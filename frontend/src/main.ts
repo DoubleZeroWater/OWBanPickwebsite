@@ -82,19 +82,6 @@ function renderShell(root: HTMLDivElement): void {
 function renderMatch(state: MatchState): void {
   app.innerHTML = `
     <main class="page-shell">
-      <section class="hero-panel">
-        <div>
-          <p class="eyebrow">Overwatch Match Control</p>
-          <h1>赛事方地图与 Ban Pick 总览</h1>
-          <p class="subtitle">房间 ${escapeHtml(state.roomCode)} · ${escapeHtml(state.currentOperation)}</p>
-        </div>
-        <div class="scoreboard" aria-label="当前大比分">
-          ${renderTeamScore("left", state.teams.left)}
-          <div class="score-divider">:</div>
-          ${renderTeamScore("right", state.teams.right)}
-        </div>
-      </section>
-
       <section class="status-strip">
         <div>
           <span class="label">当前阶段</span>
@@ -114,16 +101,6 @@ function renderMatch(state: MatchState): void {
         ${state.maps.map((map, index) => renderMapRow(map, index + 1, state.teams)).join("")}
       </section>
     </main>
-  `;
-}
-
-function renderTeamScore(side: Side, team: TeamState): string {
-  return `
-    <div class="team-score team-score-${side}">
-      <span class="team-seed">Seed ${team.seed}</span>
-      <span class="team-name">${escapeHtml(team.name)}</span>
-      <strong>${team.seriesScore}</strong>
-    </div>
   `;
 }
 
