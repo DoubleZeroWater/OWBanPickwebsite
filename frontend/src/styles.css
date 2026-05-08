@@ -231,15 +231,16 @@ h1 {
 
 .map-card {
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 22px;
-  background: rgba(6, 9, 17, 0.88);
+  background: transparent;
 }
 
 .map-image-wrap {
   position: relative;
   height: 128px;
   overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 22px;
 }
 
 .map-image {
@@ -316,7 +317,7 @@ h1 {
   min-height: 78px;
   padding: 10px 18px 12px;
   color: rgba(237, 243, 255, 0.72);
-  background: rgba(255, 255, 255, 0.006);
+  background: transparent;
 }
 
 .map-index {
