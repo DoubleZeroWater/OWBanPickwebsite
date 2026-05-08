@@ -36,14 +36,20 @@ interface MatchState {
   maps: MatchMap[];
 }
 
-const app = document.querySelector<HTMLDivElement>("#app");
-
-if (!app) {
-  throw new Error("Missing #app root element");
-}
+const app = getAppRoot();
 
 renderShell(app);
 void loadMatchState();
+
+function getAppRoot(): HTMLDivElement {
+  const root = document.querySelector<HTMLDivElement>("#app");
+
+  if (!root) {
+    throw new Error("Missing #app root element");
+  }
+
+  return root;
+}
 
 async function loadMatchState(): Promise<void> {
   try {
