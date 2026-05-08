@@ -108,16 +108,16 @@ function renderMapRow(
           <div class="map-score map-score-right">${formatMapScore(map.score.right)}</div>
           ${map.status === "after" ? '<div class="after-ribbon">After</div>' : ""}
           ${isTbd ? '<div class="tbd-watermark">TBD</div>' : ""}
-        </div>
-        <div class="map-meta">
-          <div>
-            <span class="map-index">Map ${index}</span>
-            <h2>${escapeHtml(map.nameZh ?? "TBD")}</h2>
-            <p>${escapeHtml(map.nameEn ?? "待选择地图")}</p>
+          <div class="map-meta">
+            <div>
+              <span class="map-index">Map ${index}</span>
+              <h2>${escapeHtml(map.nameZh ?? "TBD")}</h2>
+              <p>${escapeHtml(map.nameEn ?? "待选择地图")}</p>
+            </div>
+            <span class="mode-pill ${isTbd ? "mode-pill-empty" : ""}">
+              ${escapeHtml(map.mode ?? "TBD")}
+            </span>
           </div>
-          <span class="mode-pill ${isTbd ? "mode-pill-empty" : ""}">
-            ${escapeHtml(map.mode ?? "TBD")}
-          </span>
         </div>
       </div>
       ${renderBanPointer("right", firstBanSide)}
