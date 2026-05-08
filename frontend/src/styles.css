@@ -25,7 +25,7 @@ body {
   width: min(1360px, calc(100vw - 64px));
   min-height: 100vh;
   margin: 0 auto;
-  padding: 40px 0 56px;
+  padding: 24px 0 42px;
 }
 
 .hero-panel,
@@ -152,16 +152,20 @@ h1 {
 
 .map-stack {
   display: grid;
-  gap: 22px;
+  gap: 0;
 }
 
 .map-row {
   display: grid;
-  grid-template-columns: 142px 48px minmax(620px, 1fr) 48px 142px;
+  grid-template-columns: 124px 38px minmax(560px, 1fr) 38px 124px;
   align-items: center;
-  padding: 18px;
-  border-radius: 30px;
+  padding: 12px;
+  border-radius: 22px;
   background: linear-gradient(135deg, rgba(18, 24, 40, 0.86), rgba(12, 17, 29, 0.68));
+}
+
+.map-row + .map-row {
+  margin-top: -1px;
 }
 
 .map-row-after {
@@ -180,10 +184,10 @@ h1 {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 8px;
-  padding: 16px;
+  gap: 5px;
+  padding: 12px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 24px;
+  border-radius: 20px;
   background:
     linear-gradient(135deg, rgba(62, 115, 255, 0.2), rgba(255, 255, 255, 0.04)),
     rgba(7, 10, 18, 0.7);
@@ -210,7 +214,7 @@ h1 {
 
 .ban-square strong {
   color: #f9fbff;
-  font-size: 1.2rem;
+  font-size: 1.04rem;
 }
 
 .ban-square small {
@@ -222,7 +226,7 @@ h1 {
   place-items: center;
   min-height: 54px;
   color: rgba(255, 255, 255, 0.12);
-  font-size: 2.25rem;
+  font-size: 1.85rem;
   font-weight: 900;
 }
 
@@ -234,13 +238,13 @@ h1 {
 .map-card {
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 26px;
+  border-radius: 22px;
   background: rgba(6, 9, 17, 0.88);
 }
 
 .map-image-wrap {
   position: relative;
-  height: 176px;
+  height: 128px;
   overflow: hidden;
 }
 
@@ -263,38 +267,38 @@ h1 {
 .map-score {
   position: absolute;
   z-index: 2;
-  top: 16px;
-  min-width: 64px;
-  padding: 8px 16px;
+  top: 12px;
+  min-width: 54px;
+  padding: 6px 13px;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
   background: rgba(5, 8, 15, 0.72);
-  font-size: 1.45rem;
+  font-size: 1.18rem;
   font-weight: 900;
   text-align: center;
 }
 
 .map-score-left {
-  left: 18px;
+  left: 14px;
   color: #8fb1ff;
 }
 
 .map-score-right {
-  right: 18px;
+  right: 14px;
   color: #ff8d8d;
 }
 
 .after-ribbon {
   position: absolute;
   z-index: 3;
-  top: 16px;
+  top: 12px;
   left: 50%;
   transform: translateX(-50%);
-  padding: 8px 18px;
+  padding: 6px 15px;
   border-radius: 999px;
   color: #1c1206;
   background: linear-gradient(135deg, #ffd15f, #ff8a2a);
-  font-size: 0.86rem;
+  font-size: 0.78rem;
   font-weight: 950;
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -307,7 +311,7 @@ h1 {
   display: grid;
   place-items: center;
   color: rgba(255, 255, 255, 0.48);
-  font-size: 4.8rem;
+  font-size: 3.8rem;
   font-weight: 950;
   letter-spacing: 0.12em;
 }
@@ -317,7 +321,10 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  padding: 18px 22px 20px;
+  min-height: 78px;
+  padding: 10px 18px 12px;
+  color: rgba(237, 243, 255, 0.82);
+  background: rgba(255, 255, 255, 0.018);
 }
 
 .map-index {
@@ -330,23 +337,26 @@ h1 {
 
 h2 {
   margin-top: 4px;
-  font-size: 1.72rem;
+  color: rgba(237, 243, 255, 0.88);
+  font-size: 1.36rem;
   letter-spacing: -0.03em;
 }
 
 .map-meta p {
-  margin-top: 4px;
-  color: #8795ad;
+  margin-top: 2px;
+  color: rgba(135, 149, 173, 0.82);
+  font-size: 0.9rem;
 }
 
 .mode-pill {
   flex: 0 0 auto;
-  padding: 10px 16px;
+  padding: 7px 12px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 999px;
   color: #dce7ff;
   background: rgba(255, 255, 255, 0.07);
-  font-weight: 850;
+  font-size: 0.9rem;
+  font-weight: 800;
 }
 
 .mode-pill-empty {

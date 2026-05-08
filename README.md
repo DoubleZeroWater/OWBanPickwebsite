@@ -13,6 +13,12 @@ python backend/app.py
 
 打开 <http://127.0.0.1:5174/A> 查看赛事方主页面。
 
+地图图片来自 Liquipedia Overwatch 地图页，可按需重新抓取：
+
+```bash
+python3 scripts/scrape_liquipedia_maps.py
+```
+
 开发前端时可同时运行：
 
 ```bash

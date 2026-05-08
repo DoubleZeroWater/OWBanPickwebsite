@@ -82,21 +82,6 @@ function renderShell(root: HTMLDivElement): void {
 function renderMatch(state: MatchState): void {
   app.innerHTML = `
     <main class="page-shell">
-      <section class="status-strip">
-        <div>
-          <span class="label">当前阶段</span>
-          <strong>${phaseLabel(state.phase)}</strong>
-        </div>
-        <div>
-          <span class="label">倒计时</span>
-          <strong>${formatCountdown(state.currentCountdownSeconds)}</strong>
-        </div>
-        <div>
-          <span class="label">地图数量</span>
-          <strong>${state.maps.length}</strong>
-        </div>
-      </section>
-
       <section class="map-stack" aria-label="地图列表">
         ${state.maps.map((map, index) => renderMapRow(map, index + 1, state.teams)).join("")}
       </section>
@@ -175,22 +160,6 @@ function renderError(message: string): void {
       </section>
     </main>
   `;
-}
-
-function phaseLabel(phase: string): string {
-  if (phase === "after") {
-    return "地图选择完成，等待比分";
-  }
-
-  return phase;
-}
-
-function formatCountdown(totalSeconds: number): string {
-  const minutes = Math.floor(totalSeconds / 60)
-    .toString()
-    .padStart(2, "0");
-  const seconds = (totalSeconds % 60).toString().padStart(2, "0");
-  return `${minutes}:${seconds}`;
 }
 
 function formatMapScore(score: number | null): string {
