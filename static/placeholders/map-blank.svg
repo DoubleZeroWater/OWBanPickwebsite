@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-label="0þ`Mþ">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#17223a"/>
+      <stop offset="0.5" stop-color="#101827"/>
+      <stop offset="1" stop-color="#2c1c14"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" x2="1">
+      <stop offset="0" stop-color="#4a77ff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#ff884a" stop-opacity="0.55"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="420" fill="url(#bg)"/>
+  <path d="M0 302 C210 224 335 346 520 258 C706 169 841 124 1200 174 L1200 420 L0 420 Z" fill="#0c111d" opacity="0.74"/>
+  <path d="M94 104 H1106" stroke="url(#line)" stroke-width="2" opacity="0.75"/>
+  <path d="M94 316 H1106" stroke="url(#line)" stroke-width="2" opacity="0.45"/>
+  <circle cx="600" cy="210" r="84" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="24"/>
+  <text x="600" y="224" fill="#ffffff" fill-opacity="0.42" font-family="Arial, sans-serif" font-size="44" font-weight="700" text-anchor="middle">MAP IMAGE</text>
+</svg>
