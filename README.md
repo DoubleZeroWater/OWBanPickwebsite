@@ -13,10 +13,10 @@ python backend/app.py
 
 打开 <http://127.0.0.1:5174/A> 查看赛事方主页面。
 
-地图图片来自 Liquipedia Overwatch 地图页，可按需重新抓取：
+地图图片、地图模式图标、英雄头像会在 Flask 启动前通过 `scripts/scrape_assets.py` 自动刷新，也可按需手动重新抓取：
 
 ```bash
-python3 scripts/scrape_liquipedia_maps.py
+python scripts/scrape_assets.py
 ```
 
 开发前端时可同时运行：

@@ -1,0 +1,685 @@
+{
+  "sources": {
+    "maps": "https://liquipedia.net/overwatch/Portal:Maps",
+    "modeIcons": "https://overwatch.fandom.com/api.php",
+    "heroes": "https://overwatch.fandom.com/wiki/Heroes"
+  },
+  "modes": [
+    "Control",
+    "Escort",
+    "Flashpoint",
+    "Hybrid",
+    "Push"
+  ],
+  "modeIcons": {
+    "Control": {
+      "mode": "Control",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/e/e5/Control.png/revision/latest?cb=20221004203523",
+      "imageUrl": "/static/modes/control.png",
+      "fileName": "control.png"
+    },
+    "Escort": {
+      "mode": "Escort",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/d/d3/Escort.png/revision/latest?cb=20221004203623",
+      "imageUrl": "/static/modes/escort.png",
+      "fileName": "escort.png"
+    },
+    "Flashpoint": {
+      "mode": "Flashpoint",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/f/f2/Flashpoint.png/revision/latest?cb=20230916210318",
+      "imageUrl": "/static/modes/flashpoint.png",
+      "fileName": "flashpoint.png"
+    },
+    "Hybrid": {
+      "mode": "Hybrid",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/e/ed/Hybrid.png/revision/latest?cb=20221004203811",
+      "imageUrl": "/static/modes/hybrid.png",
+      "fileName": "hybrid.png"
+    },
+    "Push": {
+      "mode": "Push",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/6/6a/Push.png/revision/latest?cb=20221004203203",
+      "imageUrl": "/static/modes/push.png",
+      "fileName": "push.png"
+    }
+  },
+  "maps": {
+    "Control": [
+      {
+        "mode": "Control",
+        "nameEn": "Antarctic Peninsula",
+        "pageUrl": "https://liquipedia.net/overwatch/Antarctic_Peninsula",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/8/83/Antarctic_Peninsula.jpg/534px-Antarctic_Peninsula.jpg",
+        "imageUrl": "/static/maps/antarctic-peninsula.jpg",
+        "fileName": "antarctic-peninsula.jpg"
+      },
+      {
+        "mode": "Control",
+        "nameEn": "Busan",
+        "pageUrl": "https://liquipedia.net/overwatch/Busan",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/a/a1/Busan.jpg/527px-Busan.jpg",
+        "imageUrl": "/static/maps/busan.jpg",
+        "fileName": "busan.jpg"
+      },
+      {
+        "mode": "Control",
+        "nameEn": "Ilios",
+        "pageUrl": "https://liquipedia.net/overwatch/Ilios",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/4/45/Ilios.jpg/527px-Ilios.jpg",
+        "imageUrl": "/static/maps/ilios.jpg",
+        "fileName": "ilios.jpg"
+      },
+      {
+        "mode": "Control",
+        "nameEn": "Lijiang Tower",
+        "pageUrl": "https://liquipedia.net/overwatch/Lijiang_Tower",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/e/e8/Lijiang-tower.jpg/526px-Lijiang-tower.jpg",
+        "imageUrl": "/static/maps/lijiang-tower.jpg",
+        "fileName": "lijiang-tower.jpg"
+      },
+      {
+        "mode": "Control",
+        "nameEn": "Nepal",
+        "pageUrl": "https://liquipedia.net/overwatch/Nepal",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/c/ca/Nepal.jpg/527px-Nepal.jpg",
+        "imageUrl": "/static/maps/nepal.jpg",
+        "fileName": "nepal.jpg"
+      },
+      {
+        "mode": "Control",
+        "nameEn": "Oasis",
+        "pageUrl": "https://liquipedia.net/overwatch/Oasis",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/f/fc/Oasis.jpg/527px-Oasis.jpg",
+        "imageUrl": "/static/maps/oasis.jpg",
+        "fileName": "oasis.jpg"
+      },
+      {
+        "mode": "Control",
+        "nameEn": "Samoa",
+        "pageUrl": "https://liquipedia.net/overwatch/Samoa",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/b/b4/Samoa.jpg/534px-Samoa.jpg",
+        "imageUrl": "/static/maps/samoa.jpg",
+        "fileName": "samoa.jpg"
+      }
+    ],
+    "Escort": [
+      {
+        "mode": "Escort",
+        "nameEn": "Circuit Royal",
+        "pageUrl": "https://liquipedia.net/overwatch/Circuit_Royal",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/a/ad/Monte_Carlo.png/527px-Monte_Carlo.png",
+        "imageUrl": "/static/maps/circuit-royal.png",
+        "fileName": "circuit-royal.png"
+      },
+      {
+        "mode": "Escort",
+        "nameEn": "Dorado",
+        "pageUrl": "https://liquipedia.net/overwatch/Dorado",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/6/6f/Dorado.jpg/527px-Dorado.jpg",
+        "imageUrl": "/static/maps/dorado.jpg",
+        "fileName": "dorado.jpg"
+      },
+      {
+        "mode": "Escort",
+        "nameEn": "Havana",
+        "pageUrl": "https://liquipedia.net/overwatch/Havana",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/d/d5/Havana.jpg/528px-Havana.jpg",
+        "imageUrl": "/static/maps/havana.jpg",
+        "fileName": "havana.jpg"
+      },
+      {
+        "mode": "Escort",
+        "nameEn": "Junkertown",
+        "pageUrl": "https://liquipedia.net/overwatch/Junkertown",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/e/e3/Junkertown.jpg/527px-Junkertown.jpg",
+        "imageUrl": "/static/maps/junkertown.jpg",
+        "fileName": "junkertown.jpg"
+      },
+      {
+        "mode": "Escort",
+        "nameEn": "Shambali Monastery",
+        "pageUrl": "https://liquipedia.net/overwatch/Shambali_Monastery",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/e/ee/Shambali.jpg/534px-Shambali.jpg",
+        "imageUrl": "/static/maps/shambali-monastery.jpg",
+        "fileName": "shambali-monastery.jpg"
+      },
+      {
+        "mode": "Escort",
+        "nameEn": "Rialto",
+        "pageUrl": "https://liquipedia.net/overwatch/Rialto",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/f/ff/Rialto.jpg/527px-Rialto.jpg",
+        "imageUrl": "/static/maps/rialto.jpg",
+        "fileName": "rialto.jpg"
+      },
+      {
+        "mode": "Escort",
+        "nameEn": "Route 66",
+        "pageUrl": "https://liquipedia.net/overwatch/Route_66",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/8/85/Route-66.jpg/527px-Route-66.jpg",
+        "imageUrl": "/static/maps/route-66.jpg",
+        "fileName": "route-66.jpg"
+      },
+      {
+        "mode": "Escort",
+        "nameEn": "Watchpoint: Gibraltar",
+        "pageUrl": "https://liquipedia.net/overwatch/Watchpoint:_Gibraltar",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/6/60/Watchpoint-gibraltar.jpg/527px-Watchpoint-gibraltar.jpg",
+        "imageUrl": "/static/maps/watchpoint-gibraltar.jpg",
+        "fileName": "watchpoint-gibraltar.jpg"
+      }
+    ],
+    "Flashpoint": [
+      {
+        "mode": "Flashpoint",
+        "nameEn": "New Junk City",
+        "pageUrl": "https://liquipedia.net/overwatch/New_Junk_City",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/a/ae/New_Junk_City.jpg/534px-New_Junk_City.jpg",
+        "imageUrl": "/static/maps/new-junk-city.jpg",
+        "fileName": "new-junk-city.jpg"
+      },
+      {
+        "mode": "Flashpoint",
+        "nameEn": "Suravasa",
+        "pageUrl": "https://liquipedia.net/overwatch/Suravasa",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/6/6f/Suravasa.jpg/534px-Suravasa.jpg",
+        "imageUrl": "/static/maps/suravasa.jpg",
+        "fileName": "suravasa.jpg"
+      },
+      {
+        "mode": "Flashpoint",
+        "nameEn": "Aatlis",
+        "pageUrl": "https://liquipedia.net/overwatch/Aatlis",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/7/78/Aatlis.jpg/534px-Aatlis.jpg",
+        "imageUrl": "/static/maps/aatlis.jpg",
+        "fileName": "aatlis.jpg"
+      }
+    ],
+    "Hybrid": [
+      {
+        "mode": "Hybrid",
+        "nameEn": "Blizzard World",
+        "pageUrl": "https://liquipedia.net/overwatch/Blizzard_World",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/0/0b/Blizzard-world.jpg/527px-Blizzard-world.jpg",
+        "imageUrl": "/static/maps/blizzard-world.jpg",
+        "fileName": "blizzard-world.jpg"
+      },
+      {
+        "mode": "Hybrid",
+        "nameEn": "Eichenwalde",
+        "pageUrl": "https://liquipedia.net/overwatch/Eichenwalde",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/e/e0/Eichenwalde.jpg/527px-Eichenwalde.jpg",
+        "imageUrl": "/static/maps/eichenwalde.jpg",
+        "fileName": "eichenwalde.jpg"
+      },
+      {
+        "mode": "Hybrid",
+        "nameEn": "Hollywood",
+        "pageUrl": "https://liquipedia.net/overwatch/Hollywood",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/5/5d/Hollywood.jpg/526px-Hollywood.jpg",
+        "imageUrl": "/static/maps/hollywood.jpg",
+        "fileName": "hollywood.jpg"
+      },
+      {
+        "mode": "Hybrid",
+        "nameEn": "King's Row",
+        "pageUrl": "https://liquipedia.net/overwatch/King%27s_Row",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/6/6a/Kings-row.jpg/527px-Kings-row.jpg",
+        "imageUrl": "/static/maps/king-s-row.jpg",
+        "fileName": "king-s-row.jpg"
+      },
+      {
+        "mode": "Hybrid",
+        "nameEn": "Midtown",
+        "pageUrl": "https://liquipedia.net/overwatch/Midtown",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/e/e1/New_York_City.jpg/527px-New_York_City.jpg",
+        "imageUrl": "/static/maps/midtown.jpg",
+        "fileName": "midtown.jpg"
+      },
+      {
+        "mode": "Hybrid",
+        "nameEn": "Numbani",
+        "pageUrl": "https://liquipedia.net/overwatch/Numbani",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/f/f9/Numbani.jpg/527px-Numbani.jpg",
+        "imageUrl": "/static/maps/numbani.jpg",
+        "fileName": "numbani.jpg"
+      },
+      {
+        "mode": "Hybrid",
+        "nameEn": "Paraíso",
+        "pageUrl": "https://liquipedia.net/overwatch/Para%C3%ADso",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/b/bc/Rio_de_Janeiro.png/527px-Rio_de_Janeiro.png",
+        "imageUrl": "/static/maps/paraiso.png",
+        "fileName": "paraiso.png"
+      }
+    ],
+    "Push": [
+      {
+        "mode": "Push",
+        "nameEn": "Colosseo",
+        "pageUrl": "https://liquipedia.net/overwatch/Colosseo",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/8/80/Rome.jpg/527px-Rome.jpg",
+        "imageUrl": "/static/maps/colosseo.jpg",
+        "fileName": "colosseo.jpg"
+      },
+      {
+        "mode": "Push",
+        "nameEn": "Esperança",
+        "pageUrl": "https://liquipedia.net/overwatch/Esperan%C3%A7a",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/c/cd/Esperanca.jpg/533px-Esperanca.jpg",
+        "imageUrl": "/static/maps/esperanca.jpg",
+        "fileName": "esperanca.jpg"
+      },
+      {
+        "mode": "Push",
+        "nameEn": "New Queen Street",
+        "pageUrl": "https://liquipedia.net/overwatch/New_Queen_Street",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/9/91/Toronto.jpg/527px-Toronto.jpg",
+        "imageUrl": "/static/maps/new-queen-street.jpg",
+        "fileName": "new-queen-street.jpg"
+      },
+      {
+        "mode": "Push",
+        "nameEn": "Runasapi",
+        "pageUrl": "https://liquipedia.net/overwatch/Runasapi",
+        "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/f/fd/Runasapi.jpg/534px-Runasapi.jpg",
+        "imageUrl": "/static/maps/runasapi.jpg",
+        "fileName": "runasapi.jpg"
+      }
+    ]
+  },
+  "heroes": [
+    {
+      "nameEn": "Ana",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/3/3d/Icon-Ana.png/revision/latest?cb=20221005160847",
+      "imageUrl": "/static/heroes/ana.png",
+      "fileName": "ana.png"
+    },
+    {
+      "nameEn": "Anran",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/0/07/Icon-Anran.png/revision/latest?cb=20260418122337",
+      "imageUrl": "/static/heroes/anran.png",
+      "fileName": "anran.png"
+    },
+    {
+      "nameEn": "Ashe",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/b/be/Icon-Ashe.png/revision/latest?cb=20221005165904",
+      "imageUrl": "/static/heroes/ashe.png",
+      "fileName": "ashe.png"
+    },
+    {
+      "nameEn": "Baptiste",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/f/fb/Icon-Baptiste.png/revision/latest?cb=20221005160910",
+      "imageUrl": "/static/heroes/baptiste.png",
+      "fileName": "baptiste.png"
+    },
+    {
+      "nameEn": "Bastion",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/5/51/Icon-Bastion.png/revision/latest?cb=20221005165909",
+      "imageUrl": "/static/heroes/bastion.png",
+      "fileName": "bastion.png"
+    },
+    {
+      "nameEn": "Brigitte",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/a/a6/Icon-Brigitte.png/revision/latest?cb=20221005160917",
+      "imageUrl": "/static/heroes/brigitte.png",
+      "fileName": "brigitte.png"
+    },
+    {
+      "nameEn": "Cassidy",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/0/05/Icon-Cassidy.png/revision/latest?cb=20221005165914",
+      "imageUrl": "/static/heroes/cassidy.png",
+      "fileName": "cassidy.png"
+    },
+    {
+      "nameEn": "D.Va",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/1/19/Icon-D.Va.png/revision/latest?cb=20221005161600",
+      "imageUrl": "/static/heroes/d-va.png",
+      "fileName": "d-va.png"
+    },
+    {
+      "nameEn": "Domina",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/7/76/Icon-Domina.png/revision/latest?cb=20260210210928",
+      "imageUrl": "/static/heroes/domina.png",
+      "fileName": "domina.png"
+    },
+    {
+      "nameEn": "Doomfist",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/a/a1/Icon-Doomfist.png/revision/latest?cb=20221005161638",
+      "imageUrl": "/static/heroes/doomfist.png",
+      "fileName": "doomfist.png"
+    },
+    {
+      "nameEn": "Echo",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/d/d6/Icon-Echo.png/revision/latest?cb=20221005165920",
+      "imageUrl": "/static/heroes/echo.png",
+      "fileName": "echo.png"
+    },
+    {
+      "nameEn": "Emre",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/3/34/Icon-Emre.png/revision/latest?cb=20260210210951",
+      "imageUrl": "/static/heroes/emre.png",
+      "fileName": "emre.png"
+    },
+    {
+      "nameEn": "Freja",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/0/04/Icon-Freja.png/revision/latest?cb=20250422191741",
+      "imageUrl": "/static/heroes/freja.png",
+      "fileName": "freja.png"
+    },
+    {
+      "nameEn": "Genji",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/1/1c/Icon-Genji.png/revision/latest?cb=20221005165931",
+      "imageUrl": "/static/heroes/genji.png",
+      "fileName": "genji.png"
+    },
+    {
+      "nameEn": "Hanzo",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/7/71/Icon-Hanzo.png/revision/latest?cb=20221005165925",
+      "imageUrl": "/static/heroes/hanzo.png",
+      "fileName": "hanzo.png"
+    },
+    {
+      "nameEn": "Hazard",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/5/54/Icon-Hazard.png/revision/latest?cb=20250211163319",
+      "imageUrl": "/static/heroes/hazard.png",
+      "fileName": "hazard.png"
+    },
+    {
+      "nameEn": "Illari",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/8/86/Icon-Illari.png/revision/latest?cb=20230811015354",
+      "imageUrl": "/static/heroes/illari.png",
+      "fileName": "illari.png"
+    },
+    {
+      "nameEn": "Junker Queen",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/2/2b/Icon-Junker_Queen.png/revision/latest?cb=20250426235748",
+      "imageUrl": "/static/heroes/junker-queen.png",
+      "fileName": "junker-queen.png"
+    },
+    {
+      "nameEn": "Junkrat",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/9/99/Icon-Junkrat.png/revision/latest?cb=20221005170201",
+      "imageUrl": "/static/heroes/junkrat.png",
+      "fileName": "junkrat.png"
+    },
+    {
+      "nameEn": "Juno",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/c/c7/Icon-Juno.png/revision/latest?cb=20240822214309",
+      "imageUrl": "/static/heroes/juno.png",
+      "fileName": "juno.png"
+    },
+    {
+      "nameEn": "Kiriko",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/c/ca/Icon-kiriko.png/revision/latest?cb=20221004202610",
+      "imageUrl": "/static/heroes/kiriko.png",
+      "fileName": "kiriko.png"
+    },
+    {
+      "nameEn": "Lifeweaver",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/8/86/Icon-Lifeweaver.png/revision/latest?cb=20230411181321",
+      "imageUrl": "/static/heroes/lifeweaver.png",
+      "fileName": "lifeweaver.png"
+    },
+    {
+      "nameEn": "Lúcio",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/5/51/Icon-L%C3%BAcio.png/revision/latest?cb=20221004204914",
+      "imageUrl": "/static/heroes/lucio.png",
+      "fileName": "lucio.png"
+    },
+    {
+      "nameEn": "Mauga",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/3/39/Icon-Mauga.png/revision/latest?cb=20231205235708",
+      "imageUrl": "/static/heroes/mauga.png",
+      "fileName": "mauga.png"
+    },
+    {
+      "nameEn": "Mei",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/9/99/Icon-Mei.png/revision/latest?cb=20221005170206",
+      "imageUrl": "/static/heroes/mei.png",
+      "fileName": "mei.png"
+    },
+    {
+      "nameEn": "Mercy",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/0/03/Icon-Mercy.png/revision/latest?cb=20221005160926",
+      "imageUrl": "/static/heroes/mercy.png",
+      "fileName": "mercy.png"
+    },
+    {
+      "nameEn": "Mizuki",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/3/36/Icon-Mizuki.png/revision/latest?cb=20260210211030",
+      "imageUrl": "/static/heroes/mizuki.png",
+      "fileName": "mizuki.png"
+    },
+    {
+      "nameEn": "Moira",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/5/55/Icon-Moira.png/revision/latest?cb=20221005160935",
+      "imageUrl": "/static/heroes/moira.png",
+      "fileName": "moira.png"
+    },
+    {
+      "nameEn": "Orisa",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/1/11/Icon-Orisa.png/revision/latest?cb=20221005161652",
+      "imageUrl": "/static/heroes/orisa.png",
+      "fileName": "orisa.png"
+    },
+    {
+      "nameEn": "Pharah",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/2/29/Icon-Pharah.png/revision/latest?cb=20221005170211",
+      "imageUrl": "/static/heroes/pharah.png",
+      "fileName": "pharah.png"
+    },
+    {
+      "nameEn": "Ramattra",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/6/6f/Icon-Ramattra.png/revision/latest?cb=20221206190323",
+      "imageUrl": "/static/heroes/ramattra.png",
+      "fileName": "ramattra.png"
+    },
+    {
+      "nameEn": "Reaper",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/a/a9/Icon-Reaper.png/revision/latest?cb=20221005170219",
+      "imageUrl": "/static/heroes/reaper.png",
+      "fileName": "reaper.png"
+    },
+    {
+      "nameEn": "Reinhardt",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/8/83/Icon-Reinhardt.png/revision/latest?cb=20221005161659",
+      "imageUrl": "/static/heroes/reinhardt.png",
+      "fileName": "reinhardt.png"
+    },
+    {
+      "nameEn": "Roadhog",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/1/16/Icon-Roadhog.png/revision/latest?cb=20221005161706",
+      "imageUrl": "/static/heroes/roadhog.png",
+      "fileName": "roadhog.png"
+    },
+    {
+      "nameEn": "Sigma",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/e/e0/Icon-Sigma.png/revision/latest?cb=20221005161714",
+      "imageUrl": "/static/heroes/sigma.png",
+      "fileName": "sigma.png"
+    },
+    {
+      "nameEn": "Sojourn",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/e/e0/Icon-Sojourn.png/revision/latest?cb=20221005170226",
+      "imageUrl": "/static/heroes/sojourn.png",
+      "fileName": "sojourn.png"
+    },
+    {
+      "nameEn": "Soldier: 76",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/2/2b/Icon-Soldier_76.png/revision/latest?cb=20221005170355",
+      "imageUrl": "/static/heroes/soldier-76.png",
+      "fileName": "soldier-76.png"
+    },
+    {
+      "nameEn": "Sombra",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/7/70/Icon-Sombra.png/revision/latest?cb=20221005170556",
+      "imageUrl": "/static/heroes/sombra.png",
+      "fileName": "sombra.png"
+    },
+    {
+      "nameEn": "Symmetra",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/0/06/Icon-Symmetra.png/revision/latest?cb=20221005170604",
+      "imageUrl": "/static/heroes/symmetra.png",
+      "fileName": "symmetra.png"
+    },
+    {
+      "nameEn": "Torbjörn",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/c/ca/Icon-Torbj%C3%B6rn.png/revision/latest?cb=20221005170611",
+      "imageUrl": "/static/heroes/torbjorn.png",
+      "fileName": "torbjorn.png"
+    },
+    {
+      "nameEn": "Tracer",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/2/29/Icon-Tracer.png/revision/latest?cb=20221005170620",
+      "imageUrl": "/static/heroes/tracer.png",
+      "fileName": "tracer.png"
+    },
+    {
+      "nameEn": "Vendetta",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/d/dd/Icon-Vendetta.png/revision/latest?cb=20251127231802",
+      "imageUrl": "/static/heroes/vendetta.png",
+      "fileName": "vendetta.png"
+    },
+    {
+      "nameEn": "Venture",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/a/a0/Icon-Venture.png/revision/latest?cb=20250324005446",
+      "imageUrl": "/static/heroes/venture.png",
+      "fileName": "venture.png"
+    },
+    {
+      "nameEn": "Widowmaker",
+      "role": "Damage",
+      "roleZh": "输出",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/5/54/Icon-Widowmaker.png/revision/latest?cb=20221005170629",
+      "imageUrl": "/static/heroes/widowmaker.png",
+      "fileName": "widowmaker.png"
+    },
+    {
+      "nameEn": "Winston",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/f/f8/Icon-Winston.png/revision/latest?cb=20221005161721",
+      "imageUrl": "/static/heroes/winston.png",
+      "fileName": "winston.png"
+    },
+    {
+      "nameEn": "Wrecking Ball",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/c/ca/Icon-Wrecking_Ball.png/revision/latest?cb=20221005161727",
+      "imageUrl": "/static/heroes/wrecking-ball.png",
+      "fileName": "wrecking-ball.png"
+    },
+    {
+      "nameEn": "Wuyang",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/6/6c/Icon-Wuyang.png/revision/latest?cb=20250826195208",
+      "imageUrl": "/static/heroes/wuyang.png",
+      "fileName": "wuyang.png"
+    },
+    {
+      "nameEn": "Zarya",
+      "role": "Tank",
+      "roleZh": "重装",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/7/75/Icon-Zarya.png/revision/latest?cb=20221005161732",
+      "imageUrl": "/static/heroes/zarya.png",
+      "fileName": "zarya.png"
+    },
+    {
+      "nameEn": "Zenyatta",
+      "role": "Support",
+      "roleZh": "支援",
+      "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/f/f7/Icon-Zenyatta.png/revision/latest?cb=20221005160943",
+      "imageUrl": "/static/heroes/zenyatta.png",
+      "fileName": "zenyatta.png"
+    }
+  ],
+  "errors": []
+}

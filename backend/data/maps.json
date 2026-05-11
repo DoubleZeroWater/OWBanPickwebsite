@@ -212,8 +212,8 @@
         "nameEn": "Paraíso",
         "pageUrl": "https://liquipedia.net/overwatch/Para%C3%ADso",
         "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/b/bc/Rio_de_Janeiro.png/527px-Rio_de_Janeiro.png",
-        "imageUrl": "/static/maps/para-so.png",
-        "fileName": "para-so.png"
+        "imageUrl": "/static/maps/paraiso.png",
+        "fileName": "paraiso.png"
       }
     ],
     "Push": [
@@ -230,8 +230,8 @@
         "nameEn": "Esperança",
         "pageUrl": "https://liquipedia.net/overwatch/Esperan%C3%A7a",
         "sourceImageUrl": "https://liquipedia.net/commons/images/thumb/c/cd/Esperanca.jpg/533px-Esperanca.jpg",
-        "imageUrl": "/static/maps/esperan-a.jpg",
-        "fileName": "esperan-a.jpg"
+        "imageUrl": "/static/maps/esperanca.jpg",
+        "fileName": "esperanca.jpg"
       },
       {
         "mode": "Push",

@@ -12,12 +12,15 @@ interface TeamState {
 
 interface HeroBan {
   hero: string;
+  nameEn: string;
   role: string;
+  imageUrl: string;
 }
 
 interface MatchMap {
   id: string;
   mode: string | null;
+  modeIconUrl: string | null;
   nameZh: string | null;
   nameEn: string | null;
   status: MapStatus;
@@ -29,6 +32,7 @@ interface MatchMap {
 
 interface MatchState {
   roomCode: string;
+  matchName: string;
   phase: string;
   currentCountdownSeconds: number;
   currentOperation: string;
@@ -82,10 +86,28 @@ function renderShell(root: HTMLDivElement): void {
 function renderMatch(state: MatchState): void {
   app.innerHTML = `
     <main class="page-shell">
+      <header class="match-header">
+        ${renderTeamHeader("left", state.teams.left)}
+        <div class="match-title">
+          <span>Match Room ${escapeHtml(state.roomCode)}</span>
+          <h1>${escapeHtml(state.matchName)}</h1>
+        </div>
+        ${renderTeamHeader("right", state.teams.right)}
+      </header>
       <section class="map-stack" aria-label="地图列表">
         ${state.maps.map((map, index) => renderMapRow(map, index + 1, state.teams)).join("")}
       </section>
     </main>
+  `;
+}
+
+function renderTeamHeader(side: Side, team: TeamState): string {
+  return `
+    <div class="team-header team-header-${side}">
+      <span>TEAM ${team.seed}</span>
+      <strong>${escapeHtml(team.name)}</strong>
+      <b>${team.seriesScore}</b>
+    </div>
   `;
 }
 
@@ -99,42 +121,52 @@ function renderMapRow(
 
   return `
     <article class="map-row map-row-${map.status}">
-      ${renderBanSquare("left", map, teams.left)}
+      ${renderBanSlot("left", map, teams.left)}
       ${renderBanPointer("left", firstBanSide)}
       <div class="map-card">
         <div class="map-image-wrap">
-          <img src="${map.imageUrl}" alt="${map.nameZh ?? "待定地图"}" class="map-image" />
+          ${isTbd ? "" : `<img src="${map.imageUrl}" alt="${map.nameZh ?? "待定地图"}" class="map-image" />`}
           <div class="map-score map-score-left">${formatMapScore(map.score.left)}</div>
           <div class="map-score map-score-right">${formatMapScore(map.score.right)}</div>
           ${map.status === "after" ? '<div class="after-ribbon">After</div>' : ""}
           ${isTbd ? '<div class="tbd-watermark">TBD</div>' : ""}
           <div class="map-meta">
-            <div>
-              <span class="map-index">Map ${index}</span>
-              <h2>${escapeHtml(map.nameZh ?? "TBD")}</h2>
-              <p>${escapeHtml(map.nameEn ?? "待选择地图")}</p>
+            <div class="map-title-block">
+              <span class="map-index">MAP ${index}</span>
+              <h2>
+                ${renderModeIcon(map)}
+                <span>${escapeHtml(map.nameEn ?? "TBD")}</span>
+              </h2>
+              <p>${escapeHtml(map.nameZh ?? "待选择地图")}${map.mode ? ` · ${escapeHtml(map.mode)}` : ""}</p>
             </div>
-            <span class="mode-pill ${isTbd ? "mode-pill-empty" : ""}">
-              ${escapeHtml(map.mode ?? "TBD")}
-            </span>
           </div>
         </div>
       </div>
       ${renderBanPointer("right", firstBanSide)}
-      ${renderBanSquare("right", map, teams.right)}
+      ${renderBanSlot("right", map, teams.right)}
     </article>
   `;
 }
 
-function renderBanSquare(side: Side, map: MatchMap, team: TeamState): string {
+function renderModeIcon(map: MatchMap): string {
+  if (!map.modeIconUrl) {
+    return "";
+  }
+
+  return `<img class="mode-icon" src="${map.modeIconUrl}" alt="${escapeHtml(map.mode ?? "地图模式")}" />`;
+}
+
+function renderBanSlot(side: Side, map: MatchMap, team: TeamState): string {
   const ban = map.bans[side];
   const empty = !ban;
 
   return `
-    <aside class="ban-square ban-square-${side} ${empty ? "ban-square-empty" : ""}">
-      <span class="ban-team">${escapeHtml(team.name)}</span>
-      <strong>${escapeHtml(ban?.hero ?? "未 Ban")}</strong>
-      <small>${escapeHtml(ban?.role ?? "等待选择")}</small>
+    <aside class="ban-slot ban-slot-${side} ${empty ? "ban-slot-empty" : ""}" aria-label="${escapeHtml(team.name)} 禁用英雄">
+      ${ban ? `<img src="${ban.imageUrl}" alt="${escapeHtml(ban.hero)}" class="ban-hero-image" />` : '<div class="ban-empty-mark">BAN</div>'}
+      <div class="ban-caption">
+        <strong>${escapeHtml(ban?.hero ?? "未 Ban")}</strong>
+        <small>${escapeHtml(ban?.role ?? team.name)}</small>
+      </div>
     </aside>
   `;
 }
