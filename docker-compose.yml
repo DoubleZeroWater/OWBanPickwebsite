@@ -1,0 +1,9 @@
+services:
+  owbanpickwebsite:
+    build:
+      context: .
+    image: owbanpickwebsite:local
+    container_name: owbanpickwebsite
+    ports:
+      - "127.0.0.1:5175:5174"
+    restart: unless-stopped
