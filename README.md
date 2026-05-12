@@ -19,6 +19,22 @@ python backend/app.py
 python scripts/scrape_assets.py
 ```
 
+## Docker 运行
+
+前后端会被打包进同一个镜像，容器内由 Flask/Gunicorn 提供页面、API 和静态资源：
+
+```bash
+docker compose up -d --build
+```
+
+打开 <http://127.0.0.1:5175/A>。
+
+当代码 push 后，GitHub Actions 会构建并推送 GHCR 镜像。若要在本机同步当前分支并重启本地容器：
+
+```powershell
+.\scripts\update_container.ps1
+```
+
 开发前端时可同时运行：
 
 ```bash
