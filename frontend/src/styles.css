@@ -42,9 +42,11 @@ p {
 
 .team-header {
   display: grid;
-  gap: 4px;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  column-gap: 14px;
+  row-gap: 4px;
   min-height: 72px;
-  align-content: center;
 }
 
 .team-header-right {
@@ -52,13 +54,21 @@ p {
 }
 
 .team-header span {
+  grid-column: 1 / -1;
   color: rgba(191, 201, 218, 0.64);
   font-size: 0.78rem;
   font-weight: 800;
 }
 
+.team-header strong {
+  color: #f3f6fb;
+  font-size: 1.42rem;
+  font-weight: 900;
+  line-height: 1.05;
+}
+
 .team-header b {
-  color: rgba(236, 241, 248, 0.76);
+  color: #ffffff;
   font-size: 3.35rem;
   line-height: 0.9;
 }
@@ -102,19 +112,10 @@ p {
 .ban-column {
   display: grid;
   justify-items: center;
-  gap: 7px;
 }
 
 .ban-column-right {
   justify-self: end;
-}
-
-.ban-team-label {
-  color: rgba(242, 246, 252, 0.9);
-  font-size: 1.08rem;
-  font-weight: 900;
-  line-height: 1;
-  text-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
 }
 
 .ban-slot {

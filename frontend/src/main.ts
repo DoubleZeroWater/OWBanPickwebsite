@@ -85,20 +85,15 @@ function renderShell(root: HTMLDivElement): void {
 }
 
 function renderMatch(state: MatchState): void {
-  const seriesScoreClasses = getScoreClasses(
-    state.teams.left.seriesScore,
-    state.teams.right.seriesScore,
-  );
-
   app.innerHTML = `
     <main class="page-shell">
       <header class="match-header">
-        ${renderTeamHeader("left", state.teams.left, seriesScoreClasses.left)}
+        ${renderTeamHeader("left", state.teams.left)}
         <div class="match-title">
           <h1>${escapeHtml(state.matchName)}</h1>
           <span>FT3</span>
         </div>
-        ${renderTeamHeader("right", state.teams.right, seriesScoreClasses.right)}
+        ${renderTeamHeader("right", state.teams.right)}
       </header>
       <section class="map-stack" aria-label="地图列表">
         ${state.maps.map((map, index) => renderMapRow(map, index + 1, state.teams)).join("")}
@@ -107,11 +102,12 @@ function renderMatch(state: MatchState): void {
   `;
 }
 
-function renderTeamHeader(side: Side, team: TeamState, scoreClass: string): string {
+function renderTeamHeader(side: Side, team: TeamState): string {
   return `
     <div class="team-header team-header-${side}">
       <span>TEAM ${team.seed}</span>
-      <b class="${scoreClass}">${team.seriesScore}</b>
+      <strong>${escapeHtml(team.name)}</strong>
+      <b>${team.seriesScore}</b>
     </div>
   `;
 }
@@ -167,7 +163,6 @@ function renderBanSlot(side: Side, team: TeamState, ban: HeroBan | null): string
 
   return `
     <aside class="ban-column ban-column-${side}" aria-label="${escapeHtml(team.name)} 禁用英雄">
-      <span class="ban-team-label">${escapeHtml(team.name)}</span>
       <div class="ban-slot ${empty ? "ban-slot-empty" : ""}">
         ${ban ? `<img src="${ban.imageUrl}" alt="${escapeHtml(ban.hero)}" class="ban-hero-image" />` : ""}
         ${ban ? '<span class="ban-forbidden-icon" aria-hidden="true"></span>' : ""}
