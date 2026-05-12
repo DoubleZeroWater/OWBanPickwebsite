@@ -131,8 +131,8 @@ p {
 
 .ban-slot {
   position: relative;
-  width: 60px;
-  height: 60px;
+  width: 90px;
+  height: 90px;
   overflow: hidden;
   border: 0;
   border-radius: 6px;
@@ -153,10 +153,10 @@ p {
 
 .ban-forbidden-icon {
   position: absolute;
-  right: 4px;
-  bottom: 4px;
-  width: 14px;
-  height: 14px;
+  right: 6px;
+  bottom: 6px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   background: transparent;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.42);
@@ -166,7 +166,7 @@ p {
   position: absolute;
   inset: 0;
   content: "";
-  border: 2px solid #f03e3e;
+  border: 1px solid #f03e3e;
   border-radius: 50%;
 }
 
@@ -174,8 +174,8 @@ p {
   position: absolute;
   top: 50%;
   left: 50%;
-  width: calc(100% + 4px);
-  height: 2px;
+  width: 16px;
+  height: 1px;
   content: "";
   background: #f03e3e;
   border-radius: 999px;
