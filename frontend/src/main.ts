@@ -2,6 +2,7 @@ import "./styles.css";
 
 type Side = "left" | "right";
 type MapStatus = "completed" | "after" | "tbd";
+type ScoreValue = number | string | null;
 
 interface TeamState {
   id: string;
@@ -25,7 +26,7 @@ interface MatchMap {
   nameEn: string | null;
   status: MapStatus;
   imageUrl: string;
-  score: Record<Side, number | null>;
+  score: Record<Side, ScoreValue>;
   bans: Record<Side, HeroBan | null>;
   firstBanSide: Side | null;
 }
@@ -84,15 +85,20 @@ function renderShell(root: HTMLDivElement): void {
 }
 
 function renderMatch(state: MatchState): void {
+  const seriesScoreClasses = getScoreClasses(
+    state.teams.left.seriesScore,
+    state.teams.right.seriesScore,
+  );
+
   app.innerHTML = `
     <main class="page-shell">
       <header class="match-header">
-        ${renderTeamHeader("left", state.teams.left)}
+        ${renderTeamHeader("left", state.teams.left, seriesScoreClasses.left)}
         <div class="match-title">
-          <span>Match Room ${escapeHtml(state.roomCode)}</span>
           <h1>${escapeHtml(state.matchName)}</h1>
+          <span>FT3</span>
         </div>
-        ${renderTeamHeader("right", state.teams.right)}
+        ${renderTeamHeader("right", state.teams.right, seriesScoreClasses.right)}
       </header>
       <section class="map-stack" aria-label="地图列表">
         ${state.maps.map((map, index) => renderMapRow(map, index + 1, state.teams)).join("")}
@@ -101,12 +107,11 @@ function renderMatch(state: MatchState): void {
   `;
 }
 
-function renderTeamHeader(side: Side, team: TeamState): string {
+function renderTeamHeader(side: Side, team: TeamState, scoreClass: string): string {
   return `
     <div class="team-header team-header-${side}">
       <span>TEAM ${team.seed}</span>
-      <strong>${escapeHtml(team.name)}</strong>
-      <b>${team.seriesScore}</b>
+      <b class="${scoreClass}">${team.seriesScore}</b>
     </div>
   `;
 }
@@ -118,32 +123,33 @@ function renderMapRow(
 ): string {
   const isTbd = map.status === "tbd";
   const firstBanSide = map.firstBanSide;
+  const scoreClasses = getScoreClasses(map.score.left, map.score.right);
+  const mapTitle = map.nameZh ?? "";
 
   return `
     <article class="map-row map-row-${map.status}">
-      ${renderBanSlot("left", map, teams.left)}
+      ${renderBanSlot("left", teams.left, map.bans.left)}
       ${renderBanPointer("left", firstBanSide)}
       <div class="map-card">
         <div class="map-image-wrap">
           ${isTbd ? "" : `<img src="${map.imageUrl}" alt="${map.nameZh ?? "待定地图"}" class="map-image" />`}
-          <div class="map-score map-score-left">${formatMapScore(map.score.left)}</div>
-          <div class="map-score map-score-right">${formatMapScore(map.score.right)}</div>
-          ${map.status === "after" ? '<div class="after-ribbon">After</div>' : ""}
-          ${isTbd ? '<div class="tbd-watermark">TBD</div>' : ""}
+          <div class="map-score map-score-left ${scoreClasses.left}">${formatMapScore(map.score.left)}</div>
+          <div class="map-score map-score-right ${scoreClasses.right}">${formatMapScore(map.score.right)}</div>
           <div class="map-meta">
             <div class="map-title-block">
               <span class="map-index">MAP ${index}</span>
-              <h2>
-                ${renderModeIcon(map)}
-                <span>${escapeHtml(map.nameEn ?? "TBD")}</span>
-              </h2>
-              <p>${escapeHtml(map.nameZh ?? "待选择地图")}${map.mode ? ` · ${escapeHtml(map.mode)}` : ""}</p>
+              ${mapTitle ? `
+                <h2>
+                  ${renderModeIcon(map)}
+                  <span>${escapeHtml(mapTitle)}</span>
+                </h2>
+              ` : ""}
             </div>
           </div>
         </div>
       </div>
       ${renderBanPointer("right", firstBanSide)}
-      ${renderBanSlot("right", map, teams.right)}
+      ${renderBanSlot("right", teams.right, map.bans.right)}
     </article>
   `;
 }
@@ -156,16 +162,15 @@ function renderModeIcon(map: MatchMap): string {
   return `<img class="mode-icon" src="${map.modeIconUrl}" alt="${escapeHtml(map.mode ?? "地图模式")}" />`;
 }
 
-function renderBanSlot(side: Side, map: MatchMap, team: TeamState): string {
-  const ban = map.bans[side];
+function renderBanSlot(side: Side, team: TeamState, ban: HeroBan | null): string {
   const empty = !ban;
 
   return `
-    <aside class="ban-slot ban-slot-${side} ${empty ? "ban-slot-empty" : ""}" aria-label="${escapeHtml(team.name)} 禁用英雄">
-      ${ban ? `<img src="${ban.imageUrl}" alt="${escapeHtml(ban.hero)}" class="ban-hero-image" />` : '<div class="ban-empty-mark">BAN</div>'}
-      <div class="ban-caption">
-        <strong>${escapeHtml(ban?.hero ?? "未 Ban")}</strong>
-        <small>${escapeHtml(ban?.role ?? team.name)}</small>
+    <aside class="ban-column ban-column-${side}" aria-label="${escapeHtml(team.name)} 禁用英雄">
+      <span class="ban-team-label">${escapeHtml(team.name)}</span>
+      <div class="ban-slot ${empty ? "ban-slot-empty" : ""}">
+        ${ban ? `<img src="${ban.imageUrl}" alt="${escapeHtml(ban.hero)}" class="ban-hero-image" />` : ""}
+        ${ban ? '<span class="ban-forbidden-icon" aria-hidden="true"></span>' : ""}
       </div>
     </aside>
   `;
@@ -173,7 +178,7 @@ function renderBanSlot(side: Side, map: MatchMap, team: TeamState): string {
 
 function renderBanPointer(side: Side, firstBanSide: Side | null): string {
   const active = firstBanSide === side;
-  const arrow = side === "left" ? "▶" : "◀";
+  const arrow = side === "left" ? "◀" : "▶";
 
   return `
     <div class="ban-pointer ${active ? "ban-pointer-active" : ""}" aria-label="${active ? "先手 Ban 方" : ""}">
@@ -194,8 +199,81 @@ function renderError(message: string): void {
   `;
 }
 
-function formatMapScore(score: number | null): string {
-  return score === null ? "-" : score.toString();
+function formatMapScore(score: ScoreValue): string {
+  if (score === null || score === "") {
+    return "";
+  }
+
+  return score.toString();
+}
+
+function getScoreClasses(
+  leftScore: ScoreValue,
+  rightScore: ScoreValue,
+): Record<Side, string> {
+  const comparison = compareScores(leftScore, rightScore);
+
+  if (comparison === null) {
+    return { left: "", right: "" };
+  }
+
+  if (comparison === 0) {
+    return { left: "map-score-even", right: "map-score-even" };
+  }
+
+  return comparison > 0
+    ? { left: "map-score-leading", right: "map-score-trailing" }
+    : { left: "map-score-trailing", right: "map-score-leading" };
+}
+
+function compareScores(leftScore: ScoreValue, rightScore: ScoreValue): number | null {
+  const left = normalizeScore(leftScore);
+  const right = normalizeScore(rightScore);
+
+  if (left === null || right === null) {
+    return null;
+  }
+
+  if (left.type === "result" || right.type === "result") {
+    if (left.type !== "result" || right.type !== "result") {
+      return null;
+    }
+
+    return left.value - right.value;
+  }
+
+  return left.value - right.value;
+}
+
+function normalizeScore(
+  score: ScoreValue,
+): { type: "number" | "result"; value: number } | null {
+  if (score === null || score === "") {
+    return null;
+  }
+
+  if (typeof score === "number") {
+    return { type: "number", value: score };
+  }
+
+  const normalized = score.trim().toUpperCase();
+
+  if (normalized === "W") {
+    return { type: "result", value: 1 };
+  }
+
+  if (normalized === "L") {
+    return { type: "result", value: 0 };
+  }
+
+  const numericText = normalized.replace(/[^\d.-]/g, "");
+  const value = Number.parseFloat(numericText);
+
+  if (Number.isNaN(value)) {
+    return null;
+  }
+
+  return { type: "number", value };
 }
 
 function escapeHtml(value: string): string {
