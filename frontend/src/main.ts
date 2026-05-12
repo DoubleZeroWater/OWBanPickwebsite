@@ -103,11 +103,12 @@ function renderMatch(state: MatchState): void {
 }
 
 function renderTeamHeader(side: Side, team: TeamState): string {
+  const score = `<b>${team.seriesScore}</b>`;
+  const name = `<strong>${escapeHtml(team.name)}</strong>`;
+
   return `
     <div class="team-header team-header-${side}">
-      <span>TEAM ${team.seed}</span>
-      <strong>${escapeHtml(team.name)}</strong>
-      <b>${team.seriesScore}</b>
+      ${side === "left" ? `${name}${score}` : `${score}${name}`}
     </div>
   `;
 }
