@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unicodedata
@@ -18,6 +19,8 @@ MAPS_DATA_PATH = ROOT / "backend" / "data" / "maps.json"
 ASSET_SCRIPT_PATH = ROOT / "scripts" / "scrape_assets.py"
 MAP_PLACEHOLDER = "/static/placeholders/map-blank.svg"
 HERO_PLACEHOLDER = "/static/placeholders/hero-blank.svg"
+SETTINGS_PRESET_PATH = ROOT / "backend" / "data" / "settings_preset.json"
+SETTINGS_PRESETS_PATH = ROOT / "backend" / "data" / "settings_presets.json"
 
 
 def create_app() -> Flask:
@@ -27,12 +30,15 @@ def create_app() -> Flask:
     def index() -> Any:
         return redirect("/A")
 
-    @app.get("/A")
-    def match_admin_page() -> Any:
+    @app.get("/<portal_code>")
+    def match_portal_page(portal_code: str) -> Any:
+        if portal_code.upper() not in {"A", "B", "C", "D"}:
+            return redirect("/A")
+
         if not (DIST_DIR / "index.html").exists():
             return (
                 "Frontend assets are missing. Run `npm install` and `npm run build` "
-                "before opening /A.",
+                "before opening /A, /B, /C, or /D.",
                 503,
             )
         return send_from_directory(DIST_DIR, "index.html")
@@ -44,6 +50,30 @@ def create_app() -> Flask:
     @app.get("/api/matches/<room_code>/state")
     def match_state(room_code: str) -> Any:
         return jsonify(build_match_state(room_code))
+
+    @app.get("/api/maps/catalog")
+    def maps_catalog() -> Any:
+        return jsonify(build_maps_catalog())
+
+    @app.get("/api/settings/preset")
+    def get_settings_preset() -> Any:
+        return jsonify(load_settings_preset())
+
+    @app.post("/api/settings/preset")
+    def save_settings_preset() -> Any:
+        from flask import request
+
+        payload = request.get_json(silent=True) or {}
+        name = str(payload.get("name") or "默认预设").strip() or "默认预设"
+        settings = payload.get("settings", payload)
+        presets_payload = load_settings_preset()
+        presets = presets_payload.setdefault("presets", {})
+        presets[name] = settings
+        presets_payload["last"] = name
+        SETTINGS_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SETTINGS_PRESETS_PATH.open("w", encoding="utf-8") as file:
+            json.dump(presets_payload, file, ensure_ascii=False, indent=2)
+        return jsonify({"ok": True, "name": name})
 
     return app
 
@@ -144,7 +174,22 @@ def build_match_state(room_code: str) -> dict[str, Any]:
     }
 
 
+def build_maps_catalog() -> dict[str, Any]:
+    assets = load_assets()
+    maps = assets.get("maps", {})
+
+    return {
+        "modes": assets.get("modes") or list(maps.keys()),
+        "modeIcons": assets.get("modeIcons", {}),
+        "maps": maps,
+        "heroes": assets.get("heroes", []),
+    }
+
+
 def refresh_static_assets() -> None:
+    if os.environ.get("OW_REFRESH_ASSETS_ON_STARTUP", "").lower() not in {"1", "true", "yes"}:
+        return
+
     if not ASSET_SCRIPT_PATH.exists():
         return
 
@@ -167,6 +212,17 @@ def refresh_static_assets() -> None:
         print(result.stderr.strip())
         print(f"Asset refresh exited with {result.returncode}; continuing with cached data.")
 
+
+
+def load_settings_preset() -> dict[str, Any]:
+    if SETTINGS_PRESETS_PATH.exists():
+        with SETTINGS_PRESETS_PATH.open(encoding="utf-8") as file:
+            return json.load(file)
+
+    if SETTINGS_PRESET_PATH.exists():
+        with SETTINGS_PRESET_PATH.open(encoding="utf-8") as file:
+            return {"presets": {"默认预设": json.load(file)}, "last": "默认预设"}
+    return {"presets": {}, "last": None}
 
 def load_assets() -> dict[str, Any]:
     if ASSETS_DATA_PATH.exists():
