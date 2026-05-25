@@ -18,6 +18,8 @@ type BanOrderChoice = "first" | "second";
 type ScoreReportMode = "admin_only" | "team_submit_opponent_confirm";
 type OverlayKind = "map" | "lineup" | "ban" | "score" | "rest";
 type CheckpointKey = keyof SettingsState["checkpoints"][number];
+type MatchFormat = "ft2" | "ft3" | "ft4";
+type OpeningSidePolicy = "random" | "red" | "blue";
 
 interface TeamState {
   id: string;
@@ -73,6 +75,7 @@ interface CheckpointConfig {
 }
 
 interface SettingsState {
+  matchFormat: MatchFormat;
   stageCount: number;
   checkpoints: Array<{
     preCountdown: CheckpointConfig;
@@ -91,6 +94,7 @@ interface SettingsState {
   rosterMode: PlayerInputMode;
   presetRosterText: string;
   firstBanPolicy: FirstBanPolicy;
+  openingSidePolicy: OpeningSidePolicy;
   scoreReportMode: ScoreReportMode;
 }
 
@@ -215,6 +219,7 @@ interface SharedRoomSnapshot {
   pauseState: PauseState;
   teamAckNotice: TeamAckNotice | null;
   adminNotice: string | null;
+  openingSide: Side;
   countdownStartedAt: number;
   countdownStartSeconds: number;
 }
@@ -227,17 +232,21 @@ const lineupSlots: LineupSlot[] = [
   { id: "support-2", role: "support", label: "辅助" },
 ];
 
+const checkpointKeys: CheckpointKey[] = [
+  "preCountdown",
+  "mapPick",
+  "lineupPick",
+  "firstSecondBanChoice",
+  "firstBan",
+  "secondBan",
+  "scorePick",
+];
+const defaultMatchFormat: MatchFormat = "ft3";
+
 const defaultSettings: SettingsState = {
-  stageCount: 5,
-  checkpoints: Array.from({ length: 5 }, (_, index) => ({
-    preCountdown: { enabled: index > 0, label: "开始前倒计时" },
-    mapPick: { enabled: true, label: "选择地图" },
-    lineupPick: { enabled: true, label: "选择上场成员" },
-    firstSecondBanChoice: { enabled: true, label: "选择先后Ban" },
-    firstBan: { enabled: true, label: "先手Ban" },
-    secondBan: { enabled: true, label: "后手Ban" },
-    scorePick: { enabled: true, label: "比分录入" },
-  })),
+  matchFormat: defaultMatchFormat,
+  stageCount: getStageCountForMatchFormat(defaultMatchFormat),
+  checkpoints: createDefaultCheckpoints(getStageCountForMatchFormat(defaultMatchFormat)),
   stageLimits: {
     preStartRestSeconds: 30,
     mapSelectSeconds: 45,
@@ -261,8 +270,21 @@ const defaultSettings: SettingsState = {
   rosterMode: "free_input",
   presetRosterText: "蓝色方: A1,A2,A3,A4,A5\n红色方: B1,B2,B3,B4,B5",
   firstBanPolicy: "allow_loser_choose",
+  openingSidePolicy: "random",
   scoreReportMode: "admin_only",
 };
+
+function createDefaultCheckpoints(stageCount: number): SettingsState["checkpoints"] {
+  return Array.from({ length: stageCount }, (_, index) => ({
+    preCountdown: { enabled: index > 0, label: "开始前倒计时" },
+    mapPick: { enabled: true, label: "选择地图" },
+    lineupPick: { enabled: true, label: "选择上场成员" },
+    firstSecondBanChoice: { enabled: true, label: "选择先后Ban" },
+    firstBan: { enabled: true, label: "先手Ban" },
+    secondBan: { enabled: true, label: "后手Ban" },
+    scorePick: { enabled: true, label: "比分录入" },
+  }));
+}
 
 const mapNameZhByEn: Record<string, string> = {
   "Aatlis": "阿特利斯",
@@ -322,6 +344,7 @@ let pauseState: PauseState = { active: false, startedAt: null, totalPausedMs: 0,
 let teamAckNotice: TeamAckNotice | null = null;
 let hiddenOverlay: OverlayKind | null = null;
 let adminNotice: string | null = null;
+let openingSide: Side = resolveOpeningSide();
 let confirmedLineups: ConfirmedLineups = {};
 let countdownStartedAt = Date.now();
 let countdownStartSeconds = defaultSettings.stageLimits.mapSelectSeconds;
@@ -433,6 +456,7 @@ function publishSharedRoomSnapshot(): void {
     pauseState,
     teamAckNotice,
     adminNotice,
+    openingSide,
     countdownStartedAt,
     countdownStartSeconds,
   };
@@ -461,6 +485,7 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
   pauseState = snapshot.pauseState ?? { active: false, startedAt: null, totalPausedMs: 0, collapsed: false };
   teamAckNotice = snapshot.teamAckNotice ?? null;
   adminNotice = snapshot.adminNotice ?? null;
+  openingSide = snapshot.openingSide ?? resolveOpeningSide();
   countdownStartedAt = snapshot.countdownStartedAt;
   countdownStartSeconds = snapshot.countdownStartSeconds;
 
@@ -591,6 +616,7 @@ async function loadInitialData(): Promise<void> {
     teamAckNotice = null;
     hiddenOverlay = null;
     adminNotice = null;
+    openingSide = resolveOpeningSide();
     confirmedLineups = {};
     resetCountdown();
     publishSharedRoomSnapshot();
@@ -720,6 +746,7 @@ function renderMapRow(map: MatchMap, zeroBasedIndex: number, teams: Record<Side,
   const scoreClasses = getScoreClasses(map.score.left, map.score.right);
   const mapTitle = map.nameZh ?? map.nameEn ?? "";
   const isTargetSlot = mapSelectorState?.targetMapIndex === zeroBasedIndex;
+  const canOpenPick = canOpenMapSlot(zeroBasedIndex);
 
   return `
     <article class="map-row map-row-${map.status} ${isTargetSlot ? "map-row-pick-target" : ""}">
@@ -743,7 +770,9 @@ function renderMapRow(map: MatchMap, zeroBasedIndex: number, teams: Record<Side,
                     ${renderLineupSummary(zeroBasedIndex)}
                   `
                   : roomStarted
-                    ? `<button class="map-pick-open" type="button" data-target-index="${zeroBasedIndex}">选择地图</button>`
+                    ? canOpenPick
+                      ? `<button class="map-pick-open" type="button" data-target-index="${zeroBasedIndex}">选择地图</button>`
+                      : `<span class="map-waiting-label">${escapeHtml(getMapSlotWaitingLabel(zeroBasedIndex))}</span>`
                     : `<span class="map-waiting-label">等待开始</span>`
               }
               ${
@@ -799,7 +828,12 @@ function renderBanPointer(side: Side, firstBanSide: Side | null): string {
 }
 
 function renderMapSelector(): string {
-  if (!currentState || !mapSelectorState?.open || isBroadcastPortal() || hiddenOverlay === "map") {
+  if (
+    !currentState
+    || !mapSelectorState?.open
+    || isBroadcastPortal()
+    || hiddenOverlay === "map"
+  ) {
     return "";
   }
 
@@ -963,7 +997,12 @@ function renderMapOption(choice: MapChoice): string {
 }
 
 function renderLineupSelector(): string {
-  if (!currentState || !lineupSelectorState?.open || isBroadcastPortal() || hiddenOverlay === "lineup") {
+  if (
+    !currentState
+    || !lineupSelectorState?.open
+    || isBroadcastPortal()
+    || hiddenOverlay === "lineup"
+  ) {
     return "";
   }
 
@@ -1093,7 +1132,12 @@ function renderLineupControl(
 }
 
 function renderBanSelector(): string {
-  if (!currentState || !banSelectorState?.open || isBroadcastPortal() || hiddenOverlay === "ban") {
+  if (
+    !currentState
+    || !banSelectorState?.open
+    || isBroadcastPortal()
+    || hiddenOverlay === "ban"
+  ) {
     return "";
   }
 
@@ -1243,7 +1287,12 @@ function renderHeroOption(hero: HeroCatalogItem): string {
 }
 
 function renderScoreSelector(): string {
-  if (!currentState || !scoreSelectorState?.open || isBroadcastPortal() || hiddenOverlay === "score") {
+  if (
+    !currentState
+    || !scoreSelectorState?.open
+    || isBroadcastPortal()
+    || hiddenOverlay === "score"
+  ) {
     return "";
   }
 
@@ -2055,6 +2104,7 @@ function resetRoomToBeginning(started: boolean): void {
   teamAckNotice = null;
   hiddenOverlay = null;
   adminNotice = null;
+  openingSide = resolveOpeningSide();
 
   if (started) {
     restState = { open: true, mapIndex: 0, skipReady: createRestSkipReadyState() };
@@ -2344,8 +2394,53 @@ function restoreCheckpoint(row: number, key: CheckpointKey): void {
   renderCurrent();
 }
 
+function canOpenMapSlot(targetMapIndex: number): boolean {
+  if (!currentState || !roomStarted || isBroadcastPortal() || getSeriesWinnerSide() !== null) {
+    return false;
+  }
+
+  if (targetMapIndex !== findTargetMapIndex(currentState)) {
+    return false;
+  }
+
+  if (hasActiveBlockingStageForMapOpen()) {
+    return false;
+  }
+
+  return !mapSelectorState || mapSelectorState.targetMapIndex === targetMapIndex;
+}
+
+function getMapSlotWaitingLabel(targetMapIndex: number): string {
+  if (getSeriesWinnerSide() !== null) {
+    return "比赛结束";
+  }
+
+  if (!currentState || targetMapIndex !== findTargetMapIndex(currentState)) {
+    return "等待前置流程";
+  }
+
+  if (hasActiveBlockingStageForMapOpen()) {
+    return "等待当前流程";
+  }
+
+  return "等待选图";
+}
+
+function hasActiveBlockingStageForMapOpen(): boolean {
+  return Boolean(
+    lineupSelectorState?.open
+      || banSelectorState?.open
+      || scoreSelectorState?.open
+      || restState?.open,
+  );
+}
+
 function openMapSelector(targetMapIndex: number): void {
   if (!currentState || !roomStarted || isBroadcastPortal()) {
+    return;
+  }
+
+  if (!canOpenMapSlot(targetMapIndex)) {
     return;
   }
 
@@ -2428,6 +2523,12 @@ function forfeitCurrentMapChoice(): void {
   lineupSelectorState = null;
   banSelectorState = null;
   scoreSelectorState = null;
+  if (finishMatchIfSeriesWon()) {
+    resetCountdown();
+    publishSharedRoomSnapshot();
+    renderCurrent();
+    return;
+  }
   openRestPeriod(mapIndex);
   resetCountdown();
   publishSharedRoomSnapshot();
@@ -2460,8 +2561,9 @@ function confirmSelectedMap(): void {
   const selectedMapIndex = mapSelectorState.targetMapIndex;
   currentState.maps[selectedMapIndex] = updatedMap;
   if (isAdminPortal()) {
-    adminNotice = `管理员已为 MAP ${selectedMapIndex + 1} 选择地图：${getDisplayMapName(choice.nameEn)}`;
-    createTeamAckNotice(`管理员已为 MAP ${selectedMapIndex + 1} 选择地图：${getDisplayMapName(choice.nameEn)}`);
+    const message = `管理员已为 MAP ${selectedMapIndex + 1} 选择地图：${getDisplayMapName(choice.nameEn)}`;
+    adminNotice = message;
+    createTeamAckNotice(message);
   }
   mapSelectorState = null;
   openLineupSelector(selectedMapIndex);
@@ -2495,6 +2597,9 @@ function confirmLineups(): void {
 
   if (isAdminPortal()) {
     lineupSelectorState.ready = { left: true, right: true };
+    const message = `管理员已确认 MAP ${lineupSelectorState.mapIndex + 1} 上场人员`;
+    adminNotice = message;
+    createTeamAckNotice(message);
     finalizeLineupSelection();
     return;
   }
@@ -2619,6 +2724,12 @@ function forfeitCurrentBanChoice(): void {
   lineupSelectorState = null;
   banSelectorState = null;
   scoreSelectorState = null;
+  if (finishMatchIfSeriesWon()) {
+    resetCountdown();
+    publishSharedRoomSnapshot();
+    renderCurrent();
+    return;
+  }
   openRestPeriod(mapIndex);
   resetCountdown();
   publishSharedRoomSnapshot();
@@ -2640,8 +2751,9 @@ function confirmBanSelection(): void {
     banSelectorState.selectedOrder = null;
     currentState!.maps[banSelectorState.mapIndex].firstBanSide = firstBanSide;
     if (isAdminPortal()) {
-      adminNotice = `管理员已确认先手 Ban：${getTeamName(firstBanSide)}`;
-      createTeamAckNotice(`管理员已确认先手 Ban：${getTeamName(firstBanSide)}`);
+      const message = `管理员已确认先手 Ban：${getTeamName(firstBanSide)}`;
+      adminNotice = message;
+      createTeamAckNotice(message);
     }
     resetCountdown();
     publishSharedRoomSnapshot();
@@ -2658,8 +2770,9 @@ function confirmBanSelection(): void {
   const side = banSelectorState.activeSide;
   currentState.maps[banSelectorState.mapIndex].bans[side] = createHeroBan(hero);
   if (isAdminPortal()) {
-    adminNotice = `管理员已为${getTeamName(side)}确认 Ban：${hero.nameEn}`;
-    createTeamAckNotice(`管理员已为${getTeamName(side)}确认 Ban：${hero.nameEn}`);
+    const message = `管理员已为${getTeamName(side)}确认 Ban：${hero.nameEn}`;
+    adminNotice = message;
+    createTeamAckNotice(message);
   }
 
   if (banSelectorState.step === "first-ban") {
@@ -2764,8 +2877,9 @@ function finalizeScoreSelection(): void {
   map.status = "completed";
 
   if (isAdminPortal()) {
-    adminNotice = `管理员已确认 MAP ${mapIndex + 1} 比分：${leftScore}-${rightScore}`;
-    createTeamAckNotice(`管理员已确认 MAP ${mapIndex + 1} 比分：${leftScore}-${rightScore}`);
+    const message = `管理员已确认 MAP ${mapIndex + 1} 比分：${leftScore}-${rightScore}`;
+    adminNotice = message;
+    createTeamAckNotice(message);
   }
 
   if (leftScore !== rightScore) {
@@ -2774,10 +2888,40 @@ function finalizeScoreSelection(): void {
   }
 
   scoreSelectorState = null;
+  if (finishMatchIfSeriesWon()) {
+    resetCountdown();
+    publishSharedRoomSnapshot();
+    renderCurrent();
+    return;
+  }
   openRestPeriod(mapIndex);
   resetCountdown();
   publishSharedRoomSnapshot();
   renderCurrent();
+}
+
+function finishMatchIfSeriesWon(): boolean {
+  if (!currentState) {
+    return false;
+  }
+
+  const winnerSide = getSeriesWinnerSide(currentState);
+
+  if (!winnerSide) {
+    return false;
+  }
+
+  mapSelectorState = null;
+  lineupSelectorState = null;
+  banSelectorState = null;
+  scoreSelectorState = null;
+  restState = null;
+  hiddenOverlay = null;
+  currentState.phase = "completed";
+  currentState.currentOperation = `比赛结束：${getTeamName(winnerSide)}获胜`;
+  adminNotice = `比赛结束：${getTeamName(winnerSide)}以 ${currentState.teams[winnerSide].seriesScore}-${currentState.teams[getOppositeSide(winnerSide)].seriesScore} 获胜`;
+
+  return true;
 }
 
 function openRestPeriod(mapIndex: number): void {
@@ -2850,6 +2994,13 @@ function finishRestPeriod(): void {
     return;
   }
 
+  if (finishMatchIfSeriesWon()) {
+    resetCountdown();
+    publishSharedRoomSnapshot();
+    renderCurrent();
+    return;
+  }
+
   restState = null;
   openNextMapSelector();
   resetCountdown();
@@ -2858,7 +3009,7 @@ function finishRestPeriod(): void {
 }
 
 function openNextMapSelector(): void {
-  if (!currentState) {
+  if (!currentState || getSeriesWinnerSide() !== null) {
     mapSelectorState = null;
     return;
   }
@@ -3130,6 +3281,11 @@ function syncMapSelectorTarget(keepExisting: boolean): void {
     return;
   }
 
+  if (getSeriesWinnerSide() !== null) {
+    mapSelectorState = null;
+    return;
+  }
+
   if (lineupSelectorState?.open || banSelectorState?.open || scoreSelectorState?.open || restState?.open) {
     return;
   }
@@ -3159,6 +3315,10 @@ function syncMapSelectorTarget(keepExisting: boolean): void {
 }
 
 function findTargetMapIndex(state: MatchState): number {
+  if (getSeriesWinnerSide(state) !== null) {
+    return -1;
+  }
+
   return state.maps.findIndex((map) => map.status === "tbd" || !map.nameEn);
 }
 
@@ -3177,6 +3337,28 @@ function getMapPickerSide(state: MatchState, targetMapIndex: number): Side {
   }
 
   return state.teams.left.seed <= state.teams.right.seed ? "left" : "right";
+}
+
+function getSeriesWinnerSide(state: MatchState | null = currentState): Side | null {
+  if (!state) {
+    return null;
+  }
+
+  const winsNeeded = getWinsNeeded();
+
+  if (state.teams.left.seriesScore >= winsNeeded) {
+    return "left";
+  }
+
+  if (state.teams.right.seriesScore >= winsNeeded) {
+    return "right";
+  }
+
+  return null;
+}
+
+function getWinsNeeded(): number {
+  return Math.floor(settingsState.stageCount / 2) + 1;
 }
 
 function getMapAvailability(choice: MapChoice): MapAvailability {
@@ -3697,8 +3879,9 @@ function applyForfeitMapLoss(mapIndex: number, loserSide: Side, reason: string):
     currentState.teams[winnerSide].seriesScore += 1;
   }
 
-  adminNotice = `${reason}，${getTeamName(loserSide)}本小图判负。`;
-  createTeamAckNotice(`${reason}，${getTeamName(loserSide)}本小图判负。`);
+  const message = `${reason}，${getTeamName(loserSide)}本小图判负。`;
+  adminNotice = message;
+  createTeamAckNotice(message);
 }
 
 function getMapConfirmButtonLabel(): string {
