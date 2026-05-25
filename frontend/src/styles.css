@@ -775,6 +775,7 @@ h2 {
 .map-selector-progress,
 .lineup-selector-progress,
 .ban-selector-progress,
+.score-selector-progress,
 .rest-progress,
 .map-selector-progress-mini {
   position: relative;
@@ -786,6 +787,7 @@ h2 {
 .map-selector-progress,
 .lineup-selector-progress,
 .ban-selector-progress,
+.score-selector-progress,
 .rest-progress {
   justify-self: end;
   width: min(440px, calc(100% - 32px));
@@ -997,8 +999,8 @@ h2 {
 }
 
 .lineup-role-icon {
-  width: 38px;
-  height: 30px;
+  width: 27px;
+  height: 27px;
   object-fit: contain;
 }
 
@@ -1096,6 +1098,14 @@ h2 {
   overflow: hidden;
 }
 
+.ban-layout-no-lineups {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ban-layout-order-only {
+  align-items: center;
+}
+
 .ban-main {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -1108,16 +1118,18 @@ h2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+  justify-self: center;
+  width: min(520px, 100%);
 }
 
 .ban-order-choice button {
-  height: 44px;
+  height: 38px;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.08);
   color: rgba(245, 247, 251, 0.78);
   cursor: pointer;
-  font-size: 0.96rem;
+  font-size: 0.88rem;
   font-weight: 950;
 }
 
@@ -1168,8 +1180,8 @@ h2 {
 }
 
 .hero-role-image {
-  width: min(220px, 100%);
-  height: 34px;
+  width: min(160px, 100%);
+  height: 27px;
   object-fit: contain;
   object-position: left center;
 }
@@ -1190,8 +1202,8 @@ h2 {
 
 .hero-option {
   position: relative;
-  display: block;
-  aspect-ratio: 1 / 1;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 30px;
   min-width: 0;
   overflow: hidden;
   border: 2px solid rgba(255, 255, 255, 0.12);
@@ -1206,23 +1218,20 @@ h2 {
 }
 
 .hero-option img {
-  position: absolute;
-  inset: 0;
+  position: static;
   width: 100%;
-  height: 100%;
+  aspect-ratio: 1 / 1;
+  height: auto;
   object-fit: cover;
   background: #1b2230;
 }
 
 .hero-option span {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
+  position: static;
   display: grid;
   place-items: center;
   overflow: hidden;
-  min-height: 28px;
+  min-height: 30px;
   padding: 0 5px;
   background: rgba(244, 246, 250, 0.94);
   font-size: 0.7rem;
@@ -1345,7 +1354,7 @@ h2 {
 
 .ban-lineup-role {
   width: 54px;
-  height: 22px;
+  height: 27px;
   object-fit: contain;
   object-position: left center;
 }
@@ -1369,7 +1378,7 @@ h2 {
 .ban-selector-footer,
 .score-selector-footer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 148px;
+  grid-template-columns: minmax(0, 1fr) repeat(2, minmax(120px, auto));
   align-items: center;
   gap: 14px;
   padding: 12px 16px;
@@ -1403,7 +1412,8 @@ h2 {
 }
 
 .confirm-ban-pick,
-.confirm-score-pick {
+.confirm-score-pick,
+.reject-score-pick {
   height: 42px;
   border: 0;
   border-radius: 6px;
@@ -1414,10 +1424,16 @@ h2 {
   font-weight: 950;
 }
 
+.reject-score-pick {
+  background: #29303f;
+}
+
 .confirm-ban-pick:hover,
 .confirm-ban-pick:focus-visible,
 .confirm-score-pick:hover,
-.confirm-score-pick:focus-visible {
+.confirm-score-pick:focus-visible,
+.reject-score-pick:hover,
+.reject-score-pick:focus-visible {
   background: #f11b2a;
   outline: 0;
 }
@@ -1762,8 +1778,9 @@ h2 {
 
 .visual-mode-pool > div {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 178px));
   gap: 8px;
+  justify-content: start;
 }
 
 .map-pool-option {
@@ -1783,6 +1800,46 @@ h2 {
 .map-pool-drag-over {
   border-color: #ffb02e;
   box-shadow: 0 0 0 2px rgba(255, 176, 46, 0.18);
+}
+
+.mode-order-setting,
+.fixed-map-order-setting {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.mode-order-setting > span,
+.fixed-map-order-setting > span {
+  color: rgba(245, 247, 251, 0.82);
+  font-size: 0.86rem;
+  font-weight: 950;
+}
+
+.mode-order-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mode-order-item {
+  min-width: 118px;
+  padding: 9px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  cursor: grab;
+  font-weight: 900;
+  text-align: center;
+}
+
+.fixed-map-order-setting {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.fixed-map-order-setting > span {
+  grid-column: 1 / -1;
 }
 
 .map-pool-option input {
@@ -1821,12 +1878,14 @@ h2 {
 .visual-rosters {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 12px;
   margin-top: 12px;
 }
 
 .visual-roster-list {
   display: grid;
+  align-content: start;
   gap: 8px;
   min-width: 0;
   padding: 10px;
@@ -1953,13 +2012,14 @@ h2 {
 
 .team-ack-overlay {
   position: fixed;
-  z-index: 90;
+  z-index: 140;
   inset: 0;
   display: grid;
-  align-items: end;
+  align-items: start;
   justify-items: center;
-  padding: 24px;
-  pointer-events: none;
+  padding: 22px;
+  background: rgba(3, 4, 8, 0.32);
+  pointer-events: auto;
 }
 
 .team-ack-panel {

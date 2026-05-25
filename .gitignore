@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.chrome-codex/
 __pycache__/
 .pytest_cache/
 .venv/

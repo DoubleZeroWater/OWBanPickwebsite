@@ -63,6 +63,7 @@ interface StageSetting {
   firstBanChoiceSeconds: number;
   firstBanActionSeconds: number;
   secondBanActionSeconds: number;
+  scoreConfirmSeconds: number;
   postMatchRestSeconds: number;
 }
 
@@ -170,6 +171,7 @@ interface ScoreSelectorState {
   mapIndex: number;
   values: Record<Side, string>;
   submittedBy: Side | null;
+  rejectedBy: Side | null;
   timedOut: boolean;
 }
 
@@ -243,6 +245,7 @@ const defaultSettings: SettingsState = {
     firstBanChoiceSeconds: 25,
     firstBanActionSeconds: 25,
     secondBanActionSeconds: 25,
+    scoreConfirmSeconds: 30,
     postMatchRestSeconds: 120,
   },
   mapPool: {
@@ -303,7 +306,7 @@ const modeNameZhByEn: Record<string, string> = {
 
 const app = getAppRoot();
 const portalConfig = getPortalConfig();
-const roomStorageKey = "ow-ban-pick-room-default-v4";
+const roomStorageKey = "ow-ban-pick-room-default-v5";
 const roomChannel = "BroadcastChannel" in window ? new BroadcastChannel(roomStorageKey) : null;
 let roomStarted = false;
 let currentState: MatchState | null = null;
@@ -1097,6 +1100,7 @@ function renderBanSelector(): string {
   const map = currentState.maps[banSelectorState.mapIndex];
   const mapName = map.nameZh ?? map.nameEn ?? `MAP ${banSelectorState.mapIndex + 1}`;
   const canConfirm = canConfirmBanSelection();
+  const hasLineups = Boolean(confirmedLineups[banSelectorState.mapIndex]);
 
   return `
     <section class="ban-selector-overlay" role="dialog" aria-modal="false" aria-label="Ban 选面板">
@@ -1112,17 +1116,12 @@ function renderBanSelector(): string {
           </div>
         </header>
         ${renderCountdownProgress("ban-selector-progress")}
-        <div class="ban-layout">
-          ${renderBanLineupSide("left")}
+        <div class="ban-layout ${hasLineups ? "" : "ban-layout-no-lineups"} ${banSelectorState.step === "order-choice" ? "ban-layout-order-only" : ""}">
+          ${hasLineups ? renderBanLineupSide("left") : ""}
           <div class="ban-main">
-            ${renderBanOrderChoice()}
-            <div class="hero-board">
-              ${renderHeroRoleColumn("Tank")}
-              ${renderHeroRoleColumn("Damage")}
-              ${renderHeroRoleColumn("Support")}
-            </div>
+            ${banSelectorState.step === "order-choice" ? renderBanOrderChoice() : renderHeroBoard()}
           </div>
-          ${renderBanLineupSide("right")}
+          ${hasLineups ? renderBanLineupSide("right") : ""}
         </div>
         <footer class="ban-selector-footer">
           <div class="selected-ban-summary">
@@ -1136,6 +1135,16 @@ function renderBanSelector(): string {
         </footer>
       </div>
     </section>
+  `;
+}
+
+function renderHeroBoard(): string {
+  return `
+    <div class="hero-board">
+      ${renderHeroRoleColumn("Tank")}
+      ${renderHeroRoleColumn("Damage")}
+      ${renderHeroRoleColumn("Support")}
+    </div>
   `;
 }
 
@@ -1256,6 +1265,7 @@ function renderScoreSelector(): string {
             <button class="selector-icon-button return-home-button" type="button" data-overlay-kind="score" title="返回主页" aria-label="返回主页">↖</button>
           </div>
         </header>
+        ${isScoreConfirmationCounting() ? renderCountdownProgress("score-selector-progress") : ""}
         <div class="score-entry-grid">
           ${renderScoreInput("left")}
           ${renderScoreInput("right")}
@@ -1268,10 +1278,19 @@ function renderScoreSelector(): string {
           <button class="confirm-score-pick" id="confirmScorePick" type="button" ${canConfirm ? "" : "disabled"}>
             ${escapeHtml(getScoreConfirmButtonLabel())}
           </button>
+          ${renderScoreRejectButton()}
         </footer>
       </div>
     </section>
   `;
+}
+
+function renderScoreRejectButton(): string {
+  if (!canRejectScoreSelection()) {
+    return "";
+  }
+
+  return `<button class="reject-score-pick" id="rejectScorePick" type="button">不确认</button>`;
 }
 
 function renderScoreInput(side: Side): string {
@@ -1413,6 +1432,7 @@ function renderSettingsPanel(): string {
         <label>先后Ban选择时间<input id="firstBanChoiceSeconds" type="number" value="${settingsState.stageLimits.firstBanChoiceSeconds}" /></label>
         <label>先Ban时间<input id="firstBanActionSeconds" type="number" value="${settingsState.stageLimits.firstBanActionSeconds}" /></label>
         <label>后Ban时间<input id="secondBanActionSeconds" type="number" value="${settingsState.stageLimits.secondBanActionSeconds}" /></label>
+        <label>比分确认时间<input id="scoreConfirmSeconds" type="number" value="${settingsState.stageLimits.scoreConfirmSeconds}" /></label>
         <label>赛后休息秒数<input id="postMatchRestSeconds" type="number" value="${settingsState.stageLimits.postMatchRestSeconds}" /></label>
       </div>
       ${renderMapSettingsPanel()}
@@ -1476,6 +1496,9 @@ function renderCheckpointRows(): string {
 }
 
 function renderMapSettingsPanel(): string {
+  const mode = settingsState.mapSelectionMode;
+  const showMapPool = mode !== "fixed_map_order";
+
   return `
     <details class="settings-section">
       <summary>地图设置</summary>
@@ -1489,19 +1512,79 @@ function renderMapSettingsPanel(): string {
           <option value="fixed_map_order">固定地图顺序</option>
         </select>
       </label>
-      <label>
-        第一张地图类别
-        <select id="firstMapMode">
-          ${(mapCatalogState.modes.length ? mapCatalogState.modes : getConfiguredModeOrder())
-            .map((mode) => `<option value="${escapeHtml(mode)}">${escapeHtml(getModeLabel(mode))}</option>`)
-            .join("")}
-        </select>
-      </label>
-      <div class="visual-map-pool">
-        ${getVisualMapPoolMarkup()}
-      </div>
-      <label>固定/优先地图顺序<textarea id="fixedMapOrderText">${escapeHtml(settingsState.fixedMapOrderText)}</textarea></label>
+      ${mode === "first_mode_then_unique_mode" ? renderFirstMapModeSetting() : ""}
+      ${mode === "strict_mode_order" ? renderModeOrderSetting() : ""}
+      ${showMapPool ? `<div class="visual-map-pool">${getVisualMapPoolMarkup()}</div>` : ""}
+      ${mode === "fixed_map_order" ? renderFixedMapOrderSetting() : ""}
     </details>
+  `;
+}
+
+function renderFirstMapModeSetting(): string {
+  return `
+    <label>
+      第一张地图类别
+      <select id="firstMapMode">
+        ${(mapCatalogState.modes.length ? mapCatalogState.modes : getConfiguredModeOrder())
+          .map((mode) => `<option value="${escapeHtml(mode)}">${escapeHtml(getModeLabel(mode))}</option>`)
+          .join("")}
+      </select>
+    </label>
+  `;
+}
+
+function renderModeOrderSetting(): string {
+  const orderedModes = getConfiguredModeOrder();
+  const fallbackModes = mapCatalogState.modes.filter((mode) => !orderedModes.includes(mode));
+  const modes = [...orderedModes, ...fallbackModes];
+
+  return `
+    <div class="mode-order-setting">
+      <span>类别顺序</span>
+      <div class="mode-order-list">
+        ${modes
+          .map(
+            (mode) => `
+              <div class="mode-order-item" draggable="true" data-mode-order="${escapeHtml(mode)}">
+                ${escapeHtml(getModeLabel(mode))}
+              </div>
+            `,
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderFixedMapOrderSetting(): string {
+  const fixedOrder = parseFixedMapOrder();
+  const options = getAllCatalogMapChoices();
+
+  return `
+    <div class="fixed-map-order-setting">
+      <span>固定地图顺序</span>
+      ${Array.from({ length: settingsState.stageCount }, (_, index) => {
+        const current = fixedOrder[index] ?? options[index]?.nameEn ?? "";
+
+        return `
+          <label>
+            MAP ${index + 1}
+            <select class="fixed-map-order-select" data-fixed-map-index="${index}">
+              <option value="">未选择</option>
+              ${options
+                .map(
+                  (choice) => `
+                    <option value="${escapeHtml(choice.nameEn)}" ${normalizeKey(choice.nameEn) === normalizeKey(current) ? "selected" : ""}>
+                      ${escapeHtml(getModeLabel(choice.mode))} - ${escapeHtml(getDisplayMapName(choice.nameEn))}
+                    </option>
+                  `,
+                )
+                .join("")}
+            </select>
+          </label>
+        `;
+      }).join("")}
+    </div>
   `;
 }
 
@@ -1732,6 +1815,7 @@ function bindScoreSelectorEvents(): void {
   });
 
   document.getElementById("confirmScorePick")?.addEventListener("click", confirmScoreSelection);
+  document.getElementById("rejectScorePick")?.addEventListener("click", rejectScoreSelection);
 }
 
 function bindRestEvents(): void {
@@ -1797,6 +1881,10 @@ function bindSettingsEvents(): void {
 
   if (mapSelectionMode) {
     mapSelectionMode.value = settingsState.mapSelectionMode;
+    mapSelectionMode.addEventListener("change", () => {
+      settingsState.mapSelectionMode = mapSelectionMode.value as MapSelectionMode;
+      renderCurrent();
+    });
   }
 
   if (firstMapMode) {
@@ -1818,7 +1906,17 @@ function bindSettingsEvents(): void {
   void populatePresetSelect();
 
   app.querySelectorAll<HTMLButtonElement>(".cp-btn").forEach((button) => {
-    button.addEventListener("click", () => restoreCheckpoint(Number(button.dataset.row), button.dataset.key as CheckpointKey));
+    button.addEventListener("click", () => {
+      const row = Number(button.dataset.row);
+      const key = button.dataset.key as CheckpointKey;
+      const checkpoint = settingsState.checkpoints[row]?.[key];
+
+      if (!checkpoint || !window.confirm(`确认回退到 MAP ${row + 1}：${checkpoint.label}？`)) {
+        return;
+      }
+
+      restoreCheckpoint(row, key);
+    });
   });
 
   document.getElementById("applyPreset")?.addEventListener("click", applySettingsFromForm);
@@ -1829,13 +1927,18 @@ function bindSettingsEvents(): void {
   document.getElementById("toggleGlobalPause")?.addEventListener("click", toggleGlobalPause);
 
   bindMapPoolDragEvents();
+  bindModeOrderDragEvents();
 
   app.querySelectorAll<HTMLButtonElement>(".add-roster-member").forEach((button) => {
     button.addEventListener("click", () => {
       const side = button.dataset.rosterSide as Side | undefined;
       const list = side ? app.querySelector<HTMLElement>(`.visual-roster-items[data-roster-side="${side}"]`) : null;
       list?.insertAdjacentHTML("beforeend", renderRosterMemberInput(side ?? "left", ""));
-      bindSettingsEvents();
+      list?.lastElementChild
+        ?.querySelector<HTMLButtonElement>(".remove-roster-member")
+        ?.addEventListener("click", (event) => {
+          (event.currentTarget as HTMLElement).closest(".roster-member-row")?.remove();
+        });
     });
   });
 
@@ -1878,6 +1981,43 @@ function bindMapPoolDragEvents(): void {
       }
 
       option.parentElement?.insertBefore(source, option);
+    });
+  });
+}
+
+function bindModeOrderDragEvents(): void {
+  app.querySelectorAll<HTMLElement>(".mode-order-item").forEach((item) => {
+    item.addEventListener("dragstart", (event) => {
+      event.dataTransfer?.setData("text/plain", item.dataset.modeOrder ?? "");
+      item.classList.add("map-pool-dragging");
+    });
+
+    item.addEventListener("dragend", () => {
+      item.classList.remove("map-pool-dragging");
+      app.querySelectorAll<HTMLElement>(".mode-order-item").forEach((entry) => entry.classList.remove("map-pool-drag-over"));
+    });
+
+    item.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      item.classList.add("map-pool-drag-over");
+    });
+
+    item.addEventListener("dragleave", () => {
+      item.classList.remove("map-pool-drag-over");
+    });
+
+    item.addEventListener("drop", (event) => {
+      event.preventDefault();
+      item.classList.remove("map-pool-drag-over");
+      const sourceMode = event.dataTransfer?.getData("text/plain");
+      const source = [...app.querySelectorAll<HTMLElement>(".mode-order-item")]
+        .find((entry) => entry.dataset.modeOrder === sourceMode);
+
+      if (!source || source === item || source.parentElement !== item.parentElement) {
+        return;
+      }
+
+      item.parentElement?.insertBefore(source, item);
     });
   });
 }
@@ -1941,6 +2081,7 @@ function readSettingsFromForm(): boolean {
     firstBanChoiceSeconds: readNumber("firstBanChoiceSeconds"),
     firstBanActionSeconds: readNumber("firstBanActionSeconds"),
     secondBanActionSeconds: readNumber("secondBanActionSeconds"),
+    scoreConfirmSeconds: readNumber("scoreConfirmSeconds"),
     postMatchRestSeconds: readNumber("postMatchRestSeconds"),
   };
 
@@ -1950,13 +2091,16 @@ function readSettingsFromForm(): boolean {
   const firstBanPolicy = document.getElementById("firstBanPolicy") as HTMLSelectElement | null;
   const scoreReportMode = document.getElementById("scoreReportMode") as HTMLSelectElement | null;
   const fixedMapOrderText = document.getElementById("fixedMapOrderText") as HTMLTextAreaElement | null;
+  const fixedMapOrderSelects = [...app.querySelectorAll<HTMLSelectElement>(".fixed-map-order-select")];
 
   settingsState.mapSelectionMode = (mapSelectionMode?.value ?? settingsState.mapSelectionMode) as MapSelectionMode;
   settingsState.firstMapMode = firstMapMode?.value ?? settingsState.firstMapMode;
   settingsState.rosterMode = (rosterMode?.value ?? settingsState.rosterMode) as PlayerInputMode;
   settingsState.firstBanPolicy = (firstBanPolicy?.value ?? settingsState.firstBanPolicy) as FirstBanPolicy;
   settingsState.scoreReportMode = (scoreReportMode?.value ?? settingsState.scoreReportMode) as ScoreReportMode;
-  settingsState.fixedMapOrderText = fixedMapOrderText?.value ?? settingsState.fixedMapOrderText;
+  settingsState.fixedMapOrderText = fixedMapOrderSelects.length > 0
+    ? fixedMapOrderSelects.map((select) => select.value).filter(Boolean).join("\n")
+    : fixedMapOrderText?.value ?? settingsState.fixedMapOrderText;
   settingsState.mapPool = readVisualMapPool();
   settingsState.presetRosterText = readVisualRosters();
 
@@ -2057,19 +2201,50 @@ function getPresetMapFromPayload(payload: unknown): Record<string, unknown> {
 
 function readVisualMapPool(): Record<string, string[]> {
   const mapPool: Record<string, string[]> = {};
+  const fixedOrderSelects = [...app.querySelectorAll<HTMLSelectElement>(".fixed-map-order-select")];
 
-  app.querySelectorAll<HTMLInputElement>(".map-pool-checkbox").forEach((checkbox) => {
-    const mode = checkbox.dataset.mapMode;
+  if (fixedOrderSelects.length > 0) {
+    fixedOrderSelects.forEach((select) => {
+      const map = findCatalogMapByName(select.value);
 
-    if (!mode || !checkbox.checked) {
-      return;
-    }
+      if (!map) {
+        return;
+      }
 
-    mapPool[mode] = mapPool[mode] ?? [];
-    mapPool[mode].push(checkbox.value);
+      mapPool[map.mode] = mapPool[map.mode] ?? [];
+      mapPool[map.mode].push(map.nameEn);
+    });
+
+    return Object.keys(mapPool).length > 0 ? mapPool : settingsState.mapPool;
+  }
+
+  getVisualModeOrder().forEach((mode) => {
+    app.querySelectorAll<HTMLInputElement>(`.map-pool-checkbox[data-map-mode="${cssEscape(mode)}"]`).forEach((checkbox) => {
+      if (!checkbox.checked) {
+        return;
+      }
+
+      mapPool[mode] = mapPool[mode] ?? [];
+      mapPool[mode].push(checkbox.value);
+    });
   });
 
   return Object.keys(mapPool).length > 0 ? mapPool : settingsState.mapPool;
+}
+
+function getVisualModeOrder(): string[] {
+  const orderedModes = [...app.querySelectorAll<HTMLElement>(".mode-order-item")]
+    .map((item) => item.dataset.modeOrder)
+    .filter((mode): mode is string => Boolean(mode));
+  const checkboxModes = [...app.querySelectorAll<HTMLInputElement>(".map-pool-checkbox")]
+    .map((checkbox) => checkbox.dataset.mapMode)
+    .filter((mode): mode is string => Boolean(mode));
+
+  return [...new Set([...orderedModes, ...checkboxModes])];
+}
+
+function cssEscape(value: string): string {
+  return value.replace(/["\\]/g, "\\$&");
 }
 
 function readVisualRosters(): string {
@@ -2106,6 +2281,7 @@ function restoreCheckpoint(row: number, key: CheckpointKey): void {
   roomStarted = true;
   hiddenOverlay = null;
   adminNotice = `管理员已回退到 MAP ${row + 1}：${settingsState.checkpoints[row][key].label}`;
+  createTeamAckNotice(`管理员已回退到 MAP ${row + 1}：${settingsState.checkpoints[row][key].label}`);
 
   for (let index = row + 1; index < currentState.maps.length; index += 1) {
     currentState.maps[index] = createBlankMap(index);
@@ -2374,8 +2550,7 @@ function selectBanOrder(order: BanOrderChoice | undefined): void {
   }
 
   banSelectorState.selectedOrder = order;
-  publishSharedRoomSnapshot();
-  renderCurrent();
+  confirmBanSelection();
 }
 
 function selectHeroBan(heroKey: string | null): void {
@@ -2511,6 +2686,7 @@ function openScoreSelectorForMap(mapIndex: number): void {
     mapIndex,
     values: { left: "", right: "" },
     submittedBy: null,
+    rejectedBy: null,
     timedOut: false,
   };
   hiddenOverlay = null;
@@ -2546,6 +2722,8 @@ function confirmScoreSelection(): void {
 
     if (!scoreSelectorState.submittedBy) {
       scoreSelectorState.submittedBy = side;
+      scoreSelectorState.rejectedBy = null;
+      resetCountdown();
       publishSharedRoomSnapshot();
       renderCurrent();
       return;
@@ -2553,6 +2731,23 @@ function confirmScoreSelection(): void {
   }
 
   finalizeScoreSelection();
+}
+
+function rejectScoreSelection(): void {
+  if (!scoreSelectorState || !canRejectScoreSelection()) {
+    return;
+  }
+
+  const side = portalConfig.side;
+
+  if (!side) {
+    return;
+  }
+
+  scoreSelectorState.rejectedBy = side;
+  adminNotice = `${getTeamName(side)}未确认比分，等待管理员处理。`;
+  publishSharedRoomSnapshot();
+  renderCurrent();
 }
 
 function finalizeScoreSelection(): void {
@@ -2567,6 +2762,11 @@ function finalizeScoreSelection(): void {
 
   map.score = { left: leftScore, right: rightScore };
   map.status = "completed";
+
+  if (isAdminPortal()) {
+    adminNotice = `管理员已确认 MAP ${mapIndex + 1} 比分：${leftScore}-${rightScore}`;
+    createTeamAckNotice(`管理员已确认 MAP ${mapIndex + 1} 比分：${leftScore}-${rightScore}`);
+  }
 
   if (leftScore !== rightScore) {
     const winnerSide: Side = leftScore > rightScore ? "left" : "right";
@@ -2868,11 +3068,35 @@ function canConfirmScoreSelection(): boolean {
     return false;
   }
 
+  if (scoreSelectorState.rejectedBy) {
+    return false;
+  }
+
   if (!scoreSelectorState.submittedBy) {
     return true;
   }
 
   return scoreSelectorState.submittedBy !== portalConfig.side;
+}
+
+function canRejectScoreSelection(): boolean {
+  return Boolean(
+    scoreSelectorState
+      && settingsState.scoreReportMode === "team_submit_opponent_confirm"
+      && portalConfig.side
+      && scoreSelectorState.submittedBy
+      && scoreSelectorState.submittedBy !== portalConfig.side
+      && !scoreSelectorState.rejectedBy,
+  );
+}
+
+function isScoreConfirmationCounting(): boolean {
+  return Boolean(
+    scoreSelectorState?.open
+      && settingsState.scoreReportMode === "team_submit_opponent_confirm"
+      && scoreSelectorState.submittedBy
+      && !scoreSelectorState.rejectedBy,
+  );
 }
 
 function isScoreComplete(): boolean {
@@ -3128,6 +3352,20 @@ function getLegalMapChoices(): MapChoice[] {
     .filter((choice) => getMapAvailability(choice).available);
 }
 
+function getAllCatalogMapChoices(): MapCatalogItem[] {
+  return (mapCatalogState.modes.length ? mapCatalogState.modes : Object.keys(mapCatalogState.maps))
+    .flatMap((mode) => mapCatalogState.maps[mode] ?? []);
+}
+
+function findCatalogMapByName(nameEn: string): MapCatalogItem | null {
+  if (!nameEn) {
+    return null;
+  }
+
+  const normalizedName = normalizeKey(nameEn);
+  return getAllCatalogMapChoices().find((map) => normalizeKey(map.nameEn) === normalizedName) ?? null;
+}
+
 function findMapChoiceByKey(mapKey: string | null): MapChoice | null {
   if (!mapKey) {
     return null;
@@ -3274,6 +3512,10 @@ function getScoreStatusText(): string {
     return "等待任一队伍提交比分";
   }
 
+  if (scoreSelectorState.rejectedBy) {
+    return `${getTeamName(scoreSelectorState.rejectedBy)}未确认比分，等待管理员修改或确认`;
+  }
+
   return `${getTeamName(scoreSelectorState.submittedBy)} 已提交，等待${getTeamName(getOppositeSide(scoreSelectorState.submittedBy))}确认`;
 }
 
@@ -3292,6 +3534,10 @@ function getScoreConfirmButtonLabel(): string {
 
   if (!scoreSelectorState.submittedBy) {
     return "提交比分";
+  }
+
+  if (scoreSelectorState.rejectedBy) {
+    return "等待管理员处理";
   }
 
   return scoreSelectorState.submittedBy === portalConfig.side ? "等待对方确认" : "确认对方比分";
@@ -3409,9 +3655,9 @@ function getHeroRoleLabel(role: string): string {
 
 function getRoleHeaderImageUrl(role: string): string {
   const urls: Record<string, string> = {
-    tank: "https://liquipedia.net/commons/images/thumb/d/df/Tank_Header.png/96px-Tank_Header.png",
-    damage: "https://liquipedia.net/commons/images/thumb/9/97/Offense_Header.png/96px-Offense_Header.png",
-    support: "https://liquipedia.net/commons/images/thumb/5/53/Support_Header.png/96px-Support_Header.png",
+    tank: "/static/role-icons/tank-header.png",
+    damage: "/static/role-icons/offense-header.png",
+    support: "/static/role-icons/support-header.png",
   };
 
   return urls[getHeroRoleKeyFromText(role)] ?? urls.damage;
@@ -3632,6 +3878,10 @@ function getActiveCountdownTotalSeconds(): number {
     return Math.max(1, settingsState.stageLimits.playerSelectSeconds);
   }
 
+  if (scoreSelectorState?.open) {
+    return isScoreConfirmationCounting() ? Math.max(1, settingsState.stageLimits.scoreConfirmSeconds) : 1;
+  }
+
   if (restState?.open) {
     const map = currentState?.maps[restState.mapIndex];
     return Math.max(
@@ -3642,7 +3892,7 @@ function getActiveCountdownTotalSeconds(): number {
     );
   }
 
-  if (scoreSelectorState?.open || !roomStarted) {
+  if (!roomStarted) {
     return Math.max(1, settingsState.stageLimits.postMatchRestSeconds);
   }
 
@@ -3714,7 +3964,7 @@ function updateCountdownDom(): void {
 
   document
     .querySelectorAll<HTMLElement>(
-      ".map-selector-progress, .map-selector-progress-mini, .lineup-selector-progress, .ban-selector-progress, .rest-progress",
+      ".map-selector-progress, .map-selector-progress-mini, .lineup-selector-progress, .ban-selector-progress, .score-selector-progress, .rest-progress",
     )
     .forEach((element) => element.style.setProperty("--progress-width", `${percent}%`));
 
@@ -3739,6 +3989,8 @@ function updateCountdownDom(): void {
       handleBanSelectionTimeout();
     } else if (lineupSelectorState?.open) {
       handleLineupSelectionTimeout();
+    } else if (scoreSelectorState?.open && isScoreConfirmationCounting()) {
+      finalizeScoreSelection();
     } else if (mapSelectorState?.open) {
       handleMapSelectionTimeout();
     } else if (restState?.open) {
