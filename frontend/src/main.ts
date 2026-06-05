@@ -13,6 +13,7 @@ type PlayerInputMode = "free_input" | "preset_only" | "skip";
 type FirstBanPolicy = "allow_loser_choose" | "loser_must_first" | "no_ban";
 type LineupRole = "damage" | "tank" | "support";
 type PortalRole = "red-team" | "blue-team" | "admin" | "broadcast";
+type AppMode = "landing" | "room" | "global-admin" | "legacy-room";
 type BanStep = "order-choice" | "first-ban" | "second-ban";
 type BanOrderChoice = "first" | "second";
 type ScoreReportMode = "admin_only" | "team_submit_opponent_confirm";
@@ -224,6 +225,49 @@ interface SharedRoomSnapshot {
   countdownStartSeconds: number;
 }
 
+interface RoomLinkInfo {
+  hash: string;
+  url: string;
+  role: PortalRole;
+  label: string;
+  side: Side | null;
+}
+
+interface CreatedRoomResponse {
+  roomId: string;
+  createdAt: number;
+  lastActiveAt: number;
+  links: Record<string, RoomLinkInfo>;
+}
+
+interface RoomTokenResponse {
+  room: {
+    id: string;
+    createdAt: number;
+    lastActiveAt: number;
+    closedAt: number | null;
+    settings: unknown;
+  };
+  portal: PortalConfig;
+  version: number;
+  snapshot: SharedRoomSnapshot | null;
+}
+
+interface AdminSettings {
+  roomsPerHour: number;
+  inactiveTimeoutMinutes: number;
+  defaultSettings: unknown;
+}
+
+interface AdminRoom {
+  id: string;
+  createdAt: number;
+  lastActiveAt: number;
+  closedAt: number | null;
+  version: number;
+  links: Record<string, RoomLinkInfo>;
+}
+
 const lineupSlots: LineupSlot[] = [
   { id: "damage-1", role: "damage", label: "输出" },
   { id: "damage-2", role: "damage", label: "输出" },
@@ -232,15 +276,6 @@ const lineupSlots: LineupSlot[] = [
   { id: "support-2", role: "support", label: "辅助" },
 ];
 
-const checkpointKeys: CheckpointKey[] = [
-  "preCountdown",
-  "mapPick",
-  "lineupPick",
-  "firstSecondBanChoice",
-  "firstBan",
-  "secondBan",
-  "scorePick",
-];
 const defaultMatchFormat: MatchFormat = "ft3";
 
 const defaultSettings: SettingsState = {
@@ -327,9 +362,12 @@ const modeNameZhByEn: Record<string, string> = {
 };
 
 const app = getAppRoot();
-const portalConfig = getPortalConfig();
-const roomStorageKey = "ow-ban-pick-room-default-v5";
-const roomChannel = "BroadcastChannel" in window ? new BroadcastChannel(roomStorageKey) : null;
+const appMode = getAppMode();
+const roomToken = getRoomTokenFromPath();
+const globalAdminHash = getGlobalAdminHashFromPath();
+let portalConfig = getPortalConfig();
+let roomStorageKey = createRoomStorageKey();
+let roomChannel: BroadcastChannel | null = createRoomChannel();
 let roomStarted = false;
 let currentState: MatchState | null = null;
 let mapCatalogState: MapCatalogState = { modes: [], modeIcons: {}, maps: {}, heroes: [] };
@@ -349,12 +387,19 @@ let confirmedLineups: ConfirmedLineups = {};
 let countdownStartedAt = Date.now();
 let countdownStartSeconds = defaultSettings.stageLimits.mapSelectSeconds;
 let countdownTimerId: number | null = null;
+let serverSnapshotVersion = 0;
+let serverSnapshotPollTimerId: number | null = null;
+let serverSnapshotPushInFlight = false;
+let pendingServerSnapshot = false;
+let lastCreatedRoom: CreatedRoomResponse | null = null;
+let adminSettings: AdminSettings | null = null;
+let adminRooms: AdminRoom[] = [];
 
 renderShell(app);
 void loadInitialData();
 window.addEventListener("keydown", handleGlobalKeydown);
 window.addEventListener("storage", handleStorageEvent);
-roomChannel?.addEventListener("message", (event: MessageEvent<SharedRoomSnapshot>) => applySharedRoomSnapshot(event.data));
+bindRoomChannel();
 
 function getAppRoot(): HTMLDivElement {
   const root = document.querySelector<HTMLDivElement>("#app");
@@ -366,7 +411,59 @@ function getAppRoot(): HTMLDivElement {
   return root;
 }
 
+function getAppMode(): AppMode {
+  const path = window.location.pathname;
+
+  if (path.startsWith("/r/")) {
+    return "room";
+  }
+
+  if (path.startsWith("/admin/")) {
+    return "global-admin";
+  }
+
+  if (/^\/[ABCD]$/i.test(path)) {
+    return "legacy-room";
+  }
+
+  return "landing";
+}
+
+function getRoomTokenFromPath(): string | null {
+  if (!window.location.pathname.startsWith("/r/")) {
+    return null;
+  }
+
+  return decodeURIComponent(window.location.pathname.slice("/r/".length)).trim() || null;
+}
+
+function getGlobalAdminHashFromPath(): string | null {
+  if (!window.location.pathname.startsWith("/admin/")) {
+    return null;
+  }
+
+  return decodeURIComponent(window.location.pathname.slice("/admin/".length)).trim() || null;
+}
+
+function createRoomStorageKey(): string {
+  return roomToken ? `ow-ban-pick-room-${roomToken}` : "ow-ban-pick-room-default-v5";
+}
+
+function createRoomChannel(): BroadcastChannel | null {
+  return "BroadcastChannel" in window ? new BroadcastChannel(roomStorageKey) : null;
+}
+
+function bindRoomChannel(): void {
+  roomChannel?.addEventListener("message", (event: MessageEvent<SharedRoomSnapshot>) => {
+    applySharedRoomSnapshot(event.data);
+  });
+}
+
 function getPortalConfig(): PortalConfig {
+  if (appMode === "room") {
+    return { code: "A", role: "red-team", label: "房间入口", side: "right" };
+  }
+
   const code = window.location.pathname.replace("/", "").trim().toUpperCase() || "A";
   const configs: Record<string, PortalConfig> = {
     A: { code: "A", role: "red-team", label: "红色队入口", side: "right" },
@@ -443,7 +540,22 @@ function publishSharedRoomSnapshot(): void {
     return;
   }
 
-  const snapshot: SharedRoomSnapshot = {
+  const snapshot = createSharedRoomSnapshot();
+
+  window.localStorage.setItem(roomStorageKey, JSON.stringify(snapshot));
+  roomChannel?.postMessage(snapshot);
+
+  if (roomToken) {
+    queueServerSnapshotPush(snapshot);
+  }
+}
+
+function createSharedRoomSnapshot(): SharedRoomSnapshot {
+  if (!currentState) {
+    throw new Error("Cannot create room snapshot before state is loaded");
+  }
+
+  return {
     roomStarted,
     currentState,
     settingsState,
@@ -460,9 +572,54 @@ function publishSharedRoomSnapshot(): void {
     countdownStartedAt,
     countdownStartSeconds,
   };
+}
 
-  window.localStorage.setItem(roomStorageKey, JSON.stringify(snapshot));
-  roomChannel?.postMessage(snapshot);
+function queueServerSnapshotPush(snapshot: SharedRoomSnapshot): void {
+  if (serverSnapshotPushInFlight) {
+    pendingServerSnapshot = true;
+    return;
+  }
+
+  void pushServerSnapshot(snapshot);
+}
+
+async function pushServerSnapshot(snapshot: SharedRoomSnapshot): Promise<void> {
+  if (!roomToken) {
+    return;
+  }
+
+  serverSnapshotPushInFlight = true;
+
+  try {
+    const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/snapshot`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version: serverSnapshotVersion, snapshot }),
+    });
+
+    if (response.status === 409) {
+      const payload = await response.json();
+      serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
+
+      if (payload.snapshot) {
+        applySharedRoomSnapshot(payload.snapshot as SharedRoomSnapshot);
+      }
+
+      return;
+    }
+
+    if (response.ok) {
+      const payload = await response.json();
+      serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
+    }
+  } finally {
+    serverSnapshotPushInFlight = false;
+
+    if (pendingServerSnapshot && currentState) {
+      pendingServerSnapshot = false;
+      queueServerSnapshotPush(createSharedRoomSnapshot());
+    }
+  }
 }
 
 function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = true): void {
@@ -513,6 +670,45 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
   if (shouldRender) {
     renderCurrent();
   }
+}
+
+function startServerSnapshotPolling(): void {
+  if (!roomToken || serverSnapshotPollTimerId !== null) {
+    return;
+  }
+
+  serverSnapshotPollTimerId = window.setInterval(() => {
+    void pullServerSnapshot();
+  }, 1000);
+}
+
+async function pullServerSnapshot(): Promise<void> {
+  if (!roomToken) {
+    return;
+  }
+
+  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/snapshot`, {
+    headers: { Accept: "application/json" },
+  });
+
+  if (response.status === 410) {
+    renderError("房间已经关闭或因不活跃而过期。");
+    return;
+  }
+
+  if (!response.ok) {
+    return;
+  }
+
+  const payload = await response.json() as { version: number; snapshot: SharedRoomSnapshot | null };
+  const nextVersion = Number(payload.version ?? 0);
+
+  if (nextVersion <= serverSnapshotVersion || !payload.snapshot) {
+    return;
+  }
+
+  serverSnapshotVersion = nextVersion;
+  applySharedRoomSnapshot(payload.snapshot);
 }
 
 function normalizeLineupSelectorState(state: LineupSelectorState | null | undefined): LineupSelectorState | null {
@@ -576,6 +772,39 @@ function handleStorageEvent(event: StorageEvent): void {
 
 async function loadInitialData(): Promise<void> {
   try {
+    if (appMode === "landing") {
+      renderLandingPage();
+      return;
+    }
+
+    if (appMode === "global-admin") {
+      await loadGlobalAdminData();
+      renderGlobalAdminPage();
+      return;
+    }
+
+    let roomPayload: RoomTokenResponse | null = null;
+
+    if (roomToken) {
+      const roomResponse = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}`, {
+        headers: { Accept: "application/json" },
+      });
+
+      if (roomResponse.status === 410) {
+        renderError("房间已经关闭或因不活跃而过期。");
+        return;
+      }
+
+      if (!roomResponse.ok) {
+        renderError("房间入口不存在。");
+        return;
+      }
+
+      roomPayload = await roomResponse.json() as RoomTokenResponse;
+      portalConfig = roomPayload.portal;
+      serverSnapshotVersion = Number(roomPayload.version ?? 0);
+    }
+
     const [matchResponse, catalogResponse, presetResponse] = await Promise.all([
       fetch("/api/matches/default/state", { headers: { Accept: "application/json" } }),
       fetch("/api/maps/catalog", { headers: { Accept: "application/json" } }),
@@ -592,15 +821,18 @@ async function loadInitialData(): Promise<void> {
 
     mapCatalogState = (await catalogResponse.json()) as MapCatalogState;
 
-    if (presetResponse.ok) {
+    if (roomPayload?.room.settings) {
+      settingsState = mergeSettings(defaultSettings, roomPayload.room.settings);
+    } else if (presetResponse.ok) {
       settingsState = mergeSettings(defaultSettings, getDefaultPresetFromPayload(await presetResponse.json()));
     }
 
-    const savedSnapshot = readSharedRoomSnapshot();
+    const savedSnapshot = roomPayload?.snapshot ?? readSharedRoomSnapshot();
 
     if (savedSnapshot) {
       applySharedRoomSnapshot(savedSnapshot, false);
       startCountdownTimer();
+      startServerSnapshotPolling();
       renderCurrent();
       return;
     }
@@ -621,6 +853,7 @@ async function loadInitialData(): Promise<void> {
     resetCountdown();
     publishSharedRoomSnapshot();
     startCountdownTimer();
+    startServerSnapshotPolling();
     renderCurrent();
   } catch (error) {
     renderError(error instanceof Error ? error.message : "未知错误");
@@ -665,7 +898,7 @@ function renderCurrent(): void {
         ${renderTeamHeader("left", currentState.teams.left)}
         <div class="match-title">
           <h1>${escapeHtml(currentState.matchName)}</h1>
-          <span>FT3</span>
+          <span>${escapeHtml(getMatchFormatLabel(settingsState.matchFormat))}</span>
           <b class="portal-badge portal-badge-${portalConfig.role}">${escapeHtml(portalConfig.label)}</b>
         </div>
         ${renderTeamHeader("right", currentState.teams.right)}
@@ -710,6 +943,222 @@ function renderShell(root: HTMLDivElement): void {
       </section>
     </main>
   `;
+}
+
+function renderLandingPage(errorMessage = ""): void {
+  app.innerHTML = `
+    <main class="page-shell">
+      <section class="landing-panel">
+        <div>
+          <p class="eyebrow">OW Ban Pick</p>
+          <h1>创建新的比赛房间</h1>
+          <p>无需注册。创建后会生成 A/B/C/D 四个哈希入口，由创建者分发给红队、蓝队、管理员和直播端。</p>
+        </div>
+        <button id="createRoomButton" class="start-match-button" type="button">创建房间</button>
+        ${errorMessage ? `<p class="landing-error">${escapeHtml(errorMessage)}</p>` : ""}
+      </section>
+      ${lastCreatedRoom ? renderCreatedRoomLinks(lastCreatedRoom) : ""}
+    </main>
+  `;
+
+  document.getElementById("createRoomButton")?.addEventListener("click", createRoomFromLanding);
+  bindCopyLinkButtons();
+}
+
+function renderCreatedRoomLinks(room: CreatedRoomResponse): string {
+  return `
+    <section class="created-room-panel">
+      <div class="created-room-header">
+        <span>房间已创建</span>
+        <strong>${escapeHtml(room.roomId)}</strong>
+      </div>
+      <div class="room-link-grid">
+        ${Object.entries(room.links).map(([code, link]) => `
+          <article class="room-link-card">
+            <span>${escapeHtml(code)} · ${escapeHtml(link.label)}</span>
+            <strong>${escapeHtml(link.hash)}</strong>
+            <a href="${escapeHtml(link.url)}">${escapeHtml(link.url)}</a>
+            <button class="copy-link-button" data-copy-value="${escapeHtml(link.url)}" type="button">复制链接</button>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+async function createRoomFromLanding(): Promise<void> {
+  const button = document.getElementById("createRoomButton") as HTMLButtonElement | null;
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "创建中...";
+  }
+
+  const response = await fetch("/api/rooms", { method: "POST", headers: { Accept: "application/json" } });
+
+  if (response.status === 429) {
+    renderLandingPage("创建过于频繁，请稍后再试。");
+    return;
+  }
+
+  if (!response.ok) {
+    renderLandingPage("创建房间失败，请稍后重试。");
+    return;
+  }
+
+  lastCreatedRoom = await response.json() as CreatedRoomResponse;
+  renderLandingPage();
+}
+
+function bindCopyLinkButtons(): void {
+  app.querySelectorAll<HTMLButtonElement>(".copy-link-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const value = button.dataset.copyValue;
+
+      if (!value) {
+        return;
+      }
+
+      await navigator.clipboard?.writeText(value);
+      button.textContent = "已复制";
+    });
+  });
+}
+
+async function loadGlobalAdminData(): Promise<void> {
+  if (!globalAdminHash) {
+    renderError("缺少全局管理哈希。");
+    return;
+  }
+
+  const [settingsResponse, roomsResponse] = await Promise.all([
+    fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/settings`, { headers: { Accept: "application/json" } }),
+    fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/rooms`, { headers: { Accept: "application/json" } }),
+  ]);
+
+  if (!settingsResponse.ok || !roomsResponse.ok) {
+    renderError("全局管理入口不存在。");
+    return;
+  }
+
+  adminSettings = await settingsResponse.json() as AdminSettings;
+  const roomsPayload = await roomsResponse.json() as { rooms: AdminRoom[] };
+  adminRooms = roomsPayload.rooms;
+}
+
+function renderGlobalAdminPage(message = ""): void {
+  if (!adminSettings) {
+    return;
+  }
+
+  app.innerHTML = `
+    <main class="page-shell">
+      <section class="global-admin-panel">
+        <div class="created-room-header">
+          <span>全局管理</span>
+          <strong>房间与默认设置</strong>
+        </div>
+        ${message ? `<p class="admin-notice">${escapeHtml(message)}</p>` : ""}
+        <div class="settings-grid">
+          <label>每 IP 每小时创建数<input id="adminRoomsPerHour" type="number" min="1" value="${adminSettings.roomsPerHour}" /></label>
+          <label>不活跃关闭分钟数<input id="adminInactiveTimeout" type="number" min="1" value="${adminSettings.inactiveTimeoutMinutes}" /></label>
+        </div>
+        <label class="admin-default-json">默认房间设置 JSON<textarea id="adminDefaultSettings">${escapeHtml(JSON.stringify(adminSettings.defaultSettings ?? {}, null, 2))}</textarea></label>
+        <button id="saveGlobalSettings" class="start-match-button" type="button">保存全局设置</button>
+      </section>
+      <section class="global-admin-panel">
+        <div class="created-room-header">
+          <span>房间列表</span>
+          <strong>${adminRooms.length} 间</strong>
+        </div>
+        <div class="admin-room-list">
+          ${adminRooms.map(renderAdminRoom).join("") || `<p class="empty-room-list">暂无房间</p>`}
+        </div>
+      </section>
+    </main>
+  `;
+
+  document.getElementById("saveGlobalSettings")?.addEventListener("click", saveGlobalSettings);
+  app.querySelectorAll<HTMLButtonElement>(".close-admin-room").forEach((button) => {
+    button.addEventListener("click", () => closeAdminRoom(button.dataset.roomId ?? ""));
+  });
+  bindCopyLinkButtons();
+}
+
+function renderAdminRoom(room: AdminRoom): string {
+  const isClosed = Boolean(room.closedAt);
+
+  return `
+    <article class="admin-room-card">
+      <header>
+        <span>${isClosed ? "已关闭" : "活跃"}</span>
+        <strong>${escapeHtml(room.id)}</strong>
+        <button class="close-admin-room" data-room-id="${escapeHtml(room.id)}" type="button" ${isClosed ? "disabled" : ""}>关闭房间</button>
+      </header>
+      <p>创建：${formatTimestamp(room.createdAt)} · 最后活跃：${formatTimestamp(room.lastActiveAt)}${room.closedAt ? ` · 关闭：${formatTimestamp(room.closedAt)}` : ""}</p>
+      <div class="admin-room-links">
+        ${Object.entries(room.links).map(([code, link]) => `
+          <div>
+            <span>${escapeHtml(code)} · ${escapeHtml(link.label)}</span>
+            <code>${escapeHtml(link.hash)}</code>
+            <button class="copy-link-button" data-copy-value="${escapeHtml(link.url)}" type="button">复制</button>
+          </div>
+        `).join("")}
+      </div>
+    </article>
+  `;
+}
+
+async function saveGlobalSettings(): Promise<void> {
+  if (!globalAdminHash || !adminSettings) {
+    return;
+  }
+
+  const roomsPerHour = Number((document.getElementById("adminRoomsPerHour") as HTMLInputElement | null)?.value || adminSettings.roomsPerHour);
+  const inactiveTimeoutMinutes = Number((document.getElementById("adminInactiveTimeout") as HTMLInputElement | null)?.value || adminSettings.inactiveTimeoutMinutes);
+  const defaultSettingsText = (document.getElementById("adminDefaultSettings") as HTMLTextAreaElement | null)?.value || "{}";
+  let defaultSettings: unknown = {};
+
+  try {
+    defaultSettings = JSON.parse(defaultSettingsText);
+  } catch {
+    renderGlobalAdminPage("默认房间设置不是有效 JSON。");
+    return;
+  }
+
+  const response = await fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ roomsPerHour, inactiveTimeoutMinutes, defaultSettings }),
+  });
+
+  if (response.ok) {
+    adminSettings = await response.json() as AdminSettings;
+    renderGlobalAdminPage("全局设置已保存。");
+  }
+}
+
+async function closeAdminRoom(roomId: string): Promise<void> {
+  if (!globalAdminHash || !roomId) {
+    return;
+  }
+
+  const response = await fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/rooms/${encodeURIComponent(roomId)}/close`, {
+    method: "POST",
+  });
+
+  if (response.ok) {
+    await loadGlobalAdminData();
+    renderGlobalAdminPage("房间已关闭。");
+  }
+}
+
+function formatTimestamp(timestamp: number): string {
+  if (!timestamp) {
+    return "-";
+  }
+
+  return new Date(timestamp * 1000).toLocaleString();
 }
 
 function renderStartGate(): string {
@@ -1475,6 +1924,14 @@ function renderSettingsPanel(): string {
         ${renderCheckpointRows()}
       </div>
       <div class="settings-grid">
+        <label>
+          比赛模式
+          <select id="matchFormat">
+            <option value="ft2">FT2</option>
+            <option value="ft3">FT3</option>
+            <option value="ft4">FT4</option>
+          </select>
+        </label>
         <label>休息秒数<input id="preStartRestSeconds" type="number" value="${settingsState.stageLimits.preStartRestSeconds}" /></label>
         <label>选图时间<input id="mapSelectSeconds" type="number" value="${settingsState.stageLimits.mapSelectSeconds}" /></label>
         <label>选人时间<input id="playerSelectSeconds" type="number" value="${settingsState.stageLimits.playerSelectSeconds}" /></label>
@@ -1669,6 +2126,14 @@ function renderBanRuleSettingsPanel(): string {
           <option value="allow_loser_choose">允许败者选择</option>
           <option value="loser_must_first">败者必须先Ban（跳过选择先后）</option>
           <option value="no_ban">无Ban</option>
+        </select>
+      </label>
+      <label>
+        首次先手方
+        <select id="openingSidePolicy">
+          <option value="random">系统随机</option>
+          <option value="red">红色方先手</option>
+          <option value="blue">蓝色方先手</option>
         </select>
       </label>
     </details>
@@ -1923,10 +2388,23 @@ function bindSettingsEvents(): void {
   }
 
   const mapSelectionMode = document.getElementById("mapSelectionMode") as HTMLSelectElement | null;
+  const matchFormat = document.getElementById("matchFormat") as HTMLSelectElement | null;
   const firstMapMode = document.getElementById("firstMapMode") as HTMLSelectElement | null;
   const rosterMode = document.getElementById("rosterMode") as HTMLSelectElement | null;
   const firstBanPolicy = document.getElementById("firstBanPolicy") as HTMLSelectElement | null;
+  const openingSidePolicy = document.getElementById("openingSidePolicy") as HTMLSelectElement | null;
   const scoreReportMode = document.getElementById("scoreReportMode") as HTMLSelectElement | null;
+
+  if (matchFormat) {
+    matchFormat.value = settingsState.matchFormat;
+    matchFormat.addEventListener("change", () => {
+      const nextFormat = matchFormat.value as MatchFormat;
+      settingsState.matchFormat = nextFormat;
+      settingsState.stageCount = getStageCountForMatchFormat(nextFormat);
+      settingsState.checkpoints = resizeCheckpoints(settingsState.checkpoints, settingsState.stageCount);
+      renderCurrent();
+    });
+  }
 
   if (mapSelectionMode) {
     mapSelectionMode.value = settingsState.mapSelectionMode;
@@ -1946,6 +2424,10 @@ function bindSettingsEvents(): void {
 
   if (firstBanPolicy) {
     firstBanPolicy.value = settingsState.firstBanPolicy;
+  }
+
+  if (openingSidePolicy) {
+    openingSidePolicy.value = settingsState.openingSidePolicy;
   }
 
   if (scoreReportMode) {
@@ -2136,17 +2618,24 @@ function readSettingsFromForm(): boolean {
   };
 
   const mapSelectionMode = document.getElementById("mapSelectionMode") as HTMLSelectElement | null;
+  const matchFormat = document.getElementById("matchFormat") as HTMLSelectElement | null;
   const firstMapMode = document.getElementById("firstMapMode") as HTMLSelectElement | null;
   const rosterMode = document.getElementById("rosterMode") as HTMLSelectElement | null;
   const firstBanPolicy = document.getElementById("firstBanPolicy") as HTMLSelectElement | null;
+  const openingSidePolicy = document.getElementById("openingSidePolicy") as HTMLSelectElement | null;
   const scoreReportMode = document.getElementById("scoreReportMode") as HTMLSelectElement | null;
   const fixedMapOrderText = document.getElementById("fixedMapOrderText") as HTMLTextAreaElement | null;
   const fixedMapOrderSelects = [...app.querySelectorAll<HTMLSelectElement>(".fixed-map-order-select")];
 
+  const nextMatchFormat = (matchFormat?.value ?? settingsState.matchFormat) as MatchFormat;
+  settingsState.matchFormat = nextMatchFormat;
+  settingsState.stageCount = getStageCountForMatchFormat(nextMatchFormat);
+  settingsState.checkpoints = resizeCheckpoints(settingsState.checkpoints, settingsState.stageCount);
   settingsState.mapSelectionMode = (mapSelectionMode?.value ?? settingsState.mapSelectionMode) as MapSelectionMode;
   settingsState.firstMapMode = firstMapMode?.value ?? settingsState.firstMapMode;
   settingsState.rosterMode = (rosterMode?.value ?? settingsState.rosterMode) as PlayerInputMode;
   settingsState.firstBanPolicy = (firstBanPolicy?.value ?? settingsState.firstBanPolicy) as FirstBanPolicy;
+  settingsState.openingSidePolicy = (openingSidePolicy?.value ?? settingsState.openingSidePolicy) as OpeningSidePolicy;
   settingsState.scoreReportMode = (scoreReportMode?.value ?? settingsState.scoreReportMode) as ScoreReportMode;
   settingsState.fixedMapOrderText = fixedMapOrderSelects.length > 0
     ? fixedMapOrderSelects.map((select) => select.value).filter(Boolean).join("\n")
@@ -4014,6 +4503,47 @@ function getMapSelectionModeLabel(mode: MapSelectionMode): string {
   return labels[mode];
 }
 
+function getStageCountForMatchFormat(format: MatchFormat): number {
+  const stageCounts: Record<MatchFormat, number> = {
+    ft2: 3,
+    ft3: 5,
+    ft4: 7,
+  };
+
+  return stageCounts[format] ?? stageCounts.ft3;
+}
+
+function getMatchFormatLabel(format: MatchFormat): string {
+  const labels: Record<MatchFormat, string> = {
+    ft2: "FT2",
+    ft3: "FT3",
+    ft4: "FT4",
+  };
+
+  return labels[format] ?? labels.ft3;
+}
+
+function resizeCheckpoints(checkpoints: SettingsState["checkpoints"], stageCount: number): SettingsState["checkpoints"] {
+  const defaults = createDefaultCheckpoints(stageCount);
+
+  return Array.from({ length: stageCount }, (_, index) => ({
+    ...defaults[index],
+    ...(checkpoints[index] ?? {}),
+  }));
+}
+
+function resolveOpeningSide(): Side {
+  if (settingsState.openingSidePolicy === "red") {
+    return "right";
+  }
+
+  if (settingsState.openingSidePolicy === "blue") {
+    return "left";
+  }
+
+  return Math.random() < 0.5 ? "left" : "right";
+}
+
 function startCountdownTimer(): void {
   if (countdownTimerId !== null) {
     window.clearInterval(countdownTimerId);
@@ -4373,15 +4903,22 @@ function mergeSettings(base: SettingsState, override: unknown): SettingsState {
 
   const partial = override as Partial<SettingsState>;
   const merged = structuredClone(base);
+  const matchFormat = partial.matchFormat ?? merged.matchFormat;
+  const stageCount = partial.stageCount ?? getStageCountForMatchFormat(matchFormat);
   const checkpointOverrides = Array.isArray(partial.checkpoints) ? partial.checkpoints : [];
 
   return {
     ...merged,
     ...partial,
-    checkpoints: merged.checkpoints.map((checkpoint, index) => ({
-      ...checkpoint,
-      ...(checkpointOverrides[index] ?? {}),
-    })),
+    matchFormat,
+    stageCount,
+    checkpoints: resizeCheckpoints(
+      merged.checkpoints.map((checkpoint, index) => ({
+        ...checkpoint,
+        ...(checkpointOverrides[index] ?? {}),
+      })),
+      stageCount,
+    ),
     stageLimits: {
       ...merged.stageLimits,
       ...(partial.stageLimits ?? {}),

@@ -3,5 +3,8 @@ dist/
 .chrome-codex/
 __pycache__/
 .pytest_cache/
+test-results/
+playwright-report/
 .venv/
 *.pyc
+backend/data/runtime/

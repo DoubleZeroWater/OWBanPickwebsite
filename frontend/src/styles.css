@@ -415,6 +415,204 @@ h2 {
 
 .settings-panel { margin-top: 16px; padding: 14px; border-radius: 8px; background: rgba(16,20,31,.9); border:1px solid rgba(255,255,255,.14); }
 .settings-panel h2 { font-size: 1.2rem; margin-bottom: 4px; }
+.landing-panel,
+.created-room-panel,
+.global-admin-panel {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 18px 22px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 8px;
+  background: rgba(12, 15, 22, 0.9);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.landing-panel {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 220px;
+}
+
+.landing-panel h1 {
+  color: #ffffff;
+  font-size: 2.15rem;
+  font-weight: 950;
+  line-height: 1.08;
+}
+
+.landing-panel p {
+  max-width: 760px;
+  margin-top: 10px;
+  color: rgba(245, 247, 251, 0.72);
+  font-size: 1rem;
+  font-weight: 800;
+  line-height: 1.5;
+}
+
+.landing-error {
+  grid-column: 1 / -1;
+  color: #ffb3b3 !important;
+}
+
+.created-room-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+}
+
+.created-room-header span,
+.admin-room-card span,
+.room-link-card span {
+  color: rgba(245, 247, 251, 0.68);
+  font-size: 0.8rem;
+  font-weight: 900;
+}
+
+.created-room-header strong {
+  overflow: hidden;
+  color: #ffffff;
+  font-size: 1.15rem;
+  font-weight: 950;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-link-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.room-link-card {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.room-link-card strong,
+.room-link-card a,
+.admin-room-links code {
+  overflow: hidden;
+  color: #ffffff;
+  font-size: 0.82rem;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-link-card a {
+  color: #9ed2ff;
+  text-decoration: none;
+}
+
+.copy-link-button,
+.close-admin-room {
+  height: 34px;
+  border: 0;
+  border-radius: 6px;
+  background: #29303f;
+  color: #ffffff;
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.close-admin-room {
+  min-width: 88px;
+  background: #d4121f;
+}
+
+.copy-link-button:hover,
+.copy-link-button:focus-visible,
+.close-admin-room:hover,
+.close-admin-room:focus-visible {
+  background: #f11b2a;
+  outline: 0;
+}
+
+.close-admin-room:disabled {
+  background: #29303f;
+  color: rgba(255, 255, 255, 0.48);
+  cursor: not-allowed;
+}
+
+.admin-default-json {
+  display: grid;
+  gap: 8px;
+  color: rgba(245, 247, 251, 0.82);
+  font-size: 0.88rem;
+  font-weight: 900;
+}
+
+.admin-default-json textarea {
+  min-height: 170px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  background: #121727;
+  color: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  padding: 10px;
+}
+
+.admin-room-list {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-room-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.admin-room-card header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.admin-room-card strong {
+  overflow: hidden;
+  color: #ffffff;
+  font-size: 1rem;
+  font-weight: 950;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-room-card p,
+.empty-room-list {
+  color: rgba(245, 247, 251, 0.68);
+  font-size: 0.86rem;
+  font-weight: 850;
+}
+
+.admin-room-links {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.admin-room-links > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .checkpoint-table { display: grid; gap: 8px; margin: 12px 0; }
 .cp-row { display: grid; grid-template-columns: 72px repeat(6, minmax(100px,1fr)); gap: 6px; align-items: center; }
 .cp-btn { border: 1px solid rgba(255,255,255,.2); border-radius: 6px; background:#29303f; color:#fff; padding:6px; cursor:pointer; }
