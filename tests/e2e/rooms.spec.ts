@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 
 test.describe.configure({ mode: "serial" });
 
-const runtimeStorePath = resolve("backend/data/runtime/rooms.json");
+const runtimeStorePath = resolve(process.env.OW_RUNTIME_DIR ?? "backend/data/runtime", "rooms.json");
 
 interface RoomLink {
   hash: string;
@@ -13,13 +13,17 @@ interface RoomLink {
 
 interface CreatedRoom {
   roomId: string;
+  archiveKey: string;
   links: Record<string, RoomLink>;
 }
 
 test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ page, baseURL }) => {
   const firstRoom = await createRoom(page);
   expect(Object.keys(firstRoom.links)).toEqual(["A", "B", "C", "D"]);
+  expect(firstRoom.roomId).toMatch(/^[0-9a-z]{4}$/);
+  Object.values(firstRoom.links).forEach((link) => expect(link.hash).toMatch(/^[0-9a-z]{4}$/));
   expect(new Set(Object.values(firstRoom.links).map((link) => link.hash)).size).toBe(4);
+  expect(new Set([firstRoom.roomId, ...Object.values(firstRoom.links).map((link) => link.hash)]).size).toBe(5);
 
   await page.goto(firstRoom.links.C.url);
   await expect(page.locator(".portal-badge")).toHaveText("房间管理员入口");
@@ -39,8 +43,9 @@ test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ 
   const adminHash = readAdminHash();
   await page.goto(`${baseURL}/admin/${adminHash}`);
   await expect(page.getByText("全局管理")).toBeVisible();
-  await expect(page.getByText(firstRoom.roomId)).toBeVisible();
-  await expect(page.locator(".admin-room-card", { hasText: firstRoom.roomId }).getByText("A · 红队入口")).toBeVisible();
+  const activeRoomCard = page.locator(".admin-room-card:not(.history-room-card)", { hasText: firstRoom.roomId });
+  await expect(activeRoomCard.getByText(firstRoom.roomId, { exact: true })).toBeVisible();
+  await expect(activeRoomCard.getByText("A · 红队入口")).toBeVisible();
 
   await page.locator("#adminRoomsPerHour").fill("5");
   await page.locator("#adminInactiveTimeout").fill("1");
@@ -55,6 +60,21 @@ test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ 
   await page.goto(`${baseURL}/admin/${adminHash}`);
   await page.locator(".admin-room-card", { hasText: firstRoom.roomId }).getByRole("button", { name: "关闭房间" }).click();
   await expect(page.getByText("房间已关闭。")).toBeVisible();
+  const historyCard = page.locator(".history-room-card", { hasText: firstRoom.archiveKey });
+  await expect(historyCard.getByText("手动关闭")).toBeVisible();
+  await historyCard.getByRole("button", { name: "查看" }).click();
+  const historyDialog = page.locator("#roomHistoryDialog");
+  await expect(historyDialog).toBeVisible();
+  await expect(historyDialog.locator("pre")).toContainText('"status": "closed"');
+  await expect(historyDialog.locator("pre")).toContainText('"action": "closed"');
+
+  const download = await page.request.get(
+    `${baseURL}/api/admin/${adminHash}/room-history/${firstRoom.archiveKey}/download`,
+  );
+  expect(download.status()).toBe(200);
+  expect(download.headers()["content-disposition"]).toContain(`${firstRoom.archiveKey}.json`);
+  await historyDialog.getByRole("button", { name: "关闭历史详情" }).click();
+
   await page.goto(firstRoom.links.C.url);
   await expect(page.getByText("房间已经关闭或因不活跃而过期。")).toBeVisible();
 
@@ -83,7 +103,11 @@ async function createRoom(page: Page): Promise<CreatedRoom> {
   const store = readStore();
   const matchedRoom = store.rooms.find((room: any) => room.tokens.C === links.C.hash);
 
-  return { roomId: matchedRoom.id, links };
+  return {
+    roomId: matchedRoom.id,
+    archiveKey: ["A", "B", "C", "D"].map((code) => links[code].hash).join("-"),
+    links,
+  };
 }
 
 async function expectEventuallyRateLimited(page: Page): Promise<void> {

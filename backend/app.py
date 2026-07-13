@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, redirect, request, send_from_directory
+from flask import Flask, jsonify, redirect, request, send_file, send_from_directory
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,12 +25,36 @@ MAP_PLACEHOLDER = "/static/placeholders/map-blank.svg"
 HERO_PLACEHOLDER = "/static/placeholders/hero-blank.svg"
 SETTINGS_PRESET_PATH = ROOT / "backend" / "data" / "settings_preset.json"
 SETTINGS_PRESETS_PATH = ROOT / "backend" / "data" / "settings_presets.json"
-ROOM_STORE_PATH = ROOT / "backend" / "data" / "runtime" / "rooms.json"
+RUNTIME_DATA_DIR = Path(os.environ.get("OW_RUNTIME_DIR", ROOT / "backend" / "data" / "runtime"))
+ROOM_STORE_PATH = RUNTIME_DATA_DIR / "rooms.json"
+ROOM_HISTORY_DIR = RUNTIME_DATA_DIR / "room_history"
+ROOM_HISTORY_INDEX_PATH = RUNTIME_DATA_DIR / "room_history_index.json"
 ROOM_ROLES = {
     "A": {"role": "red-team", "label": "红队入口", "side": "right"},
     "B": {"role": "blue-team", "label": "蓝队入口", "side": "left"},
     "C": {"role": "admin", "label": "房间管理员入口", "side": None},
     "D": {"role": "broadcast", "label": "直播入口", "side": None},
+}
+ROOM_STORE_SCHEMA_VERSION = 2
+ROOM_HISTORY_SCHEMA_VERSION = 1
+ROOM_HISTORY_INDEX_SCHEMA_VERSION = 1
+SHORT_CODE_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+SHORT_CODE_LENGTH = 4
+SHORT_CODE_PATTERN = re.compile(r"^[0-9a-z]{4}$")
+ARCHIVE_KEY_PATTERN = re.compile(r"^[0-9a-z]{4}(?:-[0-9a-z]{4}){3}$")
+OPERATION_PART_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
+MAX_SHORT_CODE_ATTEMPTS = 10_000
+ALLOWED_OPERATION_CATEGORIES = {
+    "room",
+    "settings",
+    "map",
+    "lineup",
+    "ban",
+    "score",
+    "rest",
+    "pause",
+    "notice",
+    "ui",
 }
 DEFAULT_GLOBAL_SETTINGS = {
     "roomsPerHour": 5,
@@ -37,6 +62,10 @@ DEFAULT_GLOBAL_SETTINGS = {
     "defaultSettings": None,
 }
 room_store_lock = threading.Lock()
+
+
+class CodeSpaceExhausted(RuntimeError):
+    pass
 
 
 def create_app() -> Flask:
@@ -107,18 +136,31 @@ def create_app() -> Flask:
         with room_store_lock:
             store = load_room_store_unlocked()
             now = current_timestamp()
-            cleanup_inactive_rooms_unlocked(store, now)
+            store_changed = cleanup_inactive_rooms_unlocked(store, now)
             client_ip = get_client_ip()
             creation_window = prune_creation_window_unlocked(store, client_ip, now)
             limit = int(store["globalSettings"].get("roomsPerHour") or DEFAULT_GLOBAL_SETTINGS["roomsPerHour"])
 
             if len(creation_window) >= limit:
+                if store_changed:
+                    save_room_store_unlocked(store)
                 return jsonify({"error": "rate_limited", "limit": limit}), 429
 
-            room = create_room_record_unlocked(store, now)
+            try:
+                room = create_room_record_unlocked(store, now)
+            except CodeSpaceExhausted:
+                if store_changed:
+                    save_room_store_unlocked(store)
+                return jsonify({"error": "code_space_exhausted"}), 503
+
             creation_window.append(now)
             store.setdefault("createLog", {})[client_ip] = creation_window
-            save_room_store_unlocked(store)
+
+            try:
+                save_room_store_unlocked(store)
+            except Exception:
+                rollback_created_room_unlocked(store, room)
+                raise
 
         return jsonify(format_created_room(room))
 
@@ -127,19 +169,17 @@ def create_app() -> Flask:
         with room_store_lock:
             store = load_room_store_unlocked()
             now = current_timestamp()
-            cleanup_inactive_rooms_unlocked(store, now)
+            store_changed = cleanup_inactive_rooms_unlocked(store, now)
             lookup = find_room_by_token_unlocked(store, room_token)
 
             if not lookup:
-                save_room_store_unlocked(store)
+                if store_changed:
+                    save_room_store_unlocked(store)
+                if is_archived_token_unlocked(room_token):
+                    return jsonify({"error": "closed"}), 410
                 return jsonify({"error": "not_found"}), 404
 
             room, portal_code = lookup
-
-            if room.get("closedAt"):
-                save_room_store_unlocked(store)
-                return jsonify({"error": "closed"}), 410
-
             touch_room_unlocked(room, now)
             save_room_store_unlocked(store)
 
@@ -150,19 +190,17 @@ def create_app() -> Flask:
         with room_store_lock:
             store = load_room_store_unlocked()
             now = current_timestamp()
-            cleanup_inactive_rooms_unlocked(store, now)
+            store_changed = cleanup_inactive_rooms_unlocked(store, now)
             lookup = find_room_by_token_unlocked(store, room_token)
 
             if not lookup:
-                save_room_store_unlocked(store)
+                if store_changed:
+                    save_room_store_unlocked(store)
+                if is_archived_token_unlocked(room_token):
+                    return jsonify({"error": "closed"}), 410
                 return jsonify({"error": "not_found"}), 404
 
             room, _portal_code = lookup
-
-            if room.get("closedAt"):
-                save_room_store_unlocked(store)
-                return jsonify({"error": "closed"}), 410
-
             touch_room_unlocked(room, now)
             save_room_store_unlocked(store)
 
@@ -173,30 +211,43 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         expected_version = payload.get("version")
 
+        try:
+            operation = normalize_operation(payload.get("operation"))
+        except ValueError:
+            return jsonify({"error": "invalid_operation"}), 400
+
         with room_store_lock:
             store = load_room_store_unlocked()
             now = current_timestamp()
-            cleanup_inactive_rooms_unlocked(store, now)
+            store_changed = cleanup_inactive_rooms_unlocked(store, now)
             lookup = find_room_by_token_unlocked(store, room_token)
 
             if not lookup:
-                save_room_store_unlocked(store)
+                if store_changed:
+                    save_room_store_unlocked(store)
+                if is_archived_token_unlocked(room_token):
+                    return jsonify({"error": "closed"}), 410
                 return jsonify({"error": "not_found"}), 404
 
-            room, _portal_code = lookup
-
-            if room.get("closedAt"):
-                save_room_store_unlocked(store)
-                return jsonify({"error": "closed"}), 410
+            room, portal_code = lookup
 
             current_version = int(room.get("version") or 0)
 
             if isinstance(expected_version, int) and expected_version != current_version:
-                save_room_store_unlocked(store)
+                if store_changed:
+                    save_room_store_unlocked(store)
                 return jsonify({"error": "version_conflict", "version": current_version, "snapshot": room.get("snapshot")}), 409
 
-            room["snapshot"] = payload.get("snapshot")
-            room["version"] = current_version + 1
+            next_version = current_version + 1
+            next_snapshot = payload.get("snapshot")
+            actor = {
+                "type": "portal",
+                "portalCode": portal_code,
+                "role": ROOM_ROLES[portal_code]["role"],
+            }
+            append_room_history_unlocked(room, now, next_version, next_snapshot, actor, operation)
+            room["snapshot"] = next_snapshot
+            room["version"] = next_version
             touch_room_unlocked(room, now)
             save_room_store_unlocked(store)
 
@@ -224,15 +275,87 @@ def create_app() -> Flask:
             if not is_admin_hash_valid_unlocked(store, admin_hash):
                 return jsonify({"error": "not_found"}), 404
 
+            now = current_timestamp()
+            cleanup_inactive_rooms_unlocked(store, now)
             room = next((entry for entry in store.get("rooms", []) if entry.get("id") == room_id), None)
 
             if not room:
+                save_room_store_unlocked(store)
                 return jsonify({"error": "not_found"}), 404
 
-            room["closedAt"] = room.get("closedAt") or current_timestamp()
+            close_room_unlocked(room, now, "manual")
+            store["rooms"] = [entry for entry in store.get("rooms", []) if entry is not room]
             save_room_store_unlocked(store)
 
         return jsonify({"ok": True})
+
+    @app.get("/api/admin/<admin_hash>/room-history")
+    def admin_room_history(admin_hash: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+
+            if not is_admin_hash_valid_unlocked(store, admin_hash):
+                return jsonify({"error": "not_found"}), 404
+
+            now = current_timestamp()
+            cleanup_inactive_rooms_unlocked(store, now)
+            save_room_store_unlocked(store)
+            index = load_history_index_unlocked()
+            active_rooms = {
+                str(room.get("archiveKey")): room
+                for room in store.get("rooms", [])
+                if room.get("archiveKey")
+            }
+            items = []
+
+            for summary in index.get("items", {}).values():
+                item = dict(summary)
+                active_room = active_rooms.get(str(item.get("archiveKey")))
+
+                if active_room:
+                    item["status"] = "active"
+                    item["lastActiveAt"] = active_room.get("lastActiveAt")
+                    item["currentVersion"] = active_room.get("version", 0)
+
+                items.append(item)
+
+            items.sort(key=lambda item: (int(item.get("createdAt") or 0), str(item.get("archiveKey") or "")), reverse=True)
+            page = clamp_int(request.args.get("page"), 1, 1_000_000, 1)
+            page_size = clamp_int(request.args.get("pageSize"), 1, 100, 20)
+            start = (page - 1) * page_size
+            paged_items = items[start : start + page_size]
+
+        return jsonify({"items": paged_items, "total": len(items), "page": page, "pageSize": page_size})
+
+    @app.get("/api/admin/<admin_hash>/room-history/<archive_key>")
+    def admin_room_history_detail(admin_hash: str, archive_key: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+
+            if not is_admin_hash_valid_unlocked(store, admin_hash):
+                return jsonify({"error": "not_found"}), 404
+
+            document = load_history_document_by_key_unlocked(archive_key)
+
+            if document is None:
+                return jsonify({"error": "not_found"}), 404
+
+        return jsonify(document)
+
+    @app.get("/api/admin/<admin_hash>/room-history/<archive_key>/download")
+    def admin_room_history_download(admin_hash: str, archive_key: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+
+            if not is_admin_hash_valid_unlocked(store, admin_hash):
+                return jsonify({"error": "not_found"}), 404
+
+            history_path = get_history_path(archive_key)
+
+            if history_path is None or not history_path.is_file():
+                return jsonify({"error": "not_found"}), 404
+
+        return send_file(history_path, as_attachment=True, download_name=history_path.name, mimetype="application/json")
 
     @app.get("/api/admin/<admin_hash>/settings")
     def get_admin_settings(admin_hash: str) -> Any:
@@ -280,66 +403,472 @@ def current_timestamp() -> int:
 def load_room_store_unlocked() -> dict[str, Any]:
     if ROOM_STORE_PATH.exists():
         with ROOM_STORE_PATH.open(encoding="utf-8") as file:
-            store = json.load(file)
+            raw_store = json.load(file)
     else:
-        store = {}
+        raw_store = {}
 
-    admin_hash = os.environ.get("OW_ADMIN_HASH") or store.get("adminHash") or generate_hash()
+    schema_version = int(raw_store.get("schemaVersion") or 0)
+    admin_hash = os.environ.get("OW_ADMIN_HASH") or raw_store.get("adminHash") or generate_admin_hash()
     global_settings = {
         **DEFAULT_GLOBAL_SETTINGS,
-        **(store.get("globalSettings") if isinstance(store.get("globalSettings"), dict) else {}),
+        **(raw_store.get("globalSettings") if isinstance(raw_store.get("globalSettings"), dict) else {}),
     }
     store = {
+        "schemaVersion": ROOM_STORE_SCHEMA_VERSION,
         "adminHash": admin_hash,
         "globalSettings": global_settings,
-        "createLog": store.get("createLog") if isinstance(store.get("createLog"), dict) else {},
-        "rooms": store.get("rooms") if isinstance(store.get("rooms"), list) else [],
+        "createLog": raw_store.get("createLog") if isinstance(raw_store.get("createLog"), dict) else {},
+        "rooms": (
+            [room for room in raw_store.get("rooms", []) if isinstance(room, dict)]
+            if schema_version == ROOM_STORE_SCHEMA_VERSION and isinstance(raw_store.get("rooms"), list)
+            else []
+        ),
     }
+
+    if schema_version == ROOM_STORE_SCHEMA_VERSION and store["rooms"]:
+        reconcile_active_store_from_history_index_unlocked(store)
 
     return store
 
 
 def save_room_store_unlocked(store: dict[str, Any]) -> None:
-    ROOM_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = ROOM_STORE_PATH.with_suffix(".tmp")
+    save_json_atomic(ROOM_STORE_PATH, store)
+
+
+def save_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
 
     with temporary_path.open("w", encoding="utf-8") as file:
-        json.dump(store, file, ensure_ascii=False, indent=2)
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
 
-    os.replace(temporary_path, ROOM_STORE_PATH)
+    os.replace(temporary_path, path)
 
 
 def initialize_room_store() -> None:
     with room_store_lock:
+        ROOM_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        rebuild_history_index_unlocked()
         store = load_room_store_unlocked()
+        reconcile_active_rooms_unlocked(store)
+        cleanup_inactive_rooms_unlocked(store, current_timestamp())
         save_room_store_unlocked(store)
         print(f"Global admin URL: /admin/{store['adminHash']}")
 
 
-def generate_hash() -> str:
+def generate_admin_hash() -> str:
     return secrets.token_urlsafe(24)
 
 
+def generate_short_code() -> str:
+    return "".join(secrets.choice(SHORT_CODE_ALPHABET) for _ in range(SHORT_CODE_LENGTH))
+
+
+def allocate_short_code(used_codes: set[str]) -> str:
+    for _ in range(MAX_SHORT_CODE_ATTEMPTS):
+        code = generate_short_code()
+
+        if code not in used_codes:
+            used_codes.add(code)
+            return code
+
+    raise CodeSpaceExhausted("Unable to allocate a unique short code")
+
+
+def collect_active_codes(store: dict[str, Any]) -> set[str]:
+    codes: set[str] = set()
+
+    for room in store.get("rooms", []):
+        room_id = room.get("id")
+
+        if isinstance(room_id, str):
+            codes.add(room_id)
+
+        tokens = room.get("tokens") if isinstance(room.get("tokens"), dict) else {}
+        codes.update(str(token) for token in tokens.values())
+
+    return codes
+
+
+def build_archive_key(tokens: dict[str, Any]) -> str:
+    return "-".join(str(tokens.get(portal_code) or "") for portal_code in ROOM_ROLES)
+
+
 def create_room_record_unlocked(store: dict[str, Any], now: int) -> dict[str, Any]:
-    existing_ids = {room.get("id") for room in store.get("rooms", [])}
-    room_id = generate_hash()
+    active_codes = collect_active_codes(store)
 
-    while room_id in existing_ids:
-        room_id = generate_hash()
+    for _ in range(MAX_SHORT_CODE_ATTEMPTS):
+        candidate_codes = set(active_codes)
+        room_id = allocate_short_code(candidate_codes)
+        tokens = {portal_code: allocate_short_code(candidate_codes) for portal_code in ROOM_ROLES}
+        archive_key = build_archive_key(tokens)
+        history_path = get_history_path(archive_key)
 
-    tokens = {portal_code: generate_hash() for portal_code in ROOM_ROLES}
-    room = {
-        "id": room_id,
-        "tokens": tokens,
-        "createdAt": now,
-        "lastActiveAt": now,
+        if history_path is None or history_path.exists():
+            continue
+
+        room = {
+            "id": room_id,
+            "archiveKey": archive_key,
+            "tokens": tokens,
+            "createdAt": now,
+            "lastActiveAt": now,
+            "version": 0,
+            "snapshot": None,
+            "settings": store.get("globalSettings", {}).get("defaultSettings"),
+        }
+        create_history_document_unlocked(build_initial_history_document(room))
+        store.setdefault("rooms", []).append(room)
+        return room
+
+    raise CodeSpaceExhausted("Unable to allocate an unused room archive key")
+
+
+def rollback_created_room_unlocked(store: dict[str, Any], room: dict[str, Any]) -> None:
+    store["rooms"] = [entry for entry in store.get("rooms", []) if entry is not room]
+    archive_key = str(room.get("archiveKey") or "")
+    history_path = get_history_path(archive_key)
+
+    if history_path and history_path.exists():
+        history_path.unlink()
+
+    try:
+        remove_history_index_entry_unlocked(archive_key)
+    except Exception:
+        pass
+
+
+def normalize_operation(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"category": "room", "action": "snapshot_updated", "details": {}}
+
+    if not isinstance(value, dict):
+        raise ValueError("Operation must be an object")
+
+    category = str(value.get("category") or "").strip().lower()
+    action = str(value.get("action") or "").strip().lower()
+    details = value.get("details", {})
+
+    if category not in ALLOWED_OPERATION_CATEGORIES:
+        raise ValueError("Unsupported operation category")
+
+    if not OPERATION_PART_PATTERN.fullmatch(action):
+        raise ValueError("Invalid operation action")
+
+    if not isinstance(details, dict):
+        raise ValueError("Operation details must be an object")
+
+    return {"category": category, "action": action, "details": details}
+
+
+def build_initial_history_document(room: dict[str, Any]) -> dict[str, Any]:
+    created_at = int(room.get("createdAt") or current_timestamp())
+    archive_key = str(room.get("archiveKey") or build_archive_key(room.get("tokens", {})))
+    return {
+        "schemaVersion": ROOM_HISTORY_SCHEMA_VERSION,
+        "archiveKey": archive_key,
+        "roomId": room.get("id"),
+        "tokens": dict(room.get("tokens", {})),
+        "status": "active",
+        "createdAt": created_at,
+        "updatedAt": created_at,
+        "lastActiveAt": int(room.get("lastActiveAt") or created_at),
         "closedAt": None,
-        "version": 0,
-        "snapshot": None,
-        "settings": store.get("globalSettings", {}).get("defaultSettings"),
+        "closeReason": None,
+        "currentVersion": int(room.get("version") or 0),
+        "currentSnapshot": room.get("snapshot"),
+        "history": [
+            {
+                "sequence": 0,
+                "timestamp": created_at,
+                "version": int(room.get("version") or 0),
+                "actor": {"type": "system", "portalCode": None, "role": "system"},
+                "operation": {"category": "lifecycle", "action": "created", "details": {}},
+                "snapshot": room.get("snapshot"),
+            }
+        ],
     }
-    store.setdefault("rooms", []).append(room)
-    return room
+
+
+def create_history_document_unlocked(document: dict[str, Any]) -> None:
+    archive_key = str(document.get("archiveKey") or "")
+    history_path = get_history_path(archive_key)
+
+    if history_path is None:
+        raise ValueError("Invalid archive key")
+
+    ROOM_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    descriptor: int | None = None
+
+    try:
+        descriptor = os.open(history_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            descriptor = None
+            json.dump(document, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+
+        update_history_index_unlocked(document)
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+
+        if history_path.exists():
+            history_path.unlink()
+
+        raise
+
+
+def append_room_history_unlocked(
+    room: dict[str, Any],
+    timestamp: int,
+    version: int,
+    snapshot: Any,
+    actor: dict[str, Any],
+    operation: dict[str, Any],
+    *,
+    status: str | None = None,
+    closed_at: int | None = None,
+    close_reason: str | None = None,
+    last_active_at: int | None = None,
+) -> None:
+    archive_key = str(room.get("archiveKey") or "")
+    document = load_history_document_by_key_unlocked(archive_key)
+
+    if document is None:
+        raise FileNotFoundError(f"Missing history document for room {room.get('id')}")
+
+    history = document.get("history") if isinstance(document.get("history"), list) else []
+    last_sequence = int(history[-1].get("sequence") or 0) if history else -1
+    history.append(
+        {
+            "sequence": last_sequence + 1,
+            "timestamp": timestamp,
+            "version": version,
+            "actor": actor,
+            "operation": operation,
+            "snapshot": snapshot,
+        }
+    )
+    document["history"] = history
+    document["updatedAt"] = timestamp
+    document["lastActiveAt"] = int(last_active_at if last_active_at is not None else timestamp)
+    document["currentVersion"] = version
+    document["currentSnapshot"] = snapshot
+
+    if status is not None:
+        document["status"] = status
+        document["closedAt"] = closed_at
+        document["closeReason"] = close_reason
+
+    save_json_atomic(get_history_path_or_raise(archive_key), document)
+    update_history_index_unlocked(document)
+
+
+def close_room_unlocked(room: dict[str, Any], now: int, reason: str) -> None:
+    archive_key = str(room.get("archiveKey") or "")
+    document = load_history_document_by_key_unlocked(archive_key)
+
+    if document is None:
+        raise FileNotFoundError(f"Missing history document for room {room.get('id')}")
+
+    if document.get("status") != "active":
+        return
+
+    is_manual = reason == "manual"
+    append_room_history_unlocked(
+        room,
+        now,
+        int(room.get("version") or 0),
+        room.get("snapshot"),
+        (
+            {"type": "global_admin", "portalCode": None, "role": "global-admin"}
+            if is_manual
+            else {"type": "system", "portalCode": None, "role": "system"}
+        ),
+        {
+            "category": "lifecycle",
+            "action": "closed" if is_manual else "expired",
+            "details": {"reason": reason},
+        },
+        status="closed" if is_manual else "expired",
+        closed_at=now,
+        close_reason=reason,
+        last_active_at=int(room.get("lastActiveAt") or room.get("createdAt") or now),
+    )
+
+
+def get_history_path(archive_key: str) -> Path | None:
+    if not ARCHIVE_KEY_PATTERN.fullmatch(archive_key):
+        return None
+
+    return ROOM_HISTORY_DIR / f"{archive_key}.json"
+
+
+def get_history_path_or_raise(archive_key: str) -> Path:
+    history_path = get_history_path(archive_key)
+
+    if history_path is None:
+        raise ValueError("Invalid archive key")
+
+    return history_path
+
+
+def load_history_document_by_key_unlocked(archive_key: str) -> dict[str, Any] | None:
+    history_path = get_history_path(archive_key)
+
+    if history_path is None or not history_path.is_file():
+        return None
+
+    with history_path.open(encoding="utf-8") as file:
+        document = json.load(file)
+
+    return document if isinstance(document, dict) else None
+
+
+def history_summary_from_document(document: dict[str, Any]) -> dict[str, Any]:
+    history = document.get("history") if isinstance(document.get("history"), list) else []
+    return {
+        "archiveKey": document.get("archiveKey"),
+        "roomId": document.get("roomId"),
+        "tokens": document.get("tokens") if isinstance(document.get("tokens"), dict) else {},
+        "status": document.get("status"),
+        "createdAt": document.get("createdAt"),
+        "updatedAt": document.get("updatedAt"),
+        "lastActiveAt": document.get("lastActiveAt"),
+        "closedAt": document.get("closedAt"),
+        "closeReason": document.get("closeReason"),
+        "currentVersion": document.get("currentVersion", 0),
+        "operationCount": len(history),
+    }
+
+
+def empty_history_index() -> dict[str, Any]:
+    return {"schemaVersion": ROOM_HISTORY_INDEX_SCHEMA_VERSION, "items": {}}
+
+
+def load_history_index_unlocked() -> dict[str, Any]:
+    if not ROOM_HISTORY_INDEX_PATH.is_file():
+        return rebuild_history_index_unlocked()
+
+    try:
+        with ROOM_HISTORY_INDEX_PATH.open(encoding="utf-8") as file:
+            index = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return rebuild_history_index_unlocked()
+
+    if not isinstance(index, dict) or not isinstance(index.get("items"), dict):
+        return rebuild_history_index_unlocked()
+
+    return index
+
+
+def rebuild_history_index_unlocked() -> dict[str, Any]:
+    ROOM_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    index = empty_history_index()
+
+    for history_path in ROOM_HISTORY_DIR.glob("*.json"):
+        if not ARCHIVE_KEY_PATTERN.fullmatch(history_path.stem):
+            continue
+
+        try:
+            with history_path.open(encoding="utf-8") as file:
+                document = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(document, dict):
+            continue
+
+        archive_key = str(document.get("archiveKey") or "")
+
+        if ARCHIVE_KEY_PATTERN.fullmatch(archive_key):
+            index["items"][archive_key] = history_summary_from_document(document)
+
+    save_json_atomic(ROOM_HISTORY_INDEX_PATH, index)
+    return index
+
+
+def update_history_index_unlocked(document: dict[str, Any]) -> None:
+    archive_key = str(document.get("archiveKey") or "")
+
+    if not ARCHIVE_KEY_PATTERN.fullmatch(archive_key):
+        raise ValueError("Invalid archive key")
+
+    index = load_history_index_unlocked()
+    index.setdefault("items", {})[archive_key] = history_summary_from_document(document)
+    save_json_atomic(ROOM_HISTORY_INDEX_PATH, index)
+
+
+def remove_history_index_entry_unlocked(archive_key: str) -> None:
+    index = load_history_index_unlocked()
+    index.setdefault("items", {}).pop(archive_key, None)
+    save_json_atomic(ROOM_HISTORY_INDEX_PATH, index)
+
+
+def reconcile_active_rooms_unlocked(store: dict[str, Any]) -> None:
+    active_rooms: list[dict[str, Any]] = []
+
+    for room in store.get("rooms", []):
+        tokens = room.get("tokens") if isinstance(room.get("tokens"), dict) else {}
+        codes = [room.get("id"), *(tokens.get(portal_code) for portal_code in ROOM_ROLES)]
+
+        if len(codes) != 5 or any(not isinstance(code, str) or not SHORT_CODE_PATTERN.fullmatch(code) for code in codes):
+            continue
+
+        if len(set(codes)) != 5:
+            continue
+
+        archive_key = build_archive_key(tokens)
+        room["archiveKey"] = archive_key
+        document = load_history_document_by_key_unlocked(archive_key)
+
+        if document is None:
+            create_history_document_unlocked(build_initial_history_document(room))
+            document = load_history_document_by_key_unlocked(archive_key)
+
+        if not document or document.get("status") != "active":
+            continue
+
+        history_version = int(document.get("currentVersion") or 0)
+
+        if history_version > int(room.get("version") or 0):
+            room["version"] = history_version
+            room["snapshot"] = document.get("currentSnapshot")
+
+        active_rooms.append(room)
+
+    store["rooms"] = active_rooms
+
+
+def reconcile_active_store_from_history_index_unlocked(store: dict[str, Any]) -> None:
+    index = load_history_index_unlocked()
+    summaries = index.get("items", {})
+    active_rooms: list[dict[str, Any]] = []
+
+    for room in store.get("rooms", []):
+        archive_key = str(room.get("archiveKey") or build_archive_key(room.get("tokens", {})))
+        summary = summaries.get(archive_key)
+
+        if isinstance(summary, dict) and summary.get("status") != "active":
+            continue
+
+        if isinstance(summary, dict) and int(summary.get("currentVersion") or 0) > int(room.get("version") or 0):
+            document = load_history_document_by_key_unlocked(archive_key)
+
+            if document is not None:
+                room["version"] = int(document.get("currentVersion") or 0)
+                room["snapshot"] = document.get("currentSnapshot")
+
+        room["archiveKey"] = archive_key
+        active_rooms.append(room)
+
+    store["rooms"] = active_rooms
 
 
 def get_client_ip() -> str:
@@ -359,18 +888,31 @@ def prune_creation_window_unlocked(store: dict[str, Any], client_ip: str, now: i
     return timestamps
 
 
-def cleanup_inactive_rooms_unlocked(store: dict[str, Any], now: int) -> None:
+def cleanup_inactive_rooms_unlocked(store: dict[str, Any], now: int) -> bool:
     timeout_minutes = int(store.get("globalSettings", {}).get("inactiveTimeoutMinutes") or 30)
     timeout_seconds = timeout_minutes * 60
+    active_rooms: list[dict[str, Any]] = []
+    changed = False
 
     for room in store.get("rooms", []):
         if room.get("closedAt"):
+            close_room_unlocked(room, int(room.get("closedAt") or now), "manual")
+            changed = True
             continue
 
         last_active = int(room.get("lastActiveAt") or room.get("createdAt") or now)
 
         if now - last_active > timeout_seconds:
-            room["closedAt"] = now
+            close_room_unlocked(room, now, "inactive_timeout")
+            changed = True
+            continue
+
+        active_rooms.append(room)
+
+    if changed:
+        store["rooms"] = active_rooms
+
+    return changed
 
 
 def touch_room_unlocked(room: dict[str, Any], now: int) -> None:
@@ -378,6 +920,9 @@ def touch_room_unlocked(room: dict[str, Any], now: int) -> None:
 
 
 def find_room_by_token_unlocked(store: dict[str, Any], token: str) -> tuple[dict[str, Any], str] | None:
+    if not SHORT_CODE_PATTERN.fullmatch(token):
+        return None
+
     for room in store.get("rooms", []):
         tokens = room.get("tokens") if isinstance(room.get("tokens"), dict) else {}
 
@@ -386,6 +931,21 @@ def find_room_by_token_unlocked(store: dict[str, Any], token: str) -> tuple[dict
                 return room, portal_code
 
     return None
+
+
+def is_archived_token_unlocked(token: str) -> bool:
+    if not SHORT_CODE_PATTERN.fullmatch(token):
+        return False
+
+    index = load_history_index_unlocked()
+
+    for summary in index.get("items", {}).values():
+        tokens = summary.get("tokens") if isinstance(summary.get("tokens"), dict) else {}
+
+        if any(secrets.compare_digest(str(value), token) for value in tokens.values()):
+            return True
+
+    return False
 
 
 def is_admin_hash_valid_unlocked(store: dict[str, Any], admin_hash: str) -> bool:
@@ -421,7 +981,7 @@ def format_room_token_payload(room: dict[str, Any], portal_code: str) -> dict[st
             "id": room.get("id"),
             "createdAt": room.get("createdAt"),
             "lastActiveAt": room.get("lastActiveAt"),
-            "closedAt": room.get("closedAt"),
+            "closedAt": None,
             "settings": room.get("settings"),
         },
         "portal": {"code": portal_code, **ROOM_ROLES[portal_code]},
@@ -435,7 +995,7 @@ def format_admin_room(room: dict[str, Any]) -> dict[str, Any]:
         "id": room.get("id"),
         "createdAt": room.get("createdAt"),
         "lastActiveAt": room.get("lastActiveAt"),
-        "closedAt": room.get("closedAt"),
+        "closedAt": None,
         "version": room.get("version", 0),
         "links": format_room_links(room),
     }

@@ -21,6 +21,7 @@ type OverlayKind = "map" | "lineup" | "ban" | "score" | "rest";
 type CheckpointKey = keyof SettingsState["checkpoints"][number];
 type MatchFormat = "ft2" | "ft3" | "ft4";
 type OpeningSidePolicy = "random" | "red" | "blue";
+type OperationCategory = "room" | "settings" | "map" | "lineup" | "ban" | "score" | "rest" | "pause" | "notice" | "ui";
 
 interface TeamState {
   id: string;
@@ -225,6 +226,17 @@ interface SharedRoomSnapshot {
   countdownStartSeconds: number;
 }
 
+interface RoomOperation {
+  category: OperationCategory;
+  action: string;
+  details: Record<string, unknown>;
+}
+
+interface PendingSnapshotPush {
+  snapshot: SharedRoomSnapshot;
+  operation: RoomOperation;
+}
+
 interface RoomLinkInfo {
   hash: string;
   url: string;
@@ -266,6 +278,27 @@ interface AdminRoom {
   closedAt: number | null;
   version: number;
   links: Record<string, RoomLinkInfo>;
+}
+
+interface RoomHistorySummary {
+  archiveKey: string;
+  roomId: string;
+  tokens: Record<string, string>;
+  status: "active" | "closed" | "expired";
+  createdAt: number;
+  updatedAt: number;
+  lastActiveAt: number;
+  closedAt: number | null;
+  closeReason: string | null;
+  currentVersion: number;
+  operationCount: number;
+}
+
+interface RoomHistoryPage {
+  items: RoomHistorySummary[];
+  total: number;
+  page: number;
+  pageSize: number;
 }
 
 const lineupSlots: LineupSlot[] = [
@@ -390,10 +423,11 @@ let countdownTimerId: number | null = null;
 let serverSnapshotVersion = 0;
 let serverSnapshotPollTimerId: number | null = null;
 let serverSnapshotPushInFlight = false;
-let pendingServerSnapshot = false;
+let pendingServerSnapshot: PendingSnapshotPush | null = null;
 let lastCreatedRoom: CreatedRoomResponse | null = null;
 let adminSettings: AdminSettings | null = null;
 let adminRooms: AdminRoom[] = [];
+let adminRoomHistory: RoomHistoryPage = { items: [], total: 0, page: 1, pageSize: 20 };
 
 renderShell(app);
 void loadInitialData();
@@ -535,7 +569,17 @@ function readSharedRoomSnapshot(): SharedRoomSnapshot | null {
   }
 }
 
-function publishSharedRoomSnapshot(): void {
+function createRoomOperation(
+  category: OperationCategory,
+  action: string,
+  details: Record<string, unknown> = {},
+): RoomOperation {
+  return { category, action, details };
+}
+
+function publishSharedRoomSnapshot(
+  operation: RoomOperation = createRoomOperation("room", "snapshot_updated"),
+): void {
   if (!currentState) {
     return;
   }
@@ -546,7 +590,7 @@ function publishSharedRoomSnapshot(): void {
   roomChannel?.postMessage(snapshot);
 
   if (roomToken) {
-    queueServerSnapshotPush(snapshot);
+    queueServerSnapshotPush(snapshot, operation);
   }
 }
 
@@ -574,16 +618,16 @@ function createSharedRoomSnapshot(): SharedRoomSnapshot {
   };
 }
 
-function queueServerSnapshotPush(snapshot: SharedRoomSnapshot): void {
+function queueServerSnapshotPush(snapshot: SharedRoomSnapshot, operation: RoomOperation): void {
   if (serverSnapshotPushInFlight) {
-    pendingServerSnapshot = true;
+    pendingServerSnapshot = { snapshot, operation };
     return;
   }
 
-  void pushServerSnapshot(snapshot);
+  void pushServerSnapshot(snapshot, operation);
 }
 
-async function pushServerSnapshot(snapshot: SharedRoomSnapshot): Promise<void> {
+async function pushServerSnapshot(snapshot: SharedRoomSnapshot, operation: RoomOperation): Promise<void> {
   if (!roomToken) {
     return;
   }
@@ -594,7 +638,7 @@ async function pushServerSnapshot(snapshot: SharedRoomSnapshot): Promise<void> {
     const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/snapshot`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ version: serverSnapshotVersion, snapshot }),
+      body: JSON.stringify({ version: serverSnapshotVersion, snapshot, operation }),
     });
 
     if (response.status === 409) {
@@ -615,9 +659,10 @@ async function pushServerSnapshot(snapshot: SharedRoomSnapshot): Promise<void> {
   } finally {
     serverSnapshotPushInFlight = false;
 
-    if (pendingServerSnapshot && currentState) {
-      pendingServerSnapshot = false;
-      queueServerSnapshotPush(createSharedRoomSnapshot());
+    if (pendingServerSnapshot) {
+      const pending = pendingServerSnapshot;
+      pendingServerSnapshot = null;
+      queueServerSnapshotPush(pending.snapshot, pending.operation);
     }
   }
 }
@@ -851,7 +896,7 @@ async function loadInitialData(): Promise<void> {
     openingSide = resolveOpeningSide();
     confirmedLineups = {};
     resetCountdown();
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("room", "initialized"));
     startCountdownTimer();
     startServerSnapshotPolling();
     renderCurrent();
@@ -1025,18 +1070,21 @@ function bindCopyLinkButtons(): void {
   });
 }
 
-async function loadGlobalAdminData(): Promise<void> {
+async function loadGlobalAdminData(page = adminRoomHistory.page): Promise<void> {
   if (!globalAdminHash) {
     renderError("缺少全局管理哈希。");
     return;
   }
 
-  const [settingsResponse, roomsResponse] = await Promise.all([
+  const [settingsResponse, roomsResponse, historyResponse] = await Promise.all([
     fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/settings`, { headers: { Accept: "application/json" } }),
     fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/rooms`, { headers: { Accept: "application/json" } }),
+    fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/room-history?page=${page}&pageSize=20`, {
+      headers: { Accept: "application/json" },
+    }),
   ]);
 
-  if (!settingsResponse.ok || !roomsResponse.ok) {
+  if (!settingsResponse.ok || !roomsResponse.ok || !historyResponse.ok) {
     renderError("全局管理入口不存在。");
     return;
   }
@@ -1044,12 +1092,15 @@ async function loadGlobalAdminData(): Promise<void> {
   adminSettings = await settingsResponse.json() as AdminSettings;
   const roomsPayload = await roomsResponse.json() as { rooms: AdminRoom[] };
   adminRooms = roomsPayload.rooms;
+  adminRoomHistory = await historyResponse.json() as RoomHistoryPage;
 }
 
 function renderGlobalAdminPage(message = ""): void {
   if (!adminSettings) {
     return;
   }
+
+  const historyPageCount = Math.max(1, Math.ceil(adminRoomHistory.total / adminRoomHistory.pageSize));
 
   app.innerHTML = `
     <main class="page-shell">
@@ -1075,12 +1126,41 @@ function renderGlobalAdminPage(message = ""): void {
           ${adminRooms.map(renderAdminRoom).join("") || `<p class="empty-room-list">暂无房间</p>`}
         </div>
       </section>
+      <section class="global-admin-panel">
+        <div class="created-room-header">
+          <span>永久历史</span>
+          <strong>${adminRoomHistory.total} 份 JSON</strong>
+        </div>
+        <div class="admin-room-list history-room-list">
+          ${adminRoomHistory.items.map(renderRoomHistorySummary).join("") || `<p class="empty-room-list">暂无历史记录</p>`}
+        </div>
+        <nav class="history-pagination" aria-label="历史分页">
+          <button id="previousHistoryPage" type="button" ${adminRoomHistory.page <= 1 ? "disabled" : ""}>上一页</button>
+          <span>第 ${adminRoomHistory.page} / ${historyPageCount} 页</span>
+          <button id="nextHistoryPage" type="button" ${adminRoomHistory.page >= historyPageCount ? "disabled" : ""}>下一页</button>
+        </nav>
+      </section>
+      <dialog id="roomHistoryDialog" class="history-dialog">
+        <header>
+          <strong id="roomHistoryDialogTitle">房间历史 JSON</strong>
+          <button id="closeRoomHistoryDialog" type="button" aria-label="关闭历史详情">关闭</button>
+        </header>
+        <pre id="roomHistoryJson">正在载入...</pre>
+      </dialog>
     </main>
   `;
 
   document.getElementById("saveGlobalSettings")?.addEventListener("click", saveGlobalSettings);
   app.querySelectorAll<HTMLButtonElement>(".close-admin-room").forEach((button) => {
     button.addEventListener("click", () => closeAdminRoom(button.dataset.roomId ?? ""));
+  });
+  app.querySelectorAll<HTMLButtonElement>(".view-room-history").forEach((button) => {
+    button.addEventListener("click", () => viewRoomHistory(button.dataset.archiveKey ?? ""));
+  });
+  document.getElementById("previousHistoryPage")?.addEventListener("click", () => changeHistoryPage(adminRoomHistory.page - 1));
+  document.getElementById("nextHistoryPage")?.addEventListener("click", () => changeHistoryPage(adminRoomHistory.page + 1));
+  document.getElementById("closeRoomHistoryDialog")?.addEventListener("click", () => {
+    (document.getElementById("roomHistoryDialog") as HTMLDialogElement | null)?.close();
   });
   bindCopyLinkButtons();
 }
@@ -1107,6 +1187,76 @@ function renderAdminRoom(room: AdminRoom): string {
       </div>
     </article>
   `;
+}
+
+function renderRoomHistorySummary(history: RoomHistorySummary): string {
+  const statusLabels: Record<RoomHistorySummary["status"], string> = {
+    active: "活跃",
+    closed: "手动关闭",
+    expired: "超时归档",
+  };
+  const historyBaseUrl = `/api/admin/${encodeURIComponent(globalAdminHash ?? "")}/room-history/${encodeURIComponent(history.archiveKey)}`;
+
+  return `
+    <article class="admin-room-card history-room-card">
+      <header>
+        <span class="history-status history-status-${escapeHtml(history.status)}">${statusLabels[history.status] ?? history.status}</span>
+        <strong>房间 ${escapeHtml(history.roomId)}</strong>
+        <div class="history-card-actions">
+          <button class="view-room-history" data-archive-key="${escapeHtml(history.archiveKey)}" type="button">查看</button>
+          <a class="download-room-history" href="${escapeHtml(`${historyBaseUrl}/download`)}" download="${escapeHtml(`${history.archiveKey}.json`)}">下载</a>
+        </div>
+      </header>
+      <p>档案：<code>${escapeHtml(history.archiveKey)}</code></p>
+      <p>创建：${formatTimestamp(history.createdAt)} · 更新：${formatTimestamp(history.updatedAt)}${history.closedAt ? ` · 关闭：${formatTimestamp(history.closedAt)}` : ""}</p>
+      <p>版本 ${history.currentVersion} · ${history.operationCount} 条操作${history.closeReason ? ` · 原因：${escapeHtml(history.closeReason)}` : ""}</p>
+      <div class="history-token-list">
+        ${Object.entries(history.tokens).map(([code, token]) => `<code>${escapeHtml(code)}: ${escapeHtml(token)}</code>`).join("")}
+      </div>
+    </article>
+  `;
+}
+
+async function changeHistoryPage(page: number): Promise<void> {
+  if (page < 1) {
+    return;
+  }
+
+  await loadGlobalAdminData(page);
+  renderGlobalAdminPage();
+}
+
+async function viewRoomHistory(archiveKey: string): Promise<void> {
+  if (!globalAdminHash || !archiveKey) {
+    return;
+  }
+
+  const dialog = document.getElementById("roomHistoryDialog") as HTMLDialogElement | null;
+  const title = document.getElementById("roomHistoryDialogTitle");
+  const output = document.getElementById("roomHistoryJson");
+
+  if (!dialog || !title || !output) {
+    return;
+  }
+
+  title.textContent = `${archiveKey}.json`;
+  output.textContent = "正在载入...";
+
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+
+  const response = await fetch(
+    `/api/admin/${encodeURIComponent(globalAdminHash)}/room-history/${encodeURIComponent(archiveKey)}`,
+    { headers: { Accept: "application/json" } },
+  );
+
+  if (!response.ok) {
+    output.textContent = "历史文件载入失败。";
+    return;
+  }
+
+  output.textContent = JSON.stringify(await response.json(), null, 2);
 }
 
 async function saveGlobalSettings(): Promise<void> {
@@ -2345,7 +2495,7 @@ function bindRestEvents(): void {
 function bindPauseEvents(): void {
   document.getElementById("togglePausePanel")?.addEventListener("click", () => {
     pauseState.collapsed = !pauseState.collapsed;
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("ui", "pause_panel_toggled", { collapsed: pauseState.collapsed }));
     renderCurrent();
   });
 
@@ -2564,7 +2714,7 @@ function applySettingsFromForm(): void {
 
   syncMapSelectorTarget(true);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("settings", "updated"));
   renderCurrent();
 }
 
@@ -2596,7 +2746,7 @@ function resetRoomToBeginning(started: boolean): void {
   }
 
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("room", started ? "started" : "reset"));
   renderCurrent();
 }
 
@@ -2665,7 +2815,7 @@ async function savePreset(): Promise<void> {
 
   syncMapSelectorTarget(true);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("settings", "preset_saved", { name }));
   alert(response.ok ? `已保存预设：${name}` : "保存失败");
   await populatePresetSelect();
   renderCurrent();
@@ -2697,7 +2847,7 @@ async function loadPreset(): Promise<void> {
   settingsState = mergeSettings(defaultSettings, selectedPreset);
   syncMapSelectorTarget(true);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("settings", "preset_loaded", { name: selectedName ?? "" }));
   renderCurrent();
 }
 
@@ -2879,7 +3029,7 @@ function restoreCheckpoint(row: number, key: CheckpointKey): void {
   }
 
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("room", "stage_restored", { mapIndex: row, checkpoint: key }));
   renderCurrent();
 }
 
@@ -2950,7 +3100,7 @@ function openMapSelector(targetMapIndex: number): void {
     timedOut: false,
   };
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("map", "selector_opened", { mapIndex: targetMapIndex }));
   renderCurrent();
 }
 
@@ -2966,7 +3116,10 @@ function selectMapChoice(mapKey: string | null): void {
   }
 
   mapSelectorState.selectedMapKey = mapKey;
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("map", "choice_selected", {
+    mapIndex: mapSelectorState.targetMapIndex,
+    mapKey,
+  }));
   updateSelectedMapDom();
 }
 
@@ -2979,7 +3132,7 @@ function randomLegalMapChoice(): void {
 
   if (!choice) {
     adminNotice = "没有可随机选择的合法地图，请手动处理或判负。";
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("map", "random_failed", { mapIndex: mapSelectorState.targetMapIndex }));
     renderCurrent();
     return;
   }
@@ -2996,7 +3149,7 @@ function enableManualMapViolationChoice(): void {
   }
 
   adminNotice = "请选择一个合法地图并点击确认。";
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("map", "manual_override_enabled", { mapIndex: mapSelectorState.targetMapIndex }));
   renderCurrent();
 }
 
@@ -3014,13 +3167,13 @@ function forfeitCurrentMapChoice(): void {
   scoreSelectorState = null;
   if (finishMatchIfSeriesWon()) {
     resetCountdown();
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("map", "forfeited", { mapIndex, loserSide, matchFinished: true }));
     renderCurrent();
     return;
   }
   openRestPeriod(mapIndex);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("map", "forfeited", { mapIndex, loserSide, matchFinished: false }));
   renderCurrent();
 }
 
@@ -3058,7 +3211,11 @@ function confirmSelectedMap(): void {
   openLineupSelector(selectedMapIndex);
 
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("map", "confirmed", {
+    mapIndex: selectedMapIndex,
+    mapKey: choice.key,
+    mapName: choice.nameEn,
+  }));
   renderCurrent();
 }
 
@@ -3106,7 +3263,7 @@ function confirmLineups(): void {
     return;
   }
 
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("lineup", "ready", { side }));
   renderCurrent();
 }
 
@@ -3159,7 +3316,10 @@ function selectHeroBan(heroKey: string | null): void {
   }
 
   banSelectorState.selectedHeroKey = heroKey;
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("ban", "choice_selected", {
+    mapIndex: banSelectorState.mapIndex,
+    heroKey,
+  }));
   renderCurrent();
 }
 
@@ -3180,7 +3340,10 @@ function randomLegalBanChoice(): void {
 
   if (!hero) {
     adminNotice = "没有可随机选择的合法英雄，请手动处理或判负。";
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("ban", "random_failed", {
+      mapIndex: banSelectorState.mapIndex,
+      step: banSelectorState.step,
+    }));
     renderCurrent();
     return;
   }
@@ -3197,7 +3360,10 @@ function enableManualBanViolationChoice(): void {
   }
 
   adminNotice = banSelectorState.step === "order-choice" ? "请选择先 Ban 或后 Ban 并点击确认。" : "请选择一个合法英雄并点击确认。";
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("ban", "manual_override_enabled", {
+    mapIndex: banSelectorState.mapIndex,
+    step: banSelectorState.step,
+  }));
   renderCurrent();
 }
 
@@ -3215,13 +3381,13 @@ function forfeitCurrentBanChoice(): void {
   scoreSelectorState = null;
   if (finishMatchIfSeriesWon()) {
     resetCountdown();
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("ban", "forfeited", { mapIndex, loserSide, matchFinished: true }));
     renderCurrent();
     return;
   }
   openRestPeriod(mapIndex);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("ban", "forfeited", { mapIndex, loserSide, matchFinished: false }));
   renderCurrent();
 }
 
@@ -3245,7 +3411,10 @@ function confirmBanSelection(): void {
       createTeamAckNotice(message);
     }
     resetCountdown();
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("ban", "order_confirmed", {
+      mapIndex: banSelectorState.mapIndex,
+      firstBanSide,
+    }));
     renderCurrent();
     return;
   }
@@ -3269,7 +3438,12 @@ function confirmBanSelection(): void {
     banSelectorState.activeSide = getOppositeSide(side);
     banSelectorState.selectedHeroKey = null;
     resetCountdown();
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("ban", "hero_confirmed", {
+      mapIndex: banSelectorState.mapIndex,
+      side,
+      hero: hero.nameEn,
+      phase: "first",
+    }));
     renderCurrent();
     return;
   }
@@ -3278,7 +3452,12 @@ function confirmBanSelection(): void {
   banSelectorState = null;
   openScoreSelectorForMap(mapIndex);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("ban", "hero_confirmed", {
+    mapIndex,
+    side,
+    hero: hero.nameEn,
+    phase: "second",
+  }));
   renderCurrent();
 }
 
@@ -3306,7 +3485,10 @@ function updateScoreValue(control: HTMLInputElement): void {
   }
 
   scoreSelectorState.values[side] = control.value;
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("score", "edited", {
+    mapIndex: scoreSelectorState.mapIndex,
+    side,
+  }));
   renderCurrent();
 }
 
@@ -3326,7 +3508,10 @@ function confirmScoreSelection(): void {
       scoreSelectorState.submittedBy = side;
       scoreSelectorState.rejectedBy = null;
       resetCountdown();
-      publishSharedRoomSnapshot();
+      publishSharedRoomSnapshot(createRoomOperation("score", "submitted", {
+        mapIndex: scoreSelectorState.mapIndex,
+        side,
+      }));
       renderCurrent();
       return;
     }
@@ -3348,7 +3533,10 @@ function rejectScoreSelection(): void {
 
   scoreSelectorState.rejectedBy = side;
   adminNotice = `${getTeamName(side)}未确认比分，等待管理员处理。`;
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("score", "rejected", {
+    mapIndex: scoreSelectorState.mapIndex,
+    side,
+  }));
   renderCurrent();
 }
 
@@ -3379,13 +3567,23 @@ function finalizeScoreSelection(): void {
   scoreSelectorState = null;
   if (finishMatchIfSeriesWon()) {
     resetCountdown();
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("score", "confirmed", {
+      mapIndex,
+      leftScore,
+      rightScore,
+      matchFinished: true,
+    }));
     renderCurrent();
     return;
   }
   openRestPeriod(mapIndex);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("score", "confirmed", {
+    mapIndex,
+    leftScore,
+    rightScore,
+    matchFinished: false,
+  }));
   renderCurrent();
 }
 
@@ -3456,7 +3654,10 @@ function skipRestPeriod(): void {
     return;
   }
 
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("rest", "skip_requested", {
+    mapIndex: restState.mapIndex,
+    side,
+  }));
   renderCurrent();
 }
 
@@ -3483,9 +3684,11 @@ function finishRestPeriod(): void {
     return;
   }
 
+  const mapIndex = restState.mapIndex;
+
   if (finishMatchIfSeriesWon()) {
     resetCountdown();
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("rest", "finished", { mapIndex, matchFinished: true }));
     renderCurrent();
     return;
   }
@@ -3493,7 +3696,7 @@ function finishRestPeriod(): void {
   restState = null;
   openNextMapSelector();
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("rest", "finished", { mapIndex, matchFinished: false }));
   renderCurrent();
 }
 
@@ -3531,7 +3734,11 @@ function updateLineupValue(control: HTMLInputElement | HTMLSelectElement): void 
   }
 
   lineupSelectorState.values[side][slotId] = control.value.trim();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("lineup", "edited", {
+    mapIndex: lineupSelectorState.mapIndex,
+    side,
+    slotId,
+  }));
   updateLineupDom();
 }
 
@@ -3632,7 +3839,7 @@ function finalizeLineupSelection(): void {
   lineupSelectorState = null;
   openBanSelectorForMap(mapIndex);
   resetCountdown();
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("lineup", "confirmed", { mapIndex }));
   renderCurrent();
 }
 
@@ -4757,7 +4964,10 @@ function handleBanSelectionTimeout(): void {
 
   if (!canConfirmBanSelection()) {
     banSelectorState.timedOut = true;
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("ban", "timed_out", {
+      mapIndex: banSelectorState.mapIndex,
+      step: banSelectorState.step,
+    }));
     renderCurrent();
     return;
   }
@@ -4778,7 +4988,7 @@ function handleMapSelectionTimeout(): void {
   }
 
   mapSelectorState.timedOut = true;
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("map", "timed_out", { mapIndex: mapSelectorState.targetMapIndex }));
   renderCurrent();
 }
 
@@ -4794,7 +5004,7 @@ function handleLineupSelectionTimeout(): void {
     }
 
     lineupSelectorState.timedOut = true;
-    publishSharedRoomSnapshot();
+    publishSharedRoomSnapshot(createRoomOperation("lineup", "timed_out", { mapIndex: lineupSelectorState.mapIndex }));
     renderCurrent();
     return;
   }
@@ -4815,7 +5025,7 @@ function handleLineupSelectionTimeout(): void {
   }
 
   lineupSelectorState.timedOut = true;
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("lineup", "timed_out", { mapIndex: lineupSelectorState.mapIndex }));
   renderCurrent();
 }
 
@@ -4843,7 +5053,7 @@ function toggleGlobalPause(): void {
     totalPausedMs: pauseState.totalPausedMs,
     collapsed: false,
   };
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("pause", "started"));
   renderCurrent();
 }
 
@@ -4858,7 +5068,7 @@ function resumeGlobalPause(): void {
     totalPausedMs: pauseState.totalPausedMs + (pauseState.startedAt ? Date.now() - pauseState.startedAt : 0),
     collapsed: false,
   };
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("pause", "resumed"));
   renderCurrent();
 }
 
@@ -4883,7 +5093,7 @@ function acknowledgeTeamNotice(): void {
     teamAckNotice = null;
   }
 
-  publishSharedRoomSnapshot();
+  publishSharedRoomSnapshot(createRoomOperation("notice", "acknowledged", { side: portalConfig.side }));
   renderCurrent();
 }
 

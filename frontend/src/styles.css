@@ -613,6 +613,128 @@ h2 {
   background: rgba(255, 255, 255, 0.06);
 }
 
+.history-room-card {
+  border-left: 3px solid rgba(158, 210, 255, 0.62);
+}
+
+.history-room-card p code {
+  color: #9ed2ff;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+}
+
+.history-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.view-room-history,
+.download-room-history,
+.history-pagination button,
+.history-dialog button {
+  display: inline-grid;
+  place-items: center;
+  min-width: 72px;
+  height: 34px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: #29303f;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 0.84rem;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.view-room-history:hover,
+.view-room-history:focus-visible,
+.download-room-history:hover,
+.download-room-history:focus-visible,
+.history-pagination button:hover:not(:disabled),
+.history-pagination button:focus-visible:not(:disabled),
+.history-dialog button:hover,
+.history-dialog button:focus-visible {
+  background: #f11b2a;
+  outline: 0;
+}
+
+.history-status-active { color: #86efac !important; }
+.history-status-closed { color: #fca5a5 !important; }
+.history-status-expired { color: #fcd34d !important; }
+
+.history-token-list {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.history-token-list code {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 0.82rem;
+  font-weight: 850;
+  text-align: center;
+}
+
+.history-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: rgba(245, 247, 251, 0.72);
+  font-size: 0.86rem;
+  font-weight: 900;
+}
+
+.history-pagination button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.history-dialog {
+  width: min(980px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
+  background: #0c0f16;
+  color: #ffffff;
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.72);
+}
+
+.history-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.74);
+  backdrop-filter: blur(4px);
+}
+
+.history-dialog header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  background: #151a25;
+}
+
+.history-dialog pre {
+  min-height: 320px;
+  margin: 0;
+  padding: 18px;
+  overflow: auto;
+  color: #dbeafe;
+  font: 0.82rem/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .checkpoint-table { display: grid; gap: 8px; margin: 12px 0; }
 .cp-row { display: grid; grid-template-columns: 72px repeat(6, minmax(100px,1fr)); gap: 6px; align-items: center; }
 .cp-btn { border: 1px solid rgba(255,255,255,.2); border-radius: 6px; background:#29303f; color:#fff; padding:6px; cursor:pointer; }
@@ -2303,6 +2425,24 @@ h2 {
 }
 
 @media (max-width: 900px) {
+  .admin-room-card header {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-room-links,
+  .history-token-list,
+  .room-link-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .history-card-actions {
+    justify-content: stretch;
+  }
+
+  .history-card-actions > * {
+    flex: 1;
+  }
+
   .visual-rosters {
     grid-template-columns: 1fr;
   }
