@@ -1,0 +1,88 @@
+{
+  "$schema": "./match-config.schema.json",
+  "schemaVersion": 1,
+  "id": "cup-a",
+  "name": "杯赛 A",
+  "description": "FT3、首图控制、其余地图类别轮换的示例模板",
+  "config": {
+    "matchName": "杯赛 A",
+    "teams": {
+      "left": "蓝色方",
+      "right": "红色方"
+    },
+    "matchFormat": "ft3",
+    "stageCount": 5,
+    "checkpoints": [
+      {
+        "preCountdown": { "enabled": false, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      }
+    ],
+    "stageLimits": {
+      "preStartRestSeconds": 30,
+      "mapSelectSeconds": 45,
+      "playerSelectSeconds": 60,
+      "firstBanChoiceSeconds": 25,
+      "firstBanActionSeconds": 25,
+      "secondBanActionSeconds": 25,
+      "scoreConfirmSeconds": 30,
+      "postMatchRestSeconds": 120
+    },
+    "mapPool": {
+      "Control": ["Lijiang Tower", "Ilios", "Oasis", "Antarctic Peninsula"],
+      "Escort": ["Circuit Royal", "Dorado", "Rialto"],
+      "Hybrid": ["Hollywood", "King's Row", "Numbani"],
+      "Push": ["Colosseo", "New Queen Street", "Runasapi"],
+      "Flashpoint": ["Suravasa", "New Junk City"]
+    },
+    "mapSelectionMode": "first_mode_then_unique_mode",
+    "firstMapMode": "Control",
+    "fixedMapOrderText": "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa",
+    "rosterMode": "preset_only",
+    "presetRosterText": "蓝色方: Blue1,Blue2,Blue3,Blue4,Blue5\n红色方: Red1,Red2,Red3,Red4,Red5",
+    "firstBanPolicy": "allow_loser_choose",
+    "openingSidePolicy": "random",
+    "scoreReportMode": "team_submit_opponent_confirm"
+  }
+}

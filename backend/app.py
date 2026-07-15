@@ -9,15 +9,30 @@ import sys
 import threading
 import time
 import unicodedata
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, redirect, request, send_file, send_from_directory
 
+try:
+    from backend.match_config import (
+        MatchConfigValidationError,
+        default_match_config,
+        normalize_match_config,
+    )
+except ModuleNotFoundError:  # Support `python backend/app.py` from the repository root.
+    from match_config import (  # type: ignore[no-redef]
+        MatchConfigValidationError,
+        default_match_config,
+        normalize_match_config,
+    )
+
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = ROOT / "dist"
 STATIC_DIR = ROOT / "static"
+CONFIG_DOCS_DIR = STATIC_DIR / "config"
 ASSETS_DATA_PATH = ROOT / "backend" / "data" / "assets.json"
 MAPS_DATA_PATH = ROOT / "backend" / "data" / "maps.json"
 ASSET_SCRIPT_PATH = ROOT / "scripts" / "scrape_assets.py"
@@ -29,6 +44,7 @@ RUNTIME_DATA_DIR = Path(os.environ.get("OW_RUNTIME_DIR", ROOT / "backend" / "dat
 ROOM_STORE_PATH = RUNTIME_DATA_DIR / "rooms.json"
 ROOM_HISTORY_DIR = RUNTIME_DATA_DIR / "room_history"
 ROOM_HISTORY_INDEX_PATH = RUNTIME_DATA_DIR / "room_history_index.json"
+CONFIG_PRESETS_DIR = RUNTIME_DATA_DIR / "config_presets"
 ROOM_ROLES = {
     "A": {"role": "red-team", "label": "红队入口", "side": "right"},
     "B": {"role": "blue-team", "label": "蓝队入口", "side": "left"},
@@ -42,6 +58,7 @@ SHORT_CODE_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 SHORT_CODE_LENGTH = 4
 SHORT_CODE_PATTERN = re.compile(r"^[0-9a-z]{4}$")
 ARCHIVE_KEY_PATTERN = re.compile(r"^[0-9a-z]{4}(?:-[0-9a-z]{4}){3}$")
+CONFIG_PRESET_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 OPERATION_PART_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 MAX_SHORT_CODE_ATTEMPTS = 10_000
 ALLOWED_OPERATION_CATEGORIES = {
@@ -60,6 +77,7 @@ DEFAULT_GLOBAL_SETTINGS = {
     "roomsPerHour": 5,
     "inactiveTimeoutMinutes": 30,
     "defaultSettings": None,
+    "defaultPresetId": None,
 }
 room_store_lock = threading.Lock()
 
@@ -111,25 +129,78 @@ def create_app() -> Flask:
     def maps_catalog() -> Any:
         return jsonify(build_maps_catalog())
 
+    @app.get("/docs/config/<path:filename>")
+    def config_document(filename: str) -> Any:
+        if filename not in {"match-config.example.json", "match-config.schema.json", "match-config.md"}:
+            return jsonify({"error": "not_found"}), 404
+        return send_from_directory(CONFIG_DOCS_DIR, filename)
+
     @app.get("/api/settings/preset")
     def get_settings_preset() -> Any:
-        return jsonify(load_settings_preset())
+        presets = load_all_config_presets()
+        return jsonify({
+            "presets": {preset["name"]: preset["config"] for preset in presets},
+            "last": presets[0]["name"] if presets else None,
+        })
 
     @app.post("/api/settings/preset")
     def save_settings_preset() -> Any:
-        from flask import request
+        return jsonify({"error": "global_admin_required"}), 403
 
+    @app.get("/api/admin/<admin_hash>/config-presets")
+    def admin_list_config_presets(admin_hash: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            if not is_admin_hash_valid_unlocked(store, admin_hash):
+                return jsonify({"error": "not_found"}), 404
+            return jsonify({"items": load_all_config_presets()})
+
+    @app.post("/api/admin/<admin_hash>/config-presets")
+    def admin_create_config_preset(admin_hash: str) -> Any:
         payload = request.get_json(silent=True) or {}
-        name = str(payload.get("name") or "默认预设").strip() or "默认预设"
-        settings = payload.get("settings", payload)
-        presets_payload = load_settings_preset()
-        presets = presets_payload.setdefault("presets", {})
-        presets[name] = settings
-        presets_payload["last"] = name
-        SETTINGS_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with SETTINGS_PRESETS_PATH.open("w", encoding="utf-8") as file:
-            json.dump(presets_payload, file, ensure_ascii=False, indent=2)
-        return jsonify({"ok": True, "name": name})
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            if not is_admin_hash_valid_unlocked(store, admin_hash):
+                return jsonify({"error": "not_found"}), 404
+            try:
+                preset = save_config_preset(payload, replace=False)
+            except MatchConfigValidationError as exc:
+                return jsonify({"error": "invalid_config", "details": exc.errors}), 400
+            except FileExistsError:
+                return jsonify({"error": "already_exists"}), 409
+            except ValueError as exc:
+                return jsonify({"error": "invalid_preset", "message": str(exc)}), 400
+        return jsonify(preset), 201
+
+    @app.put("/api/admin/<admin_hash>/config-presets/<preset_id>")
+    def admin_update_config_preset(admin_hash: str, preset_id: str) -> Any:
+        payload = request.get_json(silent=True) or {}
+        payload = {**payload, "id": preset_id}
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            if not is_admin_hash_valid_unlocked(store, admin_hash):
+                return jsonify({"error": "not_found"}), 404
+            try:
+                preset = save_config_preset(payload, replace=True)
+            except MatchConfigValidationError as exc:
+                return jsonify({"error": "invalid_config", "details": exc.errors}), 400
+            except FileNotFoundError:
+                return jsonify({"error": "not_found"}), 404
+            except ValueError as exc:
+                return jsonify({"error": "invalid_preset", "message": str(exc)}), 400
+        return jsonify(preset)
+
+    @app.delete("/api/admin/<admin_hash>/config-presets/<preset_id>")
+    def admin_delete_config_preset(admin_hash: str, preset_id: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            if not is_admin_hash_valid_unlocked(store, admin_hash):
+                return jsonify({"error": "not_found"}), 404
+            path = get_config_preset_path(preset_id)
+            if path is None or not path.exists():
+                return jsonify({"error": "not_found"}), 404
+            path.unlink()
+        return jsonify({"ok": True})
 
     @app.post("/api/rooms")
     def create_room() -> Any:
@@ -185,6 +256,167 @@ def create_app() -> Flask:
 
         return jsonify(format_room_token_payload(room, portal_code))
 
+    @app.get("/api/rooms/token/<room_token>/config-presets")
+    def get_room_config_presets(room_token: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+            _room, portal_code = lookup
+            if portal_code != "C":
+                return jsonify({"error": "forbidden"}), 403
+            return jsonify({"items": load_all_config_presets()})
+
+    @app.get("/api/rooms/token/<room_token>/config")
+    def get_room_config(room_token: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+            room, _portal_code = lookup
+            ensure_room_config_unlocked(room)
+            save_room_store_unlocked(store)
+            return jsonify(room["config"])
+
+    @app.put("/api/rooms/token/<room_token>/config")
+    def update_room_config(room_token: str) -> Any:
+        payload = request.get_json(silent=True) or {}
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+            room, portal_code = lookup
+            if portal_code != "C":
+                return jsonify({"error": "forbidden"}), 403
+            config_state = ensure_room_config_unlocked(room)
+            if config_state["status"] == "locked":
+                return jsonify({"error": "config_locked"}), 409
+            expected_revision = payload.get("revision")
+            if isinstance(expected_revision, int) and expected_revision != config_state["revision"]:
+                return jsonify({"error": "revision_conflict", "config": config_state}), 409
+            try:
+                normalized = normalize_match_config(payload.get("config", payload), load_assets().get("maps", {}))
+            except MatchConfigValidationError as exc:
+                return jsonify({"error": "invalid_config", "details": exc.errors}), 400
+            config_state["value"] = normalized
+            config_state["status"] = "draft"
+            config_state["revision"] += 1
+            config_state["source"] = normalize_room_config_source(payload.get("source"))
+            config_state["confirmedAt"] = None
+            room["settings"] = normalized
+            record_room_config_event_unlocked(room, "updated", portal_code)
+            save_room_store_unlocked(store)
+            return jsonify(config_state)
+
+    @app.post("/api/rooms/token/<room_token>/config/apply-preset")
+    def apply_room_config_preset(room_token: str) -> Any:
+        payload = request.get_json(silent=True) or {}
+        preset_id = str(payload.get("presetId") or "")
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+            room, portal_code = lookup
+            if portal_code != "C":
+                return jsonify({"error": "forbidden"}), 403
+            config_state = ensure_room_config_unlocked(room)
+            if config_state["status"] == "locked":
+                return jsonify({"error": "config_locked"}), 409
+            preset = load_config_preset(preset_id)
+            if preset is None:
+                return jsonify({"error": "not_found"}), 404
+            config_state["value"] = deepcopy(preset["config"])
+            config_state["status"] = "draft"
+            config_state["revision"] += 1
+            config_state["source"] = {
+                "type": "preset",
+                "presetId": preset["id"],
+                "presetName": preset["name"],
+                "presetRevision": preset["revision"],
+            }
+            config_state["confirmedAt"] = None
+            room["settings"] = deepcopy(preset["config"])
+            record_room_config_event_unlocked(room, "preset_applied", portal_code, {"presetId": preset_id})
+            save_room_store_unlocked(store)
+            return jsonify(config_state)
+
+    @app.post("/api/rooms/token/<room_token>/config/confirm")
+    def confirm_room_config(room_token: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+            room, portal_code = lookup
+            if portal_code != "C":
+                return jsonify({"error": "forbidden"}), 403
+            config_state = ensure_room_config_unlocked(room)
+            if config_state["status"] == "locked":
+                return jsonify({"error": "config_locked"}), 409
+            try:
+                config_state["value"] = normalize_match_config(config_state["value"], load_assets().get("maps", {}))
+            except MatchConfigValidationError as exc:
+                return jsonify({"error": "invalid_config", "details": exc.errors}), 400
+            config_state["status"] = "ready"
+            config_state["confirmedAt"] = current_timestamp()
+            record_room_config_event_unlocked(room, "confirmed", portal_code)
+            save_room_store_unlocked(store)
+            return jsonify(config_state)
+
+    @app.post("/api/rooms/token/<room_token>/start")
+    def start_room(room_token: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+            room, portal_code = lookup
+            if portal_code != "C":
+                return jsonify({"error": "forbidden"}), 403
+            config_state = ensure_room_config_unlocked(room)
+            if config_state["status"] != "ready":
+                return jsonify({"error": "config_not_ready", "config": config_state}), 409
+            config_state["status"] = "locked"
+            config_state["lockedAt"] = current_timestamp()
+            record_room_config_event_unlocked(room, "locked", portal_code)
+            save_room_store_unlocked(store)
+            return jsonify({"ok": True, "config": config_state, "version": room.get("version", 0)})
+
+    @app.post("/api/rooms/token/<room_token>/rollback-to-config")
+    def rollback_room_to_config(room_token: str) -> Any:
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+            room, portal_code = lookup
+            if portal_code != "C":
+                return jsonify({"error": "forbidden"}), 403
+            config_state = ensure_room_config_unlocked(room)
+            config_state["status"] = "draft"
+            config_state["revision"] += 1
+            config_state["confirmedAt"] = None
+            config_state["lockedAt"] = None
+            next_version = int(room.get("version") or 0) + 1
+            now = current_timestamp()
+            append_room_history_unlocked(
+                room,
+                now,
+                next_version,
+                None,
+                {"type": "portal", "portalCode": portal_code, "role": "admin"},
+                {"category": "room", "action": "rolled_back_to_config", "details": {}},
+            )
+            room["snapshot"] = None
+            room["version"] = next_version
+            touch_room_unlocked(room, now)
+            save_room_store_unlocked(store)
+            return jsonify({"ok": True, "config": config_state, "version": next_version})
+
     @app.get("/api/rooms/token/<room_token>/snapshot")
     def get_room_snapshot(room_token: str) -> Any:
         with room_store_lock:
@@ -231,6 +463,18 @@ def create_app() -> Flask:
 
             room, portal_code = lookup
 
+            config_state = ensure_room_config_unlocked(room)
+            next_snapshot = payload.get("snapshot")
+            if not isinstance(next_snapshot, dict):
+                return jsonify({"error": "invalid_snapshot"}), 400
+            if operation["category"] == "settings" and portal_code != "C":
+                return jsonify({"error": "forbidden"}), 403
+            if bool(next_snapshot.get("roomStarted")) and config_state["status"] != "locked":
+                return jsonify({"error": "config_not_locked", "config": config_state}), 409
+            if config_state["status"] == "locked" and not bool(next_snapshot.get("roomStarted")):
+                return jsonify({"error": "config_locked"}), 409
+            next_snapshot["settingsState"] = deepcopy(config_state["value"])
+
             current_version = int(room.get("version") or 0)
 
             if isinstance(expected_version, int) and expected_version != current_version:
@@ -239,7 +483,6 @@ def create_app() -> Flask:
                 return jsonify({"error": "version_conflict", "version": current_version, "snapshot": room.get("snapshot")}), 409
 
             next_version = current_version + 1
-            next_snapshot = payload.get("snapshot")
             actor = {
                 "type": "portal",
                 "portalCode": portal_code,
@@ -389,6 +632,12 @@ def create_app() -> Flask:
             if "defaultSettings" in payload:
                 settings["defaultSettings"] = payload.get("defaultSettings")
 
+            if "defaultPresetId" in payload:
+                default_preset_id = payload.get("defaultPresetId")
+                if default_preset_id is not None and load_config_preset(str(default_preset_id)) is None:
+                    return jsonify({"error": "preset_not_found"}), 400
+                settings["defaultPresetId"] = default_preset_id
+
             save_room_store_unlocked(store)
 
         return jsonify(settings)
@@ -448,11 +697,184 @@ def save_json_atomic(path: Path, payload: Any) -> None:
     os.replace(temporary_path, path)
 
 
+def get_config_preset_path(preset_id: str) -> Path | None:
+    if not CONFIG_PRESET_ID_PATTERN.fullmatch(preset_id):
+        return None
+    return CONFIG_PRESETS_DIR / f"{preset_id}.json"
+
+
+def load_config_preset(preset_id: str) -> dict[str, Any] | None:
+    path = get_config_preset_path(preset_id)
+    if path is None or not path.exists():
+        return None
+    with path.open(encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def load_all_config_presets() -> list[dict[str, Any]]:
+    CONFIG_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    presets: list[dict[str, Any]] = []
+    for path in CONFIG_PRESETS_DIR.glob("*.json"):
+        try:
+            with path.open(encoding="utf-8") as file:
+                payload = json.load(file)
+            if isinstance(payload, dict) and get_config_preset_path(str(payload.get("id") or "")) == path:
+                presets.append(payload)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return sorted(presets, key=lambda preset: (str(preset.get("name") or "").casefold(), str(preset.get("id") or "")))
+
+
+def save_config_preset(payload: Any, *, replace: bool) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("模板必须是 JSON 对象")
+    preset_id = str(payload.get("id") or "").strip().lower()
+    path = get_config_preset_path(preset_id)
+    if path is None:
+        raise ValueError("模板 ID 只允许小写字母、数字、下划线和短横线，长度不超过 64")
+    name = str(payload.get("name") or "").strip()
+    if not name or len(name) > 80:
+        raise ValueError("模板名称必须是 1–80 个字符")
+    description = str(payload.get("description") or "").strip()
+    if len(description) > 500:
+        raise ValueError("模板说明不能超过 500 个字符")
+    existing = load_config_preset(preset_id)
+    if existing is not None and not replace:
+        raise FileExistsError(preset_id)
+    if existing is None and replace:
+        raise FileNotFoundError(preset_id)
+    normalized = normalize_match_config(payload.get("config", payload), load_assets().get("maps", {}))
+    now = current_timestamp()
+    preset = {
+        "schemaVersion": 1,
+        "id": preset_id,
+        "name": name,
+        "description": description,
+        "revision": int(existing.get("revision") or 0) + 1 if existing else 1,
+        "createdAt": int(existing.get("createdAt") or now) if existing else now,
+        "updatedAt": now,
+        "config": normalized,
+    }
+    save_json_atomic(path, preset)
+    return preset
+
+
+def build_room_config(value: Any = None, source: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        normalized = normalize_match_config(value if isinstance(value, dict) else {}, load_assets().get("maps", {}))
+    except MatchConfigValidationError:
+        normalized = default_match_config()
+    return {
+        "status": "draft",
+        "revision": 1,
+        "source": source or {"type": "builtin"},
+        "value": normalized,
+        "confirmedAt": None,
+        "lockedAt": None,
+    }
+
+
+def ensure_room_config_unlocked(room: dict[str, Any]) -> dict[str, Any]:
+    config_state = room.get("config")
+    if isinstance(config_state, dict) and isinstance(config_state.get("value"), dict):
+        config_state.setdefault("status", "draft")
+        config_state.setdefault("revision", 1)
+        config_state.setdefault("source", {"type": "manual"})
+        config_state.setdefault("confirmedAt", None)
+        config_state.setdefault("lockedAt", None)
+        return config_state
+    snapshot = room.get("snapshot") if isinstance(room.get("snapshot"), dict) else {}
+    settings = snapshot.get("settingsState") if isinstance(snapshot.get("settingsState"), dict) else room.get("settings")
+    config_state = build_room_config(settings)
+    if snapshot.get("roomStarted"):
+        config_state["status"] = "locked"
+        config_state["lockedAt"] = int(room.get("lastActiveAt") or current_timestamp())
+    room["config"] = config_state
+    room["settings"] = deepcopy(config_state["value"])
+    return config_state
+
+
+def normalize_room_config_source(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"type": "manual"}
+    source_type = value.get("type") if value.get("type") in {"manual", "json", "builtin", "preset"} else "manual"
+    if source_type != "preset":
+        return {"type": source_type}
+    return {
+        "type": "preset",
+        "presetId": str(value.get("presetId") or ""),
+        "presetName": str(value.get("presetName") or ""),
+        "presetRevision": int(value.get("presetRevision") or 0),
+    }
+
+
+def record_room_config_event_unlocked(
+    room: dict[str, Any], action: str, portal_code: str, details: dict[str, Any] | None = None
+) -> None:
+    now = current_timestamp()
+    append_room_history_unlocked(
+        room,
+        now,
+        int(room.get("version") or 0),
+        room.get("snapshot"),
+        {"type": "portal", "portalCode": portal_code, "role": ROOM_ROLES[portal_code]["role"]},
+        {"category": "settings", "action": action, "details": details or {}},
+    )
+    touch_room_unlocked(room, now)
+
+
+def migrate_legacy_config_presets_unlocked(store: dict[str, Any]) -> None:
+    existing_ids = {preset["id"] for preset in load_all_config_presets()}
+    legacy_payload: dict[str, Any] = {"presets": {}}
+    try:
+        legacy_payload = load_settings_preset()
+    except (OSError, json.JSONDecodeError):
+        pass
+    legacy_presets = legacy_payload.get("presets") if isinstance(legacy_payload, dict) else {}
+    if not existing_ids and isinstance(legacy_presets, dict):
+        for index, (name, config) in enumerate(legacy_presets.items(), start=1):
+            base_id = re.sub(r"[^a-z0-9_-]+", "-", normalize_key(str(name))).strip("-") or f"legacy-{index}"
+            preset_id = base_id[:64]
+            suffix = 2
+            while preset_id in existing_ids:
+                preset_id = f"{base_id[:58]}-{suffix}"
+                suffix += 1
+            try:
+                save_config_preset(
+                    {"id": preset_id, "name": str(name), "description": "从旧命名预设自动迁移", "config": config},
+                    replace=False,
+                )
+                existing_ids.add(preset_id)
+            except (ValueError, MatchConfigValidationError, FileExistsError):
+                continue
+
+    global_settings = store.setdefault("globalSettings", dict(DEFAULT_GLOBAL_SETTINGS))
+    inline_default = global_settings.get("defaultSettings")
+    if isinstance(inline_default, dict) and not global_settings.get("defaultPresetId"):
+        preset_id = "legacy-default"
+        try:
+            if preset_id not in existing_ids:
+                save_config_preset(
+                    {"id": preset_id, "name": "旧版全局默认配置", "description": "从 rooms.json 自动迁移", "config": inline_default},
+                    replace=False,
+                )
+            global_settings["defaultPresetId"] = preset_id
+        except (ValueError, MatchConfigValidationError, FileExistsError):
+            pass
+
+
 def initialize_room_store() -> None:
     with room_store_lock:
         ROOM_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
         rebuild_history_index_unlocked()
         store = load_room_store_unlocked()
+        migrate_legacy_config_presets_unlocked(store)
+        for room in store.get("rooms", []):
+            ensure_room_config_unlocked(room)
         reconcile_active_rooms_unlocked(store)
         cleanup_inactive_rooms_unlocked(store, current_timestamp())
         save_room_store_unlocked(store)
@@ -520,6 +942,21 @@ def create_room_record_unlocked(store: dict[str, Any], now: int) -> dict[str, An
             "snapshot": None,
             "settings": store.get("globalSettings", {}).get("defaultSettings"),
         }
+        default_preset_id = store.get("globalSettings", {}).get("defaultPresetId")
+        default_preset = load_config_preset(str(default_preset_id)) if default_preset_id else None
+        if default_preset:
+            room["config"] = build_room_config(
+                default_preset["config"],
+                {
+                    "type": "preset",
+                    "presetId": default_preset["id"],
+                    "presetName": default_preset["name"],
+                    "presetRevision": default_preset["revision"],
+                },
+            )
+        else:
+            room["config"] = build_room_config(room["settings"])
+        room["settings"] = deepcopy(room["config"]["value"])
         create_history_document_unlocked(build_initial_history_document(room))
         store.setdefault("rooms", []).append(room)
         return room
@@ -580,6 +1017,7 @@ def build_initial_history_document(room: dict[str, Any]) -> dict[str, Any]:
         "closeReason": None,
         "currentVersion": int(room.get("version") or 0),
         "currentSnapshot": room.get("snapshot"),
+        "currentConfig": deepcopy(room.get("config")),
         "history": [
             {
                 "sequence": 0,
@@ -588,6 +1026,7 @@ def build_initial_history_document(room: dict[str, Any]) -> dict[str, Any]:
                 "actor": {"type": "system", "portalCode": None, "role": "system"},
                 "operation": {"category": "lifecycle", "action": "created", "details": {}},
                 "snapshot": room.get("snapshot"),
+                "config": deepcopy(room.get("config")),
             }
         ],
     }
@@ -653,6 +1092,7 @@ def append_room_history_unlocked(
             "actor": actor,
             "operation": operation,
             "snapshot": snapshot,
+            "config": deepcopy(room.get("config")),
         }
     )
     document["history"] = history
@@ -660,6 +1100,7 @@ def append_room_history_unlocked(
     document["lastActiveAt"] = int(last_active_at if last_active_at is not None else timestamp)
     document["currentVersion"] = version
     document["currentSnapshot"] = snapshot
+    document["currentConfig"] = deepcopy(room.get("config"))
 
     if status is not None:
         document["status"] = status
@@ -976,6 +1417,7 @@ def format_room_links(room: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_room_token_payload(room: dict[str, Any], portal_code: str) -> dict[str, Any]:
+    config_state = ensure_room_config_unlocked(room)
     return {
         "room": {
             "id": room.get("id"),
@@ -983,6 +1425,7 @@ def format_room_token_payload(room: dict[str, Any], portal_code: str) -> dict[st
             "lastActiveAt": room.get("lastActiveAt"),
             "closedAt": None,
             "settings": room.get("settings"),
+            "config": config_state,
         },
         "portal": {"code": portal_code, **ROOM_ROLES[portal_code]},
         "version": room.get("version", 0),
@@ -997,6 +1440,7 @@ def format_admin_room(room: dict[str, Any]) -> dict[str, Any]:
         "lastActiveAt": room.get("lastActiveAt"),
         "closedAt": None,
         "version": room.get("version", 0),
+        "configStatus": ensure_room_config_unlocked(room).get("status"),
         "links": format_room_links(room),
     }
 

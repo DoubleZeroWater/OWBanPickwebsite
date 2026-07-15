@@ -110,6 +110,14 @@ class RoomPersistenceTests(unittest.TestCase):
     def test_successful_snapshot_is_audited_and_conflict_is_not(self) -> None:
         room = self.create_room()
         admin_token = room["links"]["C"]["hash"]
+        self.assertEqual(
+            self.client.post(f"/api/rooms/token/{admin_token}/config/confirm").status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/rooms/token/{admin_token}/start").status_code,
+            200,
+        )
         snapshot = {"roomStarted": True, "marker": "accepted"}
         accepted = self.client.put(
             f"/api/rooms/token/{admin_token}/snapshot",
@@ -131,14 +139,126 @@ class RoomPersistenceTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(conflicted.status_code, 409)
         history = self.read_history(room)
-        self.assertEqual(len(history["history"]), 2)
+        self.assertEqual(len(history["history"]), 4)
         event = history["history"][-1]
-        self.assertEqual(event["snapshot"], snapshot)
+        self.assertEqual(event["snapshot"]["marker"], "accepted")
+        self.assertEqual(event["snapshot"]["settingsState"], history["currentConfig"]["value"])
         self.assertEqual(event["actor"], {"type": "portal", "portalCode": "C", "role": "admin"})
         self.assertEqual(event["operation"]["action"], "started")
 
         self.client.get(f"/api/rooms/token/{admin_token}/snapshot")
-        self.assertEqual(len(self.read_history(room)["history"]), 2)
+        self.assertEqual(len(self.read_history(room)["history"]), 4)
+
+    def test_global_presets_are_validated_persisted_and_copied_into_rooms(self) -> None:
+        room = self.create_room()
+        admin_hash = self.admin_hash()
+        admin_token = room["links"]["C"]["hash"]
+        team_token = room["links"]["A"]["hash"]
+        config = room_app.default_match_config()
+        config["matchName"] = "杯赛 A 决赛"
+        config["stageLimits"]["mapSelectSeconds"] = 75
+        create = self.client.post(
+            f"/api/admin/{admin_hash}/config-presets",
+            json={
+                "schemaVersion": 1,
+                "id": "cup-a",
+                "name": "杯赛 A",
+                "description": "主赛事规则",
+                "config": config,
+            },
+        )
+        self.assertEqual(create.status_code, 201, create.get_data(as_text=True))
+        self.assertTrue((room_app.CONFIG_PRESETS_DIR / "cup-a.json").is_file())
+        self.assertEqual(self.client.get("/api/admin/bad/config-presets").status_code, 404)
+        self.assertEqual(
+            self.client.get(f"/api/rooms/token/{team_token}/config-presets").status_code,
+            403,
+        )
+
+        applied = self.client.post(
+            f"/api/rooms/token/{admin_token}/config/apply-preset",
+            json={"presetId": "cup-a"},
+        )
+        self.assertEqual(applied.status_code, 200, applied.get_data(as_text=True))
+        room_config = applied.get_json()
+        self.assertEqual(room_config["source"]["presetId"], "cup-a")
+        self.assertEqual(room_config["value"]["matchName"], "杯赛 A 决赛")
+        self.assertEqual(room_config["value"]["stageLimits"]["mapSelectSeconds"], 75)
+
+        changed_template = json.loads(json.dumps(config, ensure_ascii=False))
+        changed_template["stageLimits"]["mapSelectSeconds"] = 90
+        update = self.client.put(
+            f"/api/admin/{admin_hash}/config-presets/cup-a",
+            json={"id": "cup-a", "name": "杯赛 A", "description": "更新版", "config": changed_template},
+        )
+        self.assertEqual(update.status_code, 200)
+        unchanged_room = self.client.get(f"/api/rooms/token/{admin_token}/config").get_json()
+        self.assertEqual(unchanged_room["value"]["stageLimits"]["mapSelectSeconds"], 75)
+
+    def test_room_config_requires_admin_and_locks_until_destructive_rollback(self) -> None:
+        room = self.create_room()
+        admin_token = room["links"]["C"]["hash"]
+        team_token = room["links"]["A"]["hash"]
+        current = self.client.get(f"/api/rooms/token/{admin_token}/config").get_json()
+        edited = json.loads(json.dumps(current["value"], ensure_ascii=False))
+        edited["matchName"] = "独立房间配置"
+
+        forbidden = self.client.put(
+            f"/api/rooms/token/{team_token}/config",
+            json={"revision": current["revision"], "config": edited},
+        )
+        self.assertEqual(forbidden.status_code, 403)
+        saved = self.client.put(
+            f"/api/rooms/token/{admin_token}/config",
+            json={"revision": current["revision"], "config": edited, "source": {"type": "json"}},
+        )
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        self.assertEqual(saved.get_json()["source"]["type"], "json")
+        self.assertEqual(self.client.post(f"/api/rooms/token/{admin_token}/config/confirm").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/rooms/token/{admin_token}/start").status_code, 200)
+
+        locked_edit = self.client.put(
+            f"/api/rooms/token/{admin_token}/config",
+            json={"config": room_app.default_match_config()},
+        )
+        self.assertEqual(locked_edit.status_code, 409)
+        malicious_snapshot = {
+            "roomStarted": True,
+            "settingsState": {"matchName": "被篡改"},
+            "marker": "server-owned-config",
+        }
+        pushed = self.client.put(
+            f"/api/rooms/token/{team_token}/snapshot",
+            json={
+                "version": 0,
+                "snapshot": malicious_snapshot,
+                "operation": {"category": "lineup", "action": "ready", "details": {}},
+            },
+        )
+        self.assertEqual(pushed.status_code, 200, pushed.get_data(as_text=True))
+        stored_snapshot = self.client.get(f"/api/rooms/token/{admin_token}/snapshot").get_json()["snapshot"]
+        self.assertEqual(stored_snapshot["settingsState"]["matchName"], "独立房间配置")
+
+        rolled_back = self.client.post(f"/api/rooms/token/{admin_token}/rollback-to-config")
+        self.assertEqual(rolled_back.status_code, 200)
+        self.assertEqual(rolled_back.get_json()["config"]["status"], "draft")
+        self.assertIsNone(self.client.get(f"/api/rooms/token/{admin_token}/snapshot").get_json()["snapshot"])
+
+    def test_config_documentation_and_validation_errors_are_exposed(self) -> None:
+        example_response = self.client.get("/docs/config/match-config.example.json")
+        schema_response = self.client.get("/docs/config/match-config.schema.json")
+        self.assertEqual(example_response.status_code, 200)
+        self.assertEqual(schema_response.status_code, 200)
+        example_response.close()
+        schema_response.close()
+        invalid = room_app.default_match_config()
+        invalid["stageLimits"]["mapSelectSeconds"] = 0
+        response = self.client.post(
+            f"/api/admin/{self.admin_hash()}/config-presets",
+            json={"id": "invalid", "name": "无效", "config": invalid},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["details"][0]["path"], "stageLimits.mapSelectSeconds")
 
     def test_history_failure_does_not_commit_snapshot_or_release_room(self) -> None:
         room = self.create_room()

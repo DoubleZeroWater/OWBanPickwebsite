@@ -27,16 +27,17 @@ test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ 
 
   await page.goto(firstRoom.links.C.url);
   await expect(page.locator(".portal-badge")).toHaveText("房间管理员入口");
-  await page.keyboard.press("i");
-  await expect(page.getByText("详细设置")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "比赛配置" })).toBeVisible();
 
   const redPage = await page.context().newPage();
   await redPage.goto(firstRoom.links.A.url);
   await expect(redPage.locator(".portal-badge")).toHaveText("红队入口");
   await redPage.keyboard.press("i");
-  await expect(redPage.getByText("详细设置")).toHaveCount(0);
+  await expect(redPage.getByRole("heading", { name: "比赛配置" })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "开始比赛" }).click();
+  await page.locator("#confirmRoomConfig").click();
+  await expect(page.getByText("已确认，等待开始").first()).toBeVisible();
+  await page.locator("#startMatchFromSettings").click();
   await expect(redPage.getByText("比赛尚未开始")).toHaveCount(0, { timeout: 10_000 });
   await redPage.close();
 
@@ -49,13 +50,19 @@ test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ 
 
   await page.locator("#adminRoomsPerHour").fill("5");
   await page.locator("#adminInactiveTimeout").fill("1");
-  await page.locator("#adminDefaultSettings").fill(JSON.stringify({ matchFormat: "ft2" }, null, 2));
+  await page.getByRole("button", { name: "新建模板" }).click();
+  await page.locator("#globalPresetId").fill("e2e-ft2");
+  await page.locator("#globalPresetName").fill("E2E FT2 杯赛");
+  await page.locator("#matchFormat").selectOption("ft2");
+  await page.getByRole("button", { name: "保存模板" }).click();
+  await expect(page.getByText("模板“E2E FT2 杯赛”已保存。")).toBeVisible();
+  await page.locator("#adminDefaultPreset").selectOption("e2e-ft2");
   await page.getByRole("button", { name: "保存全局设置" }).click();
   await expect(page.getByText("全局设置已保存。")).toBeVisible();
 
   const defaultRoom = await createRoom(page);
   await page.goto(defaultRoom.links.C.url);
-  await expect(page.getByText("FT2")).toBeVisible();
+  await expect(page.locator(".match-title").getByText("FT2", { exact: true })).toBeVisible();
 
   await page.goto(`${baseURL}/admin/${adminHash}`);
   await page.locator(".admin-room-card", { hasText: firstRoom.roomId }).getByRole("button", { name: "关闭房间" }).click();

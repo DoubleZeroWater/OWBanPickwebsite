@@ -77,6 +77,8 @@ interface CheckpointConfig {
 }
 
 interface SettingsState {
+  matchName: string;
+  teams: Record<Side, string>;
   matchFormat: MatchFormat;
   stageCount: number;
   checkpoints: Array<{
@@ -259,6 +261,7 @@ interface RoomTokenResponse {
     lastActiveAt: number;
     closedAt: number | null;
     settings: unknown;
+    config: RoomConfigState;
   };
   portal: PortalConfig;
   version: number;
@@ -269,6 +272,34 @@ interface AdminSettings {
   roomsPerHour: number;
   inactiveTimeoutMinutes: number;
   defaultSettings: unknown;
+  defaultPresetId: string | null;
+}
+
+type RoomConfigStatus = "draft" | "ready" | "locked";
+
+interface ConfigPreset {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  description: string;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+  config: SettingsState;
+}
+
+interface RoomConfigState {
+  status: RoomConfigStatus;
+  revision: number;
+  source: {
+    type: "builtin" | "manual" | "json" | "preset";
+    presetId?: string;
+    presetName?: string;
+    presetRevision?: number;
+  };
+  value: SettingsState;
+  confirmedAt: number | null;
+  lockedAt: number | null;
 }
 
 interface AdminRoom {
@@ -312,6 +343,8 @@ const lineupSlots: LineupSlot[] = [
 const defaultMatchFormat: MatchFormat = "ft3";
 
 const defaultSettings: SettingsState = {
+  matchName: "OW Ban Pick Invitational",
+  teams: { left: "蓝色方", right: "红色方" },
   matchFormat: defaultMatchFormat,
   stageCount: getStageCountForMatchFormat(defaultMatchFormat),
   checkpoints: createDefaultCheckpoints(getStageCountForMatchFormat(defaultMatchFormat)),
@@ -426,6 +459,10 @@ let serverSnapshotPushInFlight = false;
 let pendingServerSnapshot: PendingSnapshotPush | null = null;
 let lastCreatedRoom: CreatedRoomResponse | null = null;
 let adminSettings: AdminSettings | null = null;
+let configPresets: ConfigPreset[] = [];
+let roomConfigState: RoomConfigState | null = null;
+let selectedGlobalPresetId: string | null = null;
+let globalPresetDraftMeta: { id: string; name: string; description: string } | null = null;
 let adminRooms: AdminRoom[] = [];
 let adminRoomHistory: RoomHistoryPage = { items: [], total: 0, page: 1, pageSize: 20 };
 
@@ -777,12 +814,13 @@ function normalizeLineupSelectorState(state: LineupSelectorState | null | undefi
 function createFreshMatchState(baseState: MatchState): MatchState {
   return {
     ...baseState,
+    matchName: settingsState.matchName,
     phase: "waiting",
     currentOperation: "等待管理员开始",
     currentCountdownSeconds: settingsState.stageLimits.preStartRestSeconds,
     teams: {
-      left: { ...baseState.teams.left, seriesScore: 0 },
-      right: { ...baseState.teams.right, seriesScore: 0 },
+      left: { ...baseState.teams.left, name: settingsState.teams.left, seriesScore: 0 },
+      right: { ...baseState.teams.right, name: settingsState.teams.right, seriesScore: 0 },
     },
     maps: Array.from({ length: settingsState.stageCount }, (_, index) => createBlankMap(index)),
   };
@@ -848,6 +886,16 @@ async function loadInitialData(): Promise<void> {
       roomPayload = await roomResponse.json() as RoomTokenResponse;
       portalConfig = roomPayload.portal;
       serverSnapshotVersion = Number(roomPayload.version ?? 0);
+      roomConfigState = roomPayload.room.config ?? null;
+      if (portalConfig.role === "admin") {
+        const presetsResponse = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config-presets`);
+        if (presetsResponse.ok) {
+          configPresets = ((await presetsResponse.json()) as { items: ConfigPreset[] }).items;
+        }
+        if (roomConfigState?.status !== "locked") {
+          settingsPanelOpen = true;
+        }
+      }
     }
 
     const [matchResponse, catalogResponse, presetResponse] = await Promise.all([
@@ -866,7 +914,9 @@ async function loadInitialData(): Promise<void> {
 
     mapCatalogState = (await catalogResponse.json()) as MapCatalogState;
 
-    if (roomPayload?.room.settings) {
+    if (roomConfigState?.value) {
+      settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+    } else if (roomPayload?.room.settings) {
       settingsState = mergeSettings(defaultSettings, roomPayload.room.settings);
     } else if (presetResponse.ok) {
       settingsState = mergeSettings(defaultSettings, getDefaultPresetFromPayload(await presetResponse.json()));
@@ -1076,15 +1126,17 @@ async function loadGlobalAdminData(page = adminRoomHistory.page): Promise<void> 
     return;
   }
 
-  const [settingsResponse, roomsResponse, historyResponse] = await Promise.all([
+  const [settingsResponse, roomsResponse, historyResponse, presetsResponse, catalogResponse] = await Promise.all([
     fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/settings`, { headers: { Accept: "application/json" } }),
     fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/rooms`, { headers: { Accept: "application/json" } }),
     fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/room-history?page=${page}&pageSize=20`, {
       headers: { Accept: "application/json" },
     }),
+    fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/config-presets`, { headers: { Accept: "application/json" } }),
+    fetch("/api/maps/catalog", { headers: { Accept: "application/json" } }),
   ]);
 
-  if (!settingsResponse.ok || !roomsResponse.ok || !historyResponse.ok) {
+  if (!settingsResponse.ok || !roomsResponse.ok || !historyResponse.ok || !presetsResponse.ok || !catalogResponse.ok) {
     renderError("全局管理入口不存在。");
     return;
   }
@@ -1093,6 +1145,11 @@ async function loadGlobalAdminData(page = adminRoomHistory.page): Promise<void> 
   const roomsPayload = await roomsResponse.json() as { rooms: AdminRoom[] };
   adminRooms = roomsPayload.rooms;
   adminRoomHistory = await historyResponse.json() as RoomHistoryPage;
+  configPresets = ((await presetsResponse.json()) as { items: ConfigPreset[] }).items;
+  mapCatalogState = await catalogResponse.json() as MapCatalogState;
+  if (selectedGlobalPresetId && !configPresets.some((preset) => preset.id === selectedGlobalPresetId)) {
+    selectedGlobalPresetId = null;
+  }
 }
 
 function renderGlobalAdminPage(message = ""): void {
@@ -1101,6 +1158,12 @@ function renderGlobalAdminPage(message = ""): void {
   }
 
   const historyPageCount = Math.max(1, Math.ceil(adminRoomHistory.total / adminRoomHistory.pageSize));
+  const selectedPreset = configPresets.find((preset) => preset.id === selectedGlobalPresetId);
+  if (selectedPreset && !globalPresetDraftMeta) {
+    settingsState = mergeSettings(defaultSettings, selectedPreset.config);
+  } else if (selectedGlobalPresetId === "__new__" && !globalPresetDraftMeta) {
+    settingsState = structuredClone(defaultSettings);
+  }
 
   app.innerHTML = `
     <main class="page-shell">
@@ -1114,9 +1177,15 @@ function renderGlobalAdminPage(message = ""): void {
           <label>每 IP 每小时创建数<input id="adminRoomsPerHour" type="number" min="1" value="${adminSettings.roomsPerHour}" /></label>
           <label>不活跃关闭分钟数<input id="adminInactiveTimeout" type="number" min="1" value="${adminSettings.inactiveTimeoutMinutes}" /></label>
         </div>
-        <label class="admin-default-json">默认房间设置 JSON<textarea id="adminDefaultSettings">${escapeHtml(JSON.stringify(adminSettings.defaultSettings ?? {}, null, 2))}</textarea></label>
+        <label>新房间默认模板
+          <select id="adminDefaultPreset">
+            <option value="">网站内置默认配置</option>
+            ${configPresets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${adminSettings!.defaultPresetId === preset.id ? "selected" : ""}>${escapeHtml(preset.name)}</option>`).join("")}
+          </select>
+        </label>
         <button id="saveGlobalSettings" class="start-match-button" type="button">保存全局设置</button>
       </section>
+      ${renderConfigPresetManager(selectedPreset ?? null)}
       <section class="global-admin-panel">
         <div class="created-room-header">
           <span>房间列表</span>
@@ -1151,6 +1220,7 @@ function renderGlobalAdminPage(message = ""): void {
   `;
 
   document.getElementById("saveGlobalSettings")?.addEventListener("click", saveGlobalSettings);
+  bindGlobalPresetManagerEvents();
   app.querySelectorAll<HTMLButtonElement>(".close-admin-room").forEach((button) => {
     button.addEventListener("click", () => closeAdminRoom(button.dataset.roomId ?? ""));
   });
@@ -1266,20 +1336,12 @@ async function saveGlobalSettings(): Promise<void> {
 
   const roomsPerHour = Number((document.getElementById("adminRoomsPerHour") as HTMLInputElement | null)?.value || adminSettings.roomsPerHour);
   const inactiveTimeoutMinutes = Number((document.getElementById("adminInactiveTimeout") as HTMLInputElement | null)?.value || adminSettings.inactiveTimeoutMinutes);
-  const defaultSettingsText = (document.getElementById("adminDefaultSettings") as HTMLTextAreaElement | null)?.value || "{}";
-  let defaultSettings: unknown = {};
-
-  try {
-    defaultSettings = JSON.parse(defaultSettingsText);
-  } catch {
-    renderGlobalAdminPage("默认房间设置不是有效 JSON。");
-    return;
-  }
+  const defaultPresetId = (document.getElementById("adminDefaultPreset") as HTMLSelectElement | null)?.value || null;
 
   const response = await fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/settings`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ roomsPerHour, inactiveTimeoutMinutes, defaultSettings }),
+    body: JSON.stringify({ roomsPerHour, inactiveTimeoutMinutes, defaultPresetId }),
   });
 
   if (response.ok) {
@@ -1312,8 +1374,16 @@ function formatTimestamp(timestamp: number): string {
 }
 
 function renderStartGate(): string {
+  const status = roomConfigState?.status ?? "draft";
   const action = canUseSettings()
-    ? `<button class="start-match-button" id="startMatchFromGate" type="button">开始比赛</button>`
+    ? `
+      <div class="start-gate-actions">
+        <button id="openRoomConfig" type="button">配置比赛</button>
+        ${status === "ready"
+          ? `<button class="start-match-button" id="startMatchFromGate" type="button">开始比赛</button>`
+          : `<button class="start-match-button" id="confirmRoomConfigFromGate" type="button">确认配置</button>`}
+      </div>
+    `
     : `<strong>${isBroadcastPortal() ? "直播等待开始" : "等待管理员开始"}</strong>`;
 
   return `
@@ -1321,6 +1391,7 @@ function renderStartGate(): string {
       <div>
         <span>${escapeHtml(portalConfig.label)}</span>
         <h2>比赛尚未开始</h2>
+        <p>配置状态：${escapeHtml(getRoomConfigStatusLabel(status))}</p>
       </div>
       ${action}
     </section>
@@ -2061,48 +2132,339 @@ function renderMinimizedOverlay(): string {
 }
 
 function renderSettingsPanel(): string {
+  const locked = roomConfigState?.status === "locked";
+  const source = roomConfigState?.source.type === "preset"
+    ? `来自模板：${roomConfigState.source.presetName ?? roomConfigState.source.presetId ?? "未知模板"}（已复制为房间独立配置）`
+    : roomConfigState?.source.type === "json"
+      ? "来自 JSON 导入"
+      : "房间独立配置";
   return `
     <section class="settings-panel">
-      <h2>详细设置 (I)</h2>
-      <p>点击检查点可回退并重做该步骤。</p>
+      <div class="config-editor-heading">
+        <div>
+          <h2>${locked ? "比赛配置（已锁定）" : "比赛配置"}</h2>
+          <p>${escapeHtml(source)} · ${escapeHtml(getRoomConfigStatusLabel(roomConfigState?.status ?? "draft"))}</p>
+        </div>
+        <button id="closeRoomConfig" type="button">收起</button>
+      </div>
       <div class="settings-actions settings-actions-top">
-        <button id="toggleGlobalPause" type="button">${pauseState.active ? "恢复全局时间" : "全局暂停"}</button>
-        <button id="startMatchFromSettings" type="button">从头开始</button>
-        <button id="resetMatchToWaiting" type="button">重置到未开始</button>
+        ${roomStarted ? `<button id="toggleGlobalPause" type="button">${pauseState.active ? "恢复全局时间" : "全局暂停"}</button>` : ""}
+        ${locked ? `<button id="rollbackToConfig" class="danger-button" type="button">回退到赛前配置</button>` : ""}
       </div>
-      <div class="checkpoint-table">
-        ${renderCheckpointRows()}
+      ${roomStarted ? `<div class="checkpoint-table">${renderCheckpointRows()}</div>` : ""}
+      <fieldset class="config-editor-fields" ${locked ? "disabled" : ""}>
+        ${renderRoomPresetChooser()}
+        ${renderSharedConfigFields()}
+        <details class="settings-section config-json-import">
+          <summary>高级：JSON 导入与导出</summary>
+          <p>可以粘贴完整模板 JSON，导入前会由后端校验。导入只替换本房间草稿。</p>
+          <textarea id="roomConfigJson" placeholder="在这里粘贴配置 JSON"></textarea>
+          <div class="settings-actions">
+            <button id="importRoomConfigJson" type="button">校验并导入</button>
+            <button id="copyRoomConfigJson" type="button">复制当前配置 JSON</button>
+          </div>
+        </details>
+        <div class="settings-actions config-primary-actions">
+          <button id="saveRoomConfig" type="button">保存草稿</button>
+          <button id="confirmRoomConfig" class="start-match-button" type="button">确认配置</button>
+          ${roomConfigState?.status === "ready" ? `<button id="startMatchFromSettings" class="start-match-button" type="button">开始比赛</button>` : ""}
+        </div>
+      </fieldset>
+    </section>
+  `;
+}
+
+function renderConfigPresetManager(selectedPreset: ConfigPreset | null): string {
+  const editing = Boolean(selectedPreset || selectedGlobalPresetId === "__new__");
+  const editorMeta = globalPresetDraftMeta ?? {
+    id: selectedPreset?.id ?? "",
+    name: selectedPreset?.name ?? "",
+    description: selectedPreset?.description ?? "",
+  };
+  return `
+    <section class="global-admin-panel config-preset-manager">
+      <div class="created-room-header">
+        <span>默认配置模板</span>
+        <strong>${configPresets.length} 个</strong>
       </div>
+      <div class="config-preset-toolbar">
+        <button id="newConfigPreset" type="button">新建模板</button>
+        <button id="showPresetJsonImport" type="button">粘贴 JSON 导入</button>
+        <a href="/docs/config/match-config.example.json" target="_blank" rel="noreferrer">查看完整示例</a>
+      </div>
+      <div class="config-preset-list">
+        ${configPresets.map((preset) => `
+          <article class="config-preset-card ${preset.id === selectedGlobalPresetId ? "is-selected" : ""}">
+            <div><strong>${escapeHtml(preset.name)}</strong><span>v${preset.revision} · ${escapeHtml(preset.description || "无说明")}</span></div>
+            <div>
+              <button class="edit-config-preset" data-preset-id="${escapeHtml(preset.id)}" type="button">GUI 编辑</button>
+              <button class="copy-config-preset-json" data-preset-id="${escapeHtml(preset.id)}" type="button">复制 JSON</button>
+              <button class="delete-config-preset" data-preset-id="${escapeHtml(preset.id)}" type="button">删除</button>
+            </div>
+          </article>
+        `).join("") || `<p>暂无模板，可新建或导入完整 JSON。</p>`}
+      </div>
+      <div id="globalPresetImportPanel" class="config-import-panel" hidden>
+        <label>粘贴完整模板 JSON<textarea id="globalPresetJson" placeholder="粘贴 match-config.example.json 格式的内容"></textarea></label>
+        <button id="importGlobalPresetJson" type="button">校验并导入</button>
+      </div>
+      ${editing ? `
+        <section class="global-preset-editor">
+          <div class="settings-grid">
+            <label>模板 ID<input id="globalPresetId" type="text" value="${escapeHtml(editorMeta.id)}" ${selectedPreset ? "disabled" : ""} placeholder="cup-a" /></label>
+            <label>模板名称<input id="globalPresetName" type="text" value="${escapeHtml(editorMeta.name)}" placeholder="杯赛 A" /></label>
+            <label>模板说明<input id="globalPresetDescription" type="text" value="${escapeHtml(editorMeta.description)}" /></label>
+          </div>
+          ${renderSharedConfigFields()}
+          <div class="settings-actions">
+            <button id="saveGlobalPreset" class="start-match-button" type="button">保存模板</button>
+            <button id="cancelGlobalPresetEdit" type="button">取消</button>
+          </div>
+        </section>
+      ` : ""}
+    </section>
+  `;
+}
+
+function bindGlobalPresetManagerEvents(): void {
+  document.getElementById("newConfigPreset")?.addEventListener("click", () => {
+    selectedGlobalPresetId = "__new__";
+    globalPresetDraftMeta = { id: "", name: "", description: "" };
+    settingsState = structuredClone(defaultSettings);
+    renderGlobalAdminPage();
+  });
+  document.getElementById("cancelGlobalPresetEdit")?.addEventListener("click", () => {
+    selectedGlobalPresetId = null;
+    globalPresetDraftMeta = null;
+    renderGlobalAdminPage();
+  });
+  document.getElementById("showPresetJsonImport")?.addEventListener("click", () => {
+    const panel = document.getElementById("globalPresetImportPanel");
+    if (panel) {
+      panel.hidden = !panel.hidden;
+    }
+  });
+  document.getElementById("importGlobalPresetJson")?.addEventListener("click", () => void importGlobalPresetJson());
+  document.getElementById("saveGlobalPreset")?.addEventListener("click", () => void saveGlobalPresetFromForm());
+
+  app.querySelectorAll<HTMLButtonElement>(".edit-config-preset").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectedGlobalPresetId = button.dataset.presetId ?? null;
+      const preset = configPresets.find((item) => item.id === selectedGlobalPresetId);
+      globalPresetDraftMeta = preset ? { id: preset.id, name: preset.name, description: preset.description } : null;
+      if (preset) {
+        settingsState = mergeSettings(defaultSettings, preset.config);
+      }
+      renderGlobalAdminPage();
+    });
+  });
+  app.querySelectorAll<HTMLButtonElement>(".delete-config-preset").forEach((button) => {
+    button.addEventListener("click", () => void deleteGlobalPreset(button.dataset.presetId ?? ""));
+  });
+  app.querySelectorAll<HTMLButtonElement>(".copy-config-preset-json").forEach((button) => {
+    button.addEventListener("click", () => void copyGlobalPresetJson(button.dataset.presetId ?? ""));
+  });
+
+  if (selectedGlobalPresetId) {
+    initializeConfigEditorControls();
+    bindMapPoolDragEvents();
+    bindModeOrderDragEvents();
+    bindRosterEditorControls();
+    ["matchFormat", "mapSelectionMode"].forEach((id) => {
+      document.getElementById(id)?.addEventListener("change", () => {
+        captureGlobalPresetDraftMeta();
+        readSettingsFromForm();
+        renderGlobalAdminPage();
+      });
+    });
+  }
+}
+
+function captureGlobalPresetDraftMeta(): void {
+  globalPresetDraftMeta = {
+    id: (document.getElementById("globalPresetId") as HTMLInputElement | null)?.value.trim().toLowerCase() ?? "",
+    name: (document.getElementById("globalPresetName") as HTMLInputElement | null)?.value.trim() ?? "",
+    description: (document.getElementById("globalPresetDescription") as HTMLInputElement | null)?.value.trim() ?? "",
+  };
+}
+
+function initializeConfigEditorControls(): void {
+  const values: Array<[string, string]> = [
+    ["matchFormat", settingsState.matchFormat],
+    ["mapSelectionMode", settingsState.mapSelectionMode],
+    ["firstMapMode", settingsState.firstMapMode],
+    ["rosterMode", settingsState.rosterMode],
+    ["firstBanPolicy", settingsState.firstBanPolicy],
+    ["openingSidePolicy", settingsState.openingSidePolicy],
+    ["scoreReportMode", settingsState.scoreReportMode],
+  ];
+  values.forEach(([id, value]) => {
+    const select = document.getElementById(id) as HTMLSelectElement | null;
+    if (select) {
+      select.value = value;
+    }
+  });
+}
+
+function bindRosterEditorControls(): void {
+  app.querySelectorAll<HTMLButtonElement>(".add-roster-member").forEach((button) => {
+    button.addEventListener("click", () => {
+      const side = button.dataset.rosterSide as Side | undefined;
+      const list = side ? app.querySelector<HTMLElement>(`.visual-roster-items[data-roster-side="${side}"]`) : null;
+      if (side && list) {
+        list.insertAdjacentHTML("beforeend", renderRosterMemberInput(side, ""));
+        list.lastElementChild?.querySelector<HTMLButtonElement>(".remove-roster-member")?.addEventListener("click", (event) => {
+          (event.currentTarget as HTMLElement).closest(".roster-member-row")?.remove();
+        });
+      }
+    });
+  });
+  app.querySelectorAll<HTMLButtonElement>(".remove-roster-member").forEach((button) => {
+    button.addEventListener("click", () => button.closest(".roster-member-row")?.remove());
+  });
+}
+
+async function saveGlobalPresetFromForm(): Promise<void> {
+  if (!globalAdminHash || !readSettingsFromForm()) {
+    return;
+  }
+  const id = (document.getElementById("globalPresetId") as HTMLInputElement | null)?.value.trim().toLowerCase() ?? "";
+  const name = (document.getElementById("globalPresetName") as HTMLInputElement | null)?.value.trim() ?? "";
+  const description = (document.getElementById("globalPresetDescription") as HTMLInputElement | null)?.value.trim() ?? "";
+  const existing = configPresets.some((preset) => preset.id === id);
+  const response = await fetch(
+    existing
+      ? `/api/admin/${encodeURIComponent(globalAdminHash)}/config-presets/${encodeURIComponent(id)}`
+      : `/api/admin/${encodeURIComponent(globalAdminHash)}/config-presets`,
+    {
+      method: existing ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ schemaVersion: 1, id, name, description, config: settingsState }),
+    },
+  );
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return;
+  }
+  const preset = await response.json() as ConfigPreset;
+  selectedGlobalPresetId = preset.id;
+  globalPresetDraftMeta = null;
+  await loadGlobalAdminData();
+  renderGlobalAdminPage(`模板“${preset.name}”已保存。`);
+}
+
+async function importGlobalPresetJson(): Promise<void> {
+  if (!globalAdminHash) {
+    return;
+  }
+  const textarea = document.getElementById("globalPresetJson") as HTMLTextAreaElement | null;
+  let payload: { id?: string; name?: string };
+  try {
+    payload = JSON.parse(textarea?.value ?? "") as { id?: string; name?: string };
+  } catch {
+    alert("粘贴的内容不是有效 JSON。");
+    return;
+  }
+  const id = payload.id ?? "";
+  const existing = configPresets.some((preset) => preset.id === id);
+  if (existing && !window.confirm(`模板 ${id} 已存在，是否覆盖？`)) {
+    return;
+  }
+  const response = await fetch(
+    existing
+      ? `/api/admin/${encodeURIComponent(globalAdminHash)}/config-presets/${encodeURIComponent(id)}`
+      : `/api/admin/${encodeURIComponent(globalAdminHash)}/config-presets`,
+    { method: existing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+  );
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return;
+  }
+  const preset = await response.json() as ConfigPreset;
+  selectedGlobalPresetId = preset.id;
+  globalPresetDraftMeta = null;
+  await loadGlobalAdminData();
+  renderGlobalAdminPage(`模板“${preset.name}”已导入。`);
+}
+
+async function deleteGlobalPreset(presetId: string): Promise<void> {
+  if (!globalAdminHash || !presetId || !window.confirm(`确认删除模板 ${presetId}？已复制到房间的配置不会受影响。`)) {
+    return;
+  }
+  const response = await fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/config-presets/${encodeURIComponent(presetId)}`, { method: "DELETE" });
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return;
+  }
+  selectedGlobalPresetId = null;
+  globalPresetDraftMeta = null;
+  await loadGlobalAdminData();
+  renderGlobalAdminPage("模板已删除。入房间的配置未发生变化。");
+}
+
+async function copyGlobalPresetJson(presetId: string): Promise<void> {
+  const preset = configPresets.find((item) => item.id === presetId);
+  if (!preset || !navigator.clipboard) {
+    return;
+  }
+  await navigator.clipboard.writeText(JSON.stringify({
+    $schema: "./match-config.schema.json",
+    schemaVersion: 1,
+    id: preset.id,
+    name: preset.name,
+    description: preset.description,
+    config: preset.config,
+  }, null, 2));
+  alert("模板 JSON 已复制。");
+}
+
+function renderRoomPresetChooser(): string {
+  return `
+    <section class="settings-section preset-chooser">
+      <h3>从默认模板开始</h3>
+      <p>模板会复制到本房间，之后可以自由调整。</p>
+      <div class="settings-actions">
+        <select id="roomPresetSelect">
+          <option value="">选择杯赛模板</option>
+          ${configPresets.map((preset) => `<option value="${escapeHtml(preset.id)}">${escapeHtml(preset.name)}</option>`).join("")}
+        </select>
+        <button id="applyRoomPreset" type="button">导入模板</button>
+        <button id="resetBuiltinConfig" type="button">恢复网站默认配置</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderSharedConfigFields(): string {
+  return `
+    <details class="settings-section" open>
+      <summary>比赛信息与时间</summary>
       <div class="settings-grid">
+        <label>比赛名称<input id="matchName" type="text" value="${escapeHtml(settingsState.matchName)}" /></label>
+        <label>蓝色方队名<input id="leftTeamName" type="text" value="${escapeHtml(settingsState.teams.left)}" /></label>
+        <label>红色方队名<input id="rightTeamName" type="text" value="${escapeHtml(settingsState.teams.right)}" /></label>
         <label>
-          比赛模式
+          比赛赛制
           <select id="matchFormat">
             <option value="ft2">FT2</option>
             <option value="ft3">FT3</option>
             <option value="ft4">FT4</option>
           </select>
         </label>
-        <label>休息秒数<input id="preStartRestSeconds" type="number" value="${settingsState.stageLimits.preStartRestSeconds}" /></label>
-        <label>选图时间<input id="mapSelectSeconds" type="number" value="${settingsState.stageLimits.mapSelectSeconds}" /></label>
-        <label>选人时间<input id="playerSelectSeconds" type="number" value="${settingsState.stageLimits.playerSelectSeconds}" /></label>
-        <label>先后Ban选择时间<input id="firstBanChoiceSeconds" type="number" value="${settingsState.stageLimits.firstBanChoiceSeconds}" /></label>
-        <label>先Ban时间<input id="firstBanActionSeconds" type="number" value="${settingsState.stageLimits.firstBanActionSeconds}" /></label>
-        <label>后Ban时间<input id="secondBanActionSeconds" type="number" value="${settingsState.stageLimits.secondBanActionSeconds}" /></label>
-        <label>比分确认时间<input id="scoreConfirmSeconds" type="number" value="${settingsState.stageLimits.scoreConfirmSeconds}" /></label>
-        <label>赛后休息秒数<input id="postMatchRestSeconds" type="number" value="${settingsState.stageLimits.postMatchRestSeconds}" /></label>
+        <label>开始前休息<input id="preStartRestSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.preStartRestSeconds}" /></label>
+        <label>选图时间<input id="mapSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.mapSelectSeconds}" /></label>
+        <label>选人时间<input id="playerSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.playerSelectSeconds}" /></label>
+        <label>先后 Ban 选择<input id="firstBanChoiceSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanChoiceSeconds}" /></label>
+        <label>先 Ban 时间<input id="firstBanActionSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanActionSeconds}" /></label>
+        <label>后 Ban 时间<input id="secondBanActionSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.secondBanActionSeconds}" /></label>
+        <label>比分确认<input id="scoreConfirmSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.scoreConfirmSeconds}" /></label>
+        <label>每图赛后休息<input id="postMatchRestSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.postMatchRestSeconds}" /></label>
       </div>
-      ${renderMapSettingsPanel()}
-      ${renderRosterSettingsPanel()}
-      ${renderBanRuleSettingsPanel()}
-      ${renderScoreRuleSettingsPanel()}
-      <div class="settings-actions">
-        <input id="presetName" type="text" placeholder="预设名称" />
-        <select id="presetSelect"></select>
-        <button id="applyPreset" type="button">应用到当前页面</button>
-        <button id="savePreset" type="button">保存命名预设</button>
-        <button id="loadPreset" type="button">导入选择预设</button>
-      </div>
-    </section>
+    </details>
+    ${renderMapSettingsPanel()}
+    ${renderRosterSettingsPanel()}
+    ${renderBanRuleSettingsPanel()}
+    ${renderScoreRuleSettingsPanel()}
   `;
 }
 
@@ -2393,7 +2755,12 @@ function renderRosterMemberInput(side: Side, value: string): string {
 }
 
 function bindStartGateEvents(): void {
-  document.getElementById("startMatchFromGate")?.addEventListener("click", () => resetRoomToBeginning(true));
+  document.getElementById("openRoomConfig")?.addEventListener("click", () => {
+    settingsPanelOpen = true;
+    renderCurrent();
+  });
+  document.getElementById("confirmRoomConfigFromGate")?.addEventListener("click", () => void confirmRoomConfig());
+  document.getElementById("startMatchFromGate")?.addEventListener("click", () => void startRoomMatch());
 }
 
 function bindMapRowEvents(): void {
@@ -2537,6 +2904,19 @@ function bindSettingsEvents(): void {
     return;
   }
 
+  document.getElementById("closeRoomConfig")?.addEventListener("click", () => {
+    settingsPanelOpen = false;
+    renderCurrent();
+  });
+  document.getElementById("rollbackToConfig")?.addEventListener("click", () => void rollbackRoomToConfig());
+  document.getElementById("copyRoomConfigJson")?.addEventListener("click", () => void copyRoomConfigJson());
+  document.getElementById("toggleGlobalPause")?.addEventListener("click", toggleGlobalPause);
+  bindCheckpointEvents();
+
+  if (roomConfigState?.status === "locked") {
+    return;
+  }
+
   const mapSelectionMode = document.getElementById("mapSelectionMode") as HTMLSelectElement | null;
   const matchFormat = document.getElementById("matchFormat") as HTMLSelectElement | null;
   const firstMapMode = document.getElementById("firstMapMode") as HTMLSelectElement | null;
@@ -2548,10 +2928,7 @@ function bindSettingsEvents(): void {
   if (matchFormat) {
     matchFormat.value = settingsState.matchFormat;
     matchFormat.addEventListener("change", () => {
-      const nextFormat = matchFormat.value as MatchFormat;
-      settingsState.matchFormat = nextFormat;
-      settingsState.stageCount = getStageCountForMatchFormat(nextFormat);
-      settingsState.checkpoints = resizeCheckpoints(settingsState.checkpoints, settingsState.stageCount);
+      readSettingsFromForm();
       renderCurrent();
     });
   }
@@ -2559,7 +2936,7 @@ function bindSettingsEvents(): void {
   if (mapSelectionMode) {
     mapSelectionMode.value = settingsState.mapSelectionMode;
     mapSelectionMode.addEventListener("change", () => {
-      settingsState.mapSelectionMode = mapSelectionMode.value as MapSelectionMode;
+      readSettingsFromForm();
       renderCurrent();
     });
   }
@@ -2584,28 +2961,12 @@ function bindSettingsEvents(): void {
     scoreReportMode.value = settingsState.scoreReportMode;
   }
 
-  void populatePresetSelect();
-
-  app.querySelectorAll<HTMLButtonElement>(".cp-btn").forEach((button) => {
-    button.addEventListener("click", () => {
-      const row = Number(button.dataset.row);
-      const key = button.dataset.key as CheckpointKey;
-      const checkpoint = settingsState.checkpoints[row]?.[key];
-
-      if (!checkpoint || !window.confirm(`确认回退到 MAP ${row + 1}：${checkpoint.label}？`)) {
-        return;
-      }
-
-      restoreCheckpoint(row, key);
-    });
-  });
-
-  document.getElementById("applyPreset")?.addEventListener("click", applySettingsFromForm);
-  document.getElementById("savePreset")?.addEventListener("click", savePreset);
-  document.getElementById("loadPreset")?.addEventListener("click", loadPreset);
-  document.getElementById("startMatchFromSettings")?.addEventListener("click", () => resetRoomToBeginning(true));
-  document.getElementById("resetMatchToWaiting")?.addEventListener("click", () => resetRoomToBeginning(false));
-  document.getElementById("toggleGlobalPause")?.addEventListener("click", toggleGlobalPause);
+  document.getElementById("applyRoomPreset")?.addEventListener("click", () => void applyRoomPreset());
+  document.getElementById("resetBuiltinConfig")?.addEventListener("click", () => void importRoomConfig(defaultSettings, "builtin"));
+  document.getElementById("importRoomConfigJson")?.addEventListener("click", () => void importRoomConfigFromJson());
+  document.getElementById("saveRoomConfig")?.addEventListener("click", () => void saveRoomConfigDraft());
+  document.getElementById("confirmRoomConfig")?.addEventListener("click", () => void confirmRoomConfig());
+  document.getElementById("startMatchFromSettings")?.addEventListener("click", () => void startRoomMatch());
 
   bindMapPoolDragEvents();
   bindModeOrderDragEvents();
@@ -2625,6 +2986,22 @@ function bindSettingsEvents(): void {
 
   app.querySelectorAll<HTMLButtonElement>(".remove-roster-member").forEach((button) => {
     button.addEventListener("click", () => button.closest(".roster-member-row")?.remove());
+  });
+}
+
+function bindCheckpointEvents(): void {
+  app.querySelectorAll<HTMLButtonElement>(".cp-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const row = Number(button.dataset.row);
+      const key = button.dataset.key as CheckpointKey;
+      const checkpoint = settingsState.checkpoints[row]?.[key];
+
+      if (!checkpoint || !window.confirm(`确认回退到 MAP ${row + 1}：${checkpoint.label}？`)) {
+        return;
+      }
+
+      restoreCheckpoint(row, key);
+    });
   });
 }
 
@@ -2703,21 +3080,6 @@ function bindModeOrderDragEvents(): void {
   });
 }
 
-function applySettingsFromForm(): void {
-  if (!canUseSettings()) {
-    return;
-  }
-
-  if (!readSettingsFromForm()) {
-    return;
-  }
-
-  syncMapSelectorTarget(true);
-  resetCountdown();
-  publishSharedRoomSnapshot(createRoomOperation("settings", "updated"));
-  renderCurrent();
-}
-
 function resetRoomToBeginning(started: boolean): void {
   if (!currentState || !canUseSettings()) {
     return;
@@ -2776,6 +3138,9 @@ function readSettingsFromForm(): boolean {
   const scoreReportMode = document.getElementById("scoreReportMode") as HTMLSelectElement | null;
   const fixedMapOrderText = document.getElementById("fixedMapOrderText") as HTMLTextAreaElement | null;
   const fixedMapOrderSelects = [...app.querySelectorAll<HTMLSelectElement>(".fixed-map-order-select")];
+  const matchName = document.getElementById("matchName") as HTMLInputElement | null;
+  const leftTeamName = document.getElementById("leftTeamName") as HTMLInputElement | null;
+  const rightTeamName = document.getElementById("rightTeamName") as HTMLInputElement | null;
 
   const nextMatchFormat = (matchFormat?.value ?? settingsState.matchFormat) as MatchFormat;
   settingsState.matchFormat = nextMatchFormat;
@@ -2792,86 +3157,198 @@ function readSettingsFromForm(): boolean {
     : fixedMapOrderText?.value ?? settingsState.fixedMapOrderText;
   settingsState.mapPool = readVisualMapPool();
   settingsState.presetRosterText = readVisualRosters();
+  settingsState.matchName = matchName?.value.trim() || settingsState.matchName;
+  settingsState.teams = {
+    left: leftTeamName?.value.trim() || settingsState.teams.left,
+    right: rightTeamName?.value.trim() || settingsState.teams.right,
+  };
 
   return true;
 }
 
-async function savePreset(): Promise<void> {
-  if (!canUseSettings()) {
+async function saveRoomConfigDraft(renderAfter = true): Promise<boolean> {
+  if (!roomToken || !isAdminPortal() || roomConfigState?.status === "locked") {
+    return false;
+  }
+  if (document.getElementById("matchFormat") && !readSettingsFromForm()) {
+    return false;
+  }
+  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      revision: roomConfigState?.revision,
+      config: settingsState,
+      source: roomConfigState?.source ?? { type: "manual" },
+    }),
+  });
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return false;
+  }
+  roomConfigState = await response.json() as RoomConfigState;
+  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  if (renderAfter) {
+    renderCurrent();
+  }
+  return true;
+}
+
+async function applyRoomPreset(): Promise<void> {
+  if (!roomToken || !isAdminPortal()) {
     return;
   }
-
-  if (!readSettingsFromForm()) {
+  const select = document.getElementById("roomPresetSelect") as HTMLSelectElement | null;
+  const presetId = select?.value;
+  if (!presetId) {
+    alert("请先选择一个默认模板。");
     return;
   }
-
-  const nameInput = document.getElementById("presetName") as HTMLInputElement | null;
-  const name = nameInput?.value.trim() || "默认预设";
-  const response = await fetch("/api/settings/preset", {
+  if (!window.confirm("导入模板会替换当前房间配置草稿，是否继续？")) {
+    return;
+  }
+  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config/apply-preset`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, settings: settingsState }),
+    body: JSON.stringify({ presetId }),
   });
-
-  syncMapSelectorTarget(true);
-  resetCountdown();
-  publishSharedRoomSnapshot(createRoomOperation("settings", "preset_saved", { name }));
-  alert(response.ok ? `已保存预设：${name}` : "保存失败");
-  await populatePresetSelect();
-  renderCurrent();
-}
-
-async function loadPreset(): Promise<void> {
-  if (!canUseSettings()) {
-    return;
-  }
-
-  const presetSelect = document.getElementById("presetSelect") as HTMLSelectElement | null;
-  const selectedName = presetSelect?.value;
-  const response = await fetch("/api/settings/preset");
-
   if (!response.ok) {
-    alert("载入失败");
+    alert(await getConfigErrorMessage(response));
     return;
   }
-
-  const payload = await response.json();
-  const presets = getPresetMapFromPayload(payload);
-  const selectedPreset = selectedName ? presets[selectedName] : payload;
-
-  if (!selectedPreset) {
-    alert("请选择要导入的预设");
-    return;
-  }
-
-  settingsState = mergeSettings(defaultSettings, selectedPreset);
-  syncMapSelectorTarget(true);
-  resetCountdown();
-  publishSharedRoomSnapshot(createRoomOperation("settings", "preset_loaded", { name: selectedName ?? "" }));
+  roomConfigState = await response.json() as RoomConfigState;
+  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
   renderCurrent();
 }
 
-async function populatePresetSelect(): Promise<void> {
-  const presetSelect = document.getElementById("presetSelect") as HTMLSelectElement | null;
-
-  if (!presetSelect) {
+async function importRoomConfigFromJson(): Promise<void> {
+  const textarea = document.getElementById("roomConfigJson") as HTMLTextAreaElement | null;
+  if (!textarea?.value.trim()) {
+    alert("请先粘贴配置 JSON。");
     return;
   }
-
   try {
-    const response = await fetch("/api/settings/preset");
+    const payload = JSON.parse(textarea.value) as { config?: unknown };
+    await importRoomConfig(payload.config ?? payload, "json");
+  } catch {
+    alert("粘贴的内容不是有效 JSON。");
+  }
+}
 
-    if (!response.ok) {
+async function importRoomConfig(config: unknown, sourceType: "json" | "builtin"): Promise<void> {
+  if (!roomToken || !isAdminPortal() || roomConfigState?.status === "locked") {
+    return;
+  }
+  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision: roomConfigState?.revision, config, source: { type: sourceType } }),
+  });
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return;
+  }
+  roomConfigState = await response.json() as RoomConfigState;
+  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  renderCurrent();
+}
+
+async function confirmRoomConfig(): Promise<void> {
+  if (!roomToken || !isAdminPortal()) {
+    return;
+  }
+  if (!(await saveRoomConfigDraft(false))) {
+    return;
+  }
+  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config/confirm`, { method: "POST" });
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return;
+  }
+  roomConfigState = await response.json() as RoomConfigState;
+  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  renderCurrent();
+}
+
+async function startRoomMatch(): Promise<void> {
+  if (!roomToken || !isAdminPortal() || roomConfigState?.status !== "ready") {
+    alert("请先保存并确认比赛配置。");
+    return;
+  }
+  if (document.getElementById("matchFormat")) {
+    if (!(await saveRoomConfigDraft(false))) {
       return;
     }
-
-    const presets = getPresetMapFromPayload(await response.json());
-    presetSelect.innerHTML = Object.keys(presets)
-      .map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`)
-      .join("");
-  } catch {
-    presetSelect.innerHTML = "";
+    const confirmResponse = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config/confirm`, { method: "POST" });
+    if (!confirmResponse.ok) {
+      alert(await getConfigErrorMessage(confirmResponse));
+      return;
+    }
+    roomConfigState = await confirmResponse.json() as RoomConfigState;
   }
+  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/start`, { method: "POST" });
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return;
+  }
+  const payload = await response.json() as { config: RoomConfigState; version: number };
+  roomConfigState = payload.config;
+  serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
+  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  settingsPanelOpen = false;
+  resetRoomToBeginning(true);
+}
+
+async function rollbackRoomToConfig(): Promise<void> {
+  if (!roomToken || !isAdminPortal()) {
+    return;
+  }
+  if (!window.confirm("回退会清空地图、阵容、Ban、比分和比赛进度，并重新开放配置。确认继续？")) {
+    return;
+  }
+  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/rollback-to-config`, { method: "POST" });
+  if (!response.ok) {
+    alert(await getConfigErrorMessage(response));
+    return;
+  }
+  window.location.reload();
+}
+
+async function copyRoomConfigJson(): Promise<void> {
+  if (!navigator.clipboard) {
+    alert("浏览器不支持复制到剪贴板。");
+    return;
+  }
+  const payload = {
+    schemaVersion: 1,
+    id: "room-export",
+    name: settingsState.matchName,
+    description: "从比赛房间导出的配置",
+    config: settingsState,
+  };
+  await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+  alert("当前配置 JSON 已复制。");
+}
+
+async function getConfigErrorMessage(response: Response): Promise<string> {
+  const payload = await response.json().catch(() => ({})) as {
+    error?: string;
+    message?: string;
+    details?: Array<{ path?: string; message?: string }>;
+  };
+  if (payload.details?.length) {
+    return payload.details.map((detail) => `${detail.path ?? "配置"}：${detail.message ?? "无效"}`).join("\n");
+  }
+  return payload.message ?? ({
+    config_locked: "比赛已经开始，配置已锁定。",
+    revision_conflict: "配置已在其他页面更新，请刷新后重试。",
+    config_not_ready: "请先确认比赛配置。",
+    forbidden: "当前入口没有修改配置的权限。",
+  } as Record<string, string>)[payload.error ?? ""] ?? "配置操作失败。";
+}
+
+function getRoomConfigStatusLabel(status: RoomConfigStatus): string {
+  return { draft: "草稿，可修改", ready: "已确认，等待开始", locked: "比赛中，已锁定" }[status];
 }
 
 function getPresetMapFromPayload(payload: unknown): Record<string, unknown> {
