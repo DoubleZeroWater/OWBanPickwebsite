@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { access } from "node:fs/promises";
 import worker from "../../dist/server/index.js";
+
+await access(new URL("../../dist/client/index.html", import.meta.url));
+await access(new URL("../../dist/client/static/og.png", import.meta.url));
 
 const env = {
   ASSETS: {

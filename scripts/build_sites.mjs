@@ -170,6 +170,10 @@ export default {
 
 await mkdir(resolve(dist, "server"), { recursive: true });
 await mkdir(resolve(dist, ".openai"), { recursive: true });
+await mkdir(resolve(dist, "client"), { recursive: true });
 await cp(resolve(root, "static"), resolve(dist, "static"), { recursive: true });
+await cp(resolve(dist, "index.html"), resolve(dist, "client/index.html"));
+await cp(resolve(dist, "assets"), resolve(dist, "client/assets"), { recursive: true });
+await cp(resolve(root, "static"), resolve(dist, "client/static"), { recursive: true });
 await cp(resolve(root, ".openai/hosting.json"), resolve(dist, ".openai/hosting.json"));
 await writeFile(resolve(dist, "server/index.js"), workerSource, "utf8");
