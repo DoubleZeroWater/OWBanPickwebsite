@@ -8,7 +8,8 @@
     "build": "tsc && vite build && node scripts/build_sites.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "test:backend": "python -m unittest discover -s tests/backend -v",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:sites": "npm run build && node tests/sites/worker-smoke.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
