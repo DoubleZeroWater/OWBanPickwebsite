@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build && node scripts/build_sites.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "test:backend": "python -m unittest discover -s tests/backend -v",
     "test:e2e": "playwright test"
