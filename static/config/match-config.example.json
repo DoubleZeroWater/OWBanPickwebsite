@@ -1,9 +1,7 @@
 {
   "$schema": "./match-config.schema.json",
   "schemaVersion": 1,
-  "id": "cup-a",
   "name": "杯赛 A",
-  "description": "FT3、首图控制、其余地图类别轮换的示例模板",
   "config": {
     "matchName": "杯赛 A",
     "teams": {
@@ -11,7 +9,7 @@
       "right": "红色方"
     },
     "matchFormat": "ft3",
-    "stageCount": 5,
+    "stageCount": 7,
     "checkpoints": [
       {
         "preCountdown": { "enabled": false, "label": "开始前倒计时" },
@@ -78,9 +76,15 @@
     },
     "mapSelectionMode": "first_mode_then_unique_mode",
     "firstMapMode": "Control",
-    "fixedMapOrderText": "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa",
-    "rosterMode": "preset_only",
+    "modeOrder": ["Control", "Push", "Hybrid", "Escort", "Flashpoint", "Control", "Push"],
+    "fixedMapOrderText": "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa\nIlios\nRunasapi",
+    "fixedFirstMapEnabled": false,
+    "fixedFirstMapName": "",
+    "firstMapPickerPolicy": "interactive_random",
+    "mapPickerPolicy": "loser_choose",
+    "rosterMode": "free_input",
     "presetRosterText": "蓝色方: Blue1,Blue2,Blue3,Blue4,Blue5\n红色方: Red1,Red2,Red3,Red4,Red5",
+    "banEnabled": true,
     "firstBanPolicy": "allow_loser_choose",
     "openingSidePolicy": "random",
     "scoreReportMode": "team_submit_opponent_confirm"

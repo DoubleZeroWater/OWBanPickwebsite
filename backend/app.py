@@ -732,9 +732,15 @@ def save_config_preset(payload: Any, *, replace: bool) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("模板必须是 JSON 对象")
     preset_id = str(payload.get("id") or "").strip().lower()
+    if not preset_id and not replace:
+        for _ in range(20):
+            candidate = secrets.token_hex(12)
+            if load_config_preset(candidate) is None:
+                preset_id = candidate
+                break
     path = get_config_preset_path(preset_id)
     if path is None:
-        raise ValueError("模板 ID 只允许小写字母、数字、下划线和短横线，长度不超过 64")
+        raise ValueError("无法生成有效的模板标识")
     name = str(payload.get("name") or "").strip()
     if not name or len(name) > 80:
         raise ValueError("模板名称必须是 1–80 个字符")

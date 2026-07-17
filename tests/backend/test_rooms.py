@@ -195,6 +195,30 @@ class RoomPersistenceTests(unittest.TestCase):
         unchanged_room = self.client.get(f"/api/rooms/token/{admin_token}/config").get_json()
         self.assertEqual(unchanged_room["value"]["stageLimits"]["mapSelectSeconds"], 75)
 
+    def test_extended_config_supports_ties_zero_rest_and_internal_preset_ids(self) -> None:
+        config = room_app.default_match_config()
+        self.assertEqual(config["stageCount"], 7)
+        config["stageLimits"]["preStartRestSeconds"] = 0
+        config["stageLimits"]["postMatchRestSeconds"] = 0
+        normalized = room_app.normalize_match_config(config, room_app.load_assets().get("maps", {}))
+        self.assertEqual(normalized["stageLimits"]["preStartRestSeconds"], 0)
+        self.assertEqual(normalized["stageLimits"]["postMatchRestSeconds"], 0)
+
+        auto_preset = self.client.post(
+            f"/api/admin/{self.admin_hash()}/config-presets",
+            json={"schemaVersion": 1, "name": "自动标识模板", "config": config},
+        )
+        self.assertEqual(auto_preset.status_code, 201, auto_preset.get_data(as_text=True))
+        preset_id = auto_preset.get_json()["id"]
+        self.assertRegex(preset_id, r"^[0-9a-f]{24}$")
+        self.assertTrue((room_app.CONFIG_PRESETS_DIR / f"{preset_id}.json").is_file())
+
+        invalid_order = json.loads(json.dumps(config, ensure_ascii=False))
+        invalid_order["mapSelectionMode"] = "strict_mode_order"
+        invalid_order["modeOrder"] = ["Control"]
+        with self.assertRaises(room_app.MatchConfigValidationError):
+            room_app.normalize_match_config(invalid_order, room_app.load_assets().get("maps", {}))
+
     def test_room_config_requires_admin_and_locks_until_destructive_rollback(self) -> None:
         room = self.create_room()
         admin_token = room["links"]["C"]["hash"]

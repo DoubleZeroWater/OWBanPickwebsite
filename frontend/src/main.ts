@@ -10,7 +10,7 @@ type MapSelectionMode =
   | "strict_mode_order"
   | "fixed_map_order";
 type PlayerInputMode = "free_input" | "preset_only" | "skip";
-type FirstBanPolicy = "allow_loser_choose" | "loser_must_first" | "no_ban";
+type FirstBanPolicy = "allow_loser_choose" | "loser_must_first";
 type LineupRole = "damage" | "tank" | "support";
 type PortalRole = "red-team" | "blue-team" | "admin" | "broadcast";
 type AppMode = "landing" | "room" | "global-admin" | "legacy-room";
@@ -20,7 +20,11 @@ type ScoreReportMode = "admin_only" | "team_submit_opponent_confirm";
 type OverlayKind = "map" | "lineup" | "ban" | "score" | "rest";
 type CheckpointKey = keyof SettingsState["checkpoints"][number];
 type MatchFormat = "ft2" | "ft3" | "ft4";
-type OpeningSidePolicy = "random" | "red" | "blue";
+type SidePolicy = "random" | "interactive_random" | "left" | "right";
+type OpeningSidePolicy = SidePolicy;
+type FirstMapPickerPolicy = SidePolicy;
+type MapPickerPolicy = "loser_choose";
+type InteractiveRandomPurpose = "map_picker" | "opening_ban";
 type OperationCategory = "room" | "settings" | "map" | "lineup" | "ban" | "score" | "rest" | "pause" | "notice" | "ui";
 
 interface TeamState {
@@ -94,9 +98,15 @@ interface SettingsState {
   mapPool: Record<string, string[]>;
   mapSelectionMode: MapSelectionMode;
   firstMapMode: string;
+  modeOrder: string[];
   fixedMapOrderText: string;
+  fixedFirstMapEnabled: boolean;
+  fixedFirstMapName: string;
+  firstMapPickerPolicy: FirstMapPickerPolicy;
+  mapPickerPolicy: MapPickerPolicy;
   rosterMode: PlayerInputMode;
   presetRosterText: string;
+  banEnabled: boolean;
   firstBanPolicy: FirstBanPolicy;
   openingSidePolicy: OpeningSidePolicy;
   scoreReportMode: ScoreReportMode;
@@ -189,6 +199,13 @@ interface RestState {
   skipReady: Record<Side, boolean>;
 }
 
+interface InteractiveRandomState {
+  purpose: InteractiveRandomPurpose;
+  mapIndex: number;
+  choices: Record<Side, 0 | 1 | null>;
+  resolvedSide: Side | null;
+}
+
 interface PauseState {
   active: boolean;
   startedAt: number | null;
@@ -224,6 +241,9 @@ interface SharedRoomSnapshot {
   teamAckNotice: TeamAckNotice | null;
   adminNotice: string | null;
   openingSide: Side;
+  firstMapPickerSide: Side;
+  interactiveRandomState: InteractiveRandomState | null;
+  interactiveRandomResults: Partial<Record<InteractiveRandomPurpose, Side>>;
   countdownStartedAt: number;
   countdownStartSeconds: number;
 }
@@ -365,14 +385,20 @@ const defaultSettings: SettingsState = {
     Push: ["Colosseo", "New Queen Street", "Runasapi"],
     Flashpoint: ["Suravasa", "New Junk City"],
   },
-  mapSelectionMode: "unique_map",
+  mapSelectionMode: "first_mode_then_unique_mode",
   firstMapMode: "Control",
-  fixedMapOrderText: "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa",
+  modeOrder: ["Control", "Push", "Hybrid", "Escort", "Flashpoint", "Control", "Push"],
+  fixedMapOrderText: "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa\nIlios\nRunasapi",
+  fixedFirstMapEnabled: false,
+  fixedFirstMapName: "",
+  firstMapPickerPolicy: "random",
+  mapPickerPolicy: "loser_choose",
   rosterMode: "free_input",
   presetRosterText: "蓝色方: A1,A2,A3,A4,A5\n红色方: B1,B2,B3,B4,B5",
+  banEnabled: true,
   firstBanPolicy: "allow_loser_choose",
   openingSidePolicy: "random",
-  scoreReportMode: "admin_only",
+  scoreReportMode: "team_submit_opponent_confirm",
 };
 
 function createDefaultCheckpoints(stageCount: number): SettingsState["checkpoints"] {
@@ -420,7 +446,7 @@ const mapNameZhByEn: Record<string, string> = {
 };
 
 const modeNameZhByEn: Record<string, string> = {
-  Control: "控制",
+  Control: "占领要点（控制）",
   Escort: "运载目标",
   Flashpoint: "闪点作战",
   Hybrid: "攻击/护送",
@@ -429,6 +455,8 @@ const modeNameZhByEn: Record<string, string> = {
 
 const app = getAppRoot();
 const appMode = getAppMode();
+document.body.classList.toggle("landing-page-body", appMode === "landing");
+document.body.classList.toggle("global-admin-page-body", appMode === "global-admin");
 const roomToken = getRoomTokenFromPath();
 const globalAdminHash = getGlobalAdminHashFromPath();
 let portalConfig = getPortalConfig();
@@ -449,6 +477,9 @@ let teamAckNotice: TeamAckNotice | null = null;
 let hiddenOverlay: OverlayKind | null = null;
 let adminNotice: string | null = null;
 let openingSide: Side = resolveOpeningSide();
+let firstMapPickerSide: Side = resolveSidePolicy(defaultSettings.firstMapPickerPolicy);
+let interactiveRandomState: InteractiveRandomState | null = null;
+let interactiveRandomResults: Partial<Record<InteractiveRandomPurpose, Side>> = {};
 let confirmedLineups: ConfirmedLineups = {};
 let countdownStartedAt = Date.now();
 let countdownStartSeconds = defaultSettings.stageLimits.mapSelectSeconds;
@@ -458,11 +489,12 @@ let serverSnapshotPollTimerId: number | null = null;
 let serverSnapshotPushInFlight = false;
 let pendingServerSnapshot: PendingSnapshotPush | null = null;
 let lastCreatedRoom: CreatedRoomResponse | null = null;
+let landingJoinValue = "";
 let adminSettings: AdminSettings | null = null;
 let configPresets: ConfigPreset[] = [];
 let roomConfigState: RoomConfigState | null = null;
 let selectedGlobalPresetId: string | null = null;
-let globalPresetDraftMeta: { id: string; name: string; description: string } | null = null;
+let globalPresetDraftMeta: { name: string } | null = null;
 let adminRooms: AdminRoom[] = [];
 let adminRoomHistory: RoomHistoryPage = { items: [], total: 0, page: 1, pageSize: 20 };
 
@@ -559,7 +591,7 @@ function canUseSettings(): boolean {
 }
 
 function canOperateMapSelection(): boolean {
-  if (!mapSelectorState) {
+  if (!mapSelectorState || interactiveRandomState) {
     return false;
   }
 
@@ -650,6 +682,9 @@ function createSharedRoomSnapshot(): SharedRoomSnapshot {
     teamAckNotice,
     adminNotice,
     openingSide,
+    firstMapPickerSide,
+    interactiveRandomState,
+    interactiveRandomResults,
     countdownStartedAt,
     countdownStartSeconds,
   };
@@ -710,6 +745,7 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
   }
 
   const localLineupState = lineupSelectorState;
+  const localInteractiveRandomState = interactiveRandomState;
   const incomingLineupState = normalizeLineupSelectorState(snapshot.lineupSelectorState);
 
   roomStarted = Boolean(snapshot.roomStarted);
@@ -725,6 +761,9 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
   teamAckNotice = snapshot.teamAckNotice ?? null;
   adminNotice = snapshot.adminNotice ?? null;
   openingSide = snapshot.openingSide ?? resolveOpeningSide();
+  firstMapPickerSide = snapshot.firstMapPickerSide ?? resolveSidePolicy(settingsState.firstMapPickerPolicy);
+  interactiveRandomState = snapshot.interactiveRandomState ?? null;
+  interactiveRandomResults = snapshot.interactiveRandomResults ?? {};
   countdownStartedAt = snapshot.countdownStartedAt;
   countdownStartSeconds = snapshot.countdownStartSeconds;
 
@@ -747,6 +786,27 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
     ) {
       lineupSelectorState.values[portalConfig.side] = { ...localLineupState.values[portalConfig.side] };
     }
+  }
+
+  if (
+    localInteractiveRandomState
+    && interactiveRandomState
+    && localInteractiveRandomState.purpose === interactiveRandomState.purpose
+    && portalConfig.side
+    && localInteractiveRandomState.choices[portalConfig.side] !== null
+    && interactiveRandomState.choices[portalConfig.side] === null
+  ) {
+    interactiveRandomState.choices[portalConfig.side] = localInteractiveRandomState.choices[portalConfig.side];
+  }
+
+  if (
+    interactiveRandomState
+    && !interactiveRandomState.resolvedSide
+    && interactiveRandomState.choices.left !== null
+    && interactiveRandomState.choices.right !== null
+  ) {
+    finalizeInteractiveRandom(false);
+    return;
   }
 
   if (shouldRender) {
@@ -944,6 +1004,9 @@ async function loadInitialData(): Promise<void> {
     hiddenOverlay = null;
     adminNotice = null;
     openingSide = resolveOpeningSide();
+    firstMapPickerSide = resolveSidePolicy(settingsState.firstMapPickerPolicy);
+    interactiveRandomState = null;
+    interactiveRandomResults = {};
     confirmedLineups = {};
     resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("room", "initialized"));
@@ -1009,6 +1072,7 @@ function renderCurrent(): void {
       ${renderBanSelector()}
       ${renderScoreSelector()}
       ${renderRestOverlay()}
+      ${renderInteractiveRandomOverlay()}
       ${renderMinimizedOverlay()}
       ${renderPauseOverlay()}
       ${renderTeamAckNotice()}
@@ -1022,6 +1086,7 @@ function renderCurrent(): void {
   bindBanSelectorEvents();
   bindScoreSelectorEvents();
   bindRestEvents();
+  bindInteractiveRandomEvents();
   bindPauseEvents();
   bindTeamAckEvents();
   bindOverlayNavigationEvents();
@@ -1042,43 +1107,190 @@ function renderShell(root: HTMLDivElement): void {
 
 function renderLandingPage(errorMessage = ""): void {
   app.innerHTML = `
-    <main class="page-shell">
-      <section class="landing-panel">
-        <div>
-          <p class="eyebrow">OW Ban Pick</p>
-          <h1>创建新的比赛房间</h1>
-          <p>无需注册。创建后会生成 A/B/C/D 四个哈希入口，由创建者分发给红队、蓝队、管理员和直播端。</p>
-        </div>
-        <button id="createRoomButton" class="start-match-button" type="button">创建房间</button>
-        ${errorMessage ? `<p class="landing-error">${escapeHtml(errorMessage)}</p>` : ""}
-      </section>
-      ${lastCreatedRoom ? renderCreatedRoomLinks(lastCreatedRoom) : ""}
+    <main class="page-shell landing-page-shell">
+      <header class="landing-brand" aria-label="守望先锋赛事BP房间">
+        <span class="landing-brand-mark" aria-hidden="true">OW</span>
+        <h1 class="landing-site-title">守望先锋赛事BP房间</h1>
+      </header>
+      <div class="landing-layout ${lastCreatedRoom ? "landing-layout-created" : "landing-layout-initial"}">
+        <section class="landing-panel landing-join-panel" aria-labelledby="joinRoomTitle">
+          <div class="landing-panel-heading">
+            <h2 id="joinRoomTitle">已有房间</h2>
+            <p class="landing-description">输入代码进入房间页面</p>
+          </div>
+          <form id="joinRoomForm" class="landing-join-form" novalidate>
+            <div class="landing-join-controls">
+              <input
+                id="joinRoomHash"
+                name="roomHash"
+                type="text"
+                value="${escapeHtml(landingJoinValue)}"
+                inputmode="text"
+                pattern="[0-9a-z]{4}"
+                autocomplete="off"
+                autocapitalize="none"
+                spellcheck="false"
+                placeholder="a7k2"
+                aria-label="房间代码"
+                aria-describedby="joinRoomStatus"
+              />
+              <button id="joinRoomButton" class="landing-primary-button" type="submit">进入房间</button>
+            </div>
+            <p id="joinRoomStatus" class="landing-status" aria-live="polite"></p>
+          </form>
+        </section>
+
+        <section class="landing-panel landing-create-panel" aria-labelledby="createRoomTitle">
+          <div class="landing-panel-heading">
+            <h2 id="createRoomTitle">创建房间</h2>
+            <p class="landing-description">生成进入房间的代码</p>
+          </div>
+          ${lastCreatedRoom
+            ? renderCreatedRoomLinks(lastCreatedRoom)
+            : `<button id="createRoomButton" class="landing-primary-button landing-create-button" type="button">创建房间</button>`}
+          <p id="createRoomStatus" class="landing-status${errorMessage ? " landing-status-error" : ""}" aria-live="polite">${escapeHtml(errorMessage)}</p>
+        </section>
+      </div>
     </main>
   `;
 
   document.getElementById("createRoomButton")?.addEventListener("click", createRoomFromLanding);
-  bindCopyLinkButtons();
+  bindJoinRoomForm();
+  bindRoomHashButtons();
 }
 
 function renderCreatedRoomLinks(room: CreatedRoomResponse): string {
   return `
-    <section class="created-room-panel">
+    <div class="created-room-panel">
       <div class="created-room-header">
         <span>房间已创建</span>
-        <strong>${escapeHtml(room.roomId)}</strong>
       </div>
       <div class="room-link-grid">
-        ${Object.entries(room.links).map(([code, link]) => `
-          <article class="room-link-card">
-            <span>${escapeHtml(code)} · ${escapeHtml(link.label)}</span>
-            <strong>${escapeHtml(link.hash)}</strong>
-            <a href="${escapeHtml(link.url)}">${escapeHtml(link.url)}</a>
-            <button class="copy-link-button" data-copy-value="${escapeHtml(link.url)}" type="button">复制链接</button>
-          </article>
-        `).join("")}
+        ${Object.entries(room.links).map(([code, link]) => {
+          const landingLabel = getLandingPortalLabel(code);
+          return `
+            <article class="room-link-card room-link-card-${escapeHtml(code.toLowerCase())}">
+              <div class="room-link-role">
+                <span class="room-role-dot" aria-hidden="true"></span>
+                <span>${escapeHtml(landingLabel)}</span>
+              </div>
+              <div class="room-link-actions">
+                <button
+                  class="copy-room-hash-button"
+                  data-copy-hash="${escapeHtml(link.hash)}"
+                  data-copy-label="${escapeHtml(landingLabel)}"
+                  type="button"
+                  aria-label="复制${escapeHtml(landingLabel)}哈希 ${escapeHtml(link.hash)}"
+                >${escapeHtml(link.hash)}</button>
+                <a class="enter-room-link" href="${escapeHtml(link.url)}">进入</a>
+              </div>
+            </article>
+          `;
+        }).join("")}
       </div>
-    </section>
+      <p id="copyRoomHashStatus" class="landing-status landing-copy-status" aria-live="polite"></p>
+    </div>
   `;
+}
+
+function getLandingPortalLabel(code: string): string {
+  const labels: Record<string, string> = {
+    A: "队伍1入口",
+    B: "队伍2入口",
+    C: "管理员入口",
+    D: "直播入口",
+  };
+
+  return labels[code] ?? "房间入口";
+}
+
+function bindJoinRoomForm(): void {
+  const form = document.getElementById("joinRoomForm") as HTMLFormElement | null;
+  const input = document.getElementById("joinRoomHash") as HTMLInputElement | null;
+
+  if (!form || !input) {
+    return;
+  }
+
+  input.addEventListener("input", () => {
+    const normalizedValue = normalizeRoomHash(input.value);
+    input.value = normalizedValue;
+    landingJoinValue = normalizedValue;
+    setLandingJoinStatus("");
+  });
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void enterRoomFromLanding();
+  });
+}
+
+function normalizeRoomHash(value: string): string {
+  return value.toLowerCase().replace(/[^0-9a-z]/g, "").slice(0, 4);
+}
+
+async function enterRoomFromLanding(): Promise<void> {
+  const input = document.getElementById("joinRoomHash") as HTMLInputElement | null;
+  const button = document.getElementById("joinRoomButton") as HTMLButtonElement | null;
+
+  if (!input || !button) {
+    return;
+  }
+
+  const roomHash = normalizeRoomHash(input.value);
+  input.value = roomHash;
+  landingJoinValue = roomHash;
+
+  if (!/^[0-9a-z]{4}$/.test(roomHash)) {
+    setLandingJoinStatus("请输入完整的 4 位数字或小写字母哈希。", true);
+    input.focus();
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = "验证中...";
+  setLandingJoinStatus("正在验证房间入口...");
+
+  try {
+    const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomHash)}`, {
+      headers: { Accept: "application/json" },
+    });
+
+    if (response.ok) {
+      window.location.assign(`/r/${encodeURIComponent(roomHash)}`);
+      return;
+    }
+
+    if (response.status === 404) {
+      setLandingJoinStatus("房间入口不存在，请检查哈希。", true);
+      return;
+    }
+
+    if (response.status === 410) {
+      setLandingJoinStatus("房间已经关闭或因不活跃而过期。", true);
+      return;
+    }
+
+    setLandingJoinStatus("暂时无法验证房间，请稍后重试。", true);
+  } catch {
+    setLandingJoinStatus("网络连接失败，请稍后重试。", true);
+  } finally {
+    if (document.body.contains(button)) {
+      button.disabled = false;
+      button.textContent = "进入房间";
+    }
+  }
+}
+
+function setLandingJoinStatus(message: string, isError = false): void {
+  const status = document.getElementById("joinRoomStatus");
+
+  if (!status) {
+    return;
+  }
+
+  status.textContent = message;
+  status.classList.toggle("landing-status-error", isError);
 }
 
 async function createRoomFromLanding(): Promise<void> {
@@ -1089,20 +1301,53 @@ async function createRoomFromLanding(): Promise<void> {
     button.textContent = "创建中...";
   }
 
-  const response = await fetch("/api/rooms", { method: "POST", headers: { Accept: "application/json" } });
+  try {
+    const response = await fetch("/api/rooms", { method: "POST", headers: { Accept: "application/json" } });
 
-  if (response.status === 429) {
-    renderLandingPage("创建过于频繁，请稍后再试。");
-    return;
+    if (response.status === 429) {
+      renderLandingPage("创建过于频繁，请稍后再试。");
+      return;
+    }
+
+    if (!response.ok) {
+      renderLandingPage("创建房间失败，请稍后重试。");
+      return;
+    }
+
+    lastCreatedRoom = await response.json() as CreatedRoomResponse;
+    renderLandingPage();
+  } catch {
+    renderLandingPage("网络连接失败，请稍后重试。");
   }
+}
 
-  if (!response.ok) {
-    renderLandingPage("创建房间失败，请稍后重试。");
-    return;
-  }
+function bindRoomHashButtons(): void {
+  app.querySelectorAll<HTMLButtonElement>(".copy-room-hash-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const roomHash = button.dataset.copyHash;
+      const label = button.dataset.copyLabel;
+      const status = document.getElementById("copyRoomHashStatus");
 
-  lastCreatedRoom = await response.json() as CreatedRoomResponse;
-  renderLandingPage();
+      if (!roomHash || !label || !status) {
+        return;
+      }
+
+      try {
+        if (!navigator.clipboard) {
+          throw new Error("Clipboard API unavailable");
+        }
+
+        await navigator.clipboard.writeText(roomHash);
+        status.textContent = `${label}哈希 ${roomHash} 已复制。`;
+        status.classList.remove("landing-status-error");
+        button.classList.add("is-copied");
+        window.setTimeout(() => button.classList.remove("is-copied"), 1200);
+      } catch {
+        status.textContent = "复制失败，请手动选择哈希。";
+        status.classList.add("landing-status-error");
+      }
+    });
+  });
 }
 
 function bindCopyLinkButtons(): void {
@@ -1110,12 +1355,17 @@ function bindCopyLinkButtons(): void {
     button.addEventListener("click", async () => {
       const value = button.dataset.copyValue;
 
-      if (!value) {
+      if (!value || !navigator.clipboard) {
+        button.textContent = "复制失败";
         return;
       }
 
-      await navigator.clipboard?.writeText(value);
-      button.textContent = "已复制";
+      try {
+        await navigator.clipboard.writeText(value);
+        button.textContent = "已复制";
+      } catch {
+        button.textContent = "复制失败";
+      }
     });
   });
 }
@@ -1166,39 +1416,52 @@ function renderGlobalAdminPage(message = ""): void {
   }
 
   app.innerHTML = `
-    <main class="page-shell">
-      <section class="global-admin-panel">
-        <div class="created-room-header">
-          <span>全局管理</span>
-          <strong>房间与默认设置</strong>
+    <main class="page-shell global-admin-shell">
+      <header class="global-admin-page-heading">
+        <div>
+          <span>管理设置</span>
+          <h1>全局管理</h1>
+          <p>管理房间限制、默认配置模板和历史记录。</p>
         </div>
-        ${message ? `<p class="admin-notice">${escapeHtml(message)}</p>` : ""}
-        <div class="settings-grid">
-          <label>每 IP 每小时创建数<input id="adminRoomsPerHour" type="number" min="1" value="${adminSettings.roomsPerHour}" /></label>
-          <label>不活跃关闭分钟数<input id="adminInactiveTimeout" type="number" min="1" value="${adminSettings.inactiveTimeoutMinutes}" /></label>
+      </header>
+      ${message ? `<p class="admin-notice global-admin-notice">${escapeHtml(message)}</p>` : ""}
+      <section class="global-admin-panel admin-settings-panel">
+        ${renderAdminSectionHeader("常规设置", "创建房间时使用的全局规则。")}
+        <div class="admin-setting-list">
+          ${renderAdminSettingRow(
+            "每 IP 每小时创建数",
+            "限制单个 IP 地址每小时最多可以创建的房间数量。",
+            `<input id="adminRoomsPerHour" type="number" min="1" max="500" value="${adminSettings.roomsPerHour}" />`,
+          )}
+          ${renderAdminSettingRow(
+            "不活跃关闭分钟数",
+            "房间在指定分钟内没有活动时自动关闭并归档。",
+            `<input id="adminInactiveTimeout" type="number" min="1" max="43200" value="${adminSettings.inactiveTimeoutMinutes}" />`,
+          )}
+          ${renderAdminSettingRow(
+            "新房间默认模板",
+            "选择新建房间时自动复制的配置模板。",
+            `<select id="adminDefaultPreset">
+              <option value="">网站内置默认配置</option>
+              ${configPresets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${adminSettings!.defaultPresetId === preset.id ? "selected" : ""}>${escapeHtml(preset.name)}</option>`).join("")}
+            </select>`,
+          )}
         </div>
-        <label>新房间默认模板
-          <select id="adminDefaultPreset">
-            <option value="">网站内置默认配置</option>
-            ${configPresets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${adminSettings!.defaultPresetId === preset.id ? "selected" : ""}>${escapeHtml(preset.name)}</option>`).join("")}
-          </select>
-        </label>
-        <button id="saveGlobalSettings" class="start-match-button" type="button">保存全局设置</button>
+        <footer class="admin-section-footer">
+          <button id="saveGlobalSettings" class="admin-primary-button" type="button">保存全局设置</button>
+        </footer>
       </section>
       ${renderConfigPresetManager(selectedPreset ?? null)}
       <section class="global-admin-panel">
-        <div class="created-room-header">
-          <span>房间列表</span>
-          <strong>${adminRooms.length} 间</strong>
-        </div>
+        ${renderAdminSectionHeader("房间列表", "查看当前活动房间并复制各入口地址。", `${adminRooms.length} 间`)}
         <div class="admin-room-list">
           ${adminRooms.map(renderAdminRoom).join("") || `<p class="empty-room-list">暂无房间</p>`}
         </div>
       </section>
       <section class="global-admin-panel">
-        <div class="created-room-header">
-          <span>永久历史</span>
-          <strong>${adminRoomHistory.total} 份 JSON</strong>
+        ${renderAdminSectionHeader("永久历史", "已归档房间的状态、时间和操作记录。", `${adminRoomHistory.total} 份 JSON`)}
+        <div class="history-list-heading" aria-hidden="true">
+          <span>状态</span><span>房间</span><span>时间</span><span>版本与操作</span><span>操作</span>
         </div>
         <div class="admin-room-list history-room-list">
           ${adminRoomHistory.items.map(renderRoomHistorySummary).join("") || `<p class="empty-room-list">暂无历史记录</p>`}
@@ -1235,21 +1498,45 @@ function renderGlobalAdminPage(message = ""): void {
   bindCopyLinkButtons();
 }
 
+function renderAdminSectionHeader(title: string, description: string, count = ""): string {
+  return `
+    <header class="admin-section-header">
+      <div>
+        <h2>${escapeHtml(title)}</h2>
+        <p>${escapeHtml(description)}</p>
+      </div>
+      ${count ? `<span>${escapeHtml(count)}</span>` : ""}
+    </header>
+  `;
+}
+
+function renderAdminSettingRow(title: string, description: string, control: string): string {
+  return `
+    <label class="admin-setting-row">
+      <span class="admin-setting-copy">
+        <strong>${escapeHtml(title)}</strong>
+        <small>${escapeHtml(description)}</small>
+      </span>
+      <span class="admin-setting-control">${control}</span>
+    </label>
+  `;
+}
+
 function renderAdminRoom(room: AdminRoom): string {
   const isClosed = Boolean(room.closedAt);
 
   return `
-    <article class="admin-room-card">
+    <article class="admin-room-card active-admin-room-card">
       <header>
-        <span>${isClosed ? "已关闭" : "活跃"}</span>
-        <strong>${escapeHtml(room.id)}</strong>
+        <span class="room-status ${isClosed ? "room-status-closed" : "room-status-active"}">${isClosed ? "已关闭" : "活跃"}</span>
+        <strong>房间 ${escapeHtml(room.id)}</strong>
         <button class="close-admin-room" data-room-id="${escapeHtml(room.id)}" type="button" ${isClosed ? "disabled" : ""}>关闭房间</button>
       </header>
       <p>创建：${formatTimestamp(room.createdAt)} · 最后活跃：${formatTimestamp(room.lastActiveAt)}${room.closedAt ? ` · 关闭：${formatTimestamp(room.closedAt)}` : ""}</p>
       <div class="admin-room-links">
         ${Object.entries(room.links).map(([code, link]) => `
           <div>
-            <span>${escapeHtml(code)} · ${escapeHtml(link.label)}</span>
+            <span>${escapeHtml(getLandingPortalLabel(code))}</span>
             <code>${escapeHtml(link.hash)}</code>
             <button class="copy-link-button" data-copy-value="${escapeHtml(link.url)}" type="button">复制</button>
           </div>
@@ -1268,20 +1555,23 @@ function renderRoomHistorySummary(history: RoomHistorySummary): string {
   const historyBaseUrl = `/api/admin/${encodeURIComponent(globalAdminHash ?? "")}/room-history/${encodeURIComponent(history.archiveKey)}`;
 
   return `
-    <article class="admin-room-card history-room-card">
-      <header>
-        <span class="history-status history-status-${escapeHtml(history.status)}">${statusLabels[history.status] ?? history.status}</span>
+    <article class="history-room-row">
+      <span class="history-status history-status-${escapeHtml(history.status)}">${statusLabels[history.status] ?? history.status}</span>
+      <div class="history-room-identity">
         <strong>房间 ${escapeHtml(history.roomId)}</strong>
-        <div class="history-card-actions">
-          <button class="view-room-history" data-archive-key="${escapeHtml(history.archiveKey)}" type="button">查看</button>
-          <a class="download-room-history" href="${escapeHtml(`${historyBaseUrl}/download`)}" download="${escapeHtml(`${history.archiveKey}.json`)}">下载</a>
-        </div>
-      </header>
-      <p>档案：<code>${escapeHtml(history.archiveKey)}</code></p>
-      <p>创建：${formatTimestamp(history.createdAt)} · 更新：${formatTimestamp(history.updatedAt)}${history.closedAt ? ` · 关闭：${formatTimestamp(history.closedAt)}` : ""}</p>
-      <p>版本 ${history.currentVersion} · ${history.operationCount} 条操作${history.closeReason ? ` · 原因：${escapeHtml(history.closeReason)}` : ""}</p>
-      <div class="history-token-list">
-        ${Object.entries(history.tokens).map(([code, token]) => `<code>${escapeHtml(code)}: ${escapeHtml(token)}</code>`).join("")}
+        <code>${escapeHtml(history.archiveKey)}</code>
+      </div>
+      <div class="history-room-time">
+        <span>创建：${formatTimestamp(history.createdAt)}</span>
+        <span>更新：${formatTimestamp(history.updatedAt)}${history.closedAt ? ` · 关闭：${formatTimestamp(history.closedAt)}` : ""}</span>
+      </div>
+      <div class="history-room-stats">
+        <span>版本 ${history.currentVersion} · ${history.operationCount} 条操作</span>
+        ${history.closeReason ? `<small>${escapeHtml(history.closeReason)}</small>` : ""}
+      </div>
+      <div class="history-card-actions">
+        <button class="view-room-history" data-archive-key="${escapeHtml(history.archiveKey)}" type="button">查看</button>
+        <a class="download-room-history" href="${escapeHtml(`${historyBaseUrl}/download`)}" download="${escapeHtml(`${history.archiveKey}.json`)}">下载</a>
       </div>
     </article>
   `;
@@ -1370,7 +1660,10 @@ function formatTimestamp(timestamp: number): string {
     return "-";
   }
 
-  return new Date(timestamp * 1000).toLocaleString();
+  const date = new Date(timestamp * 1000);
+  const pad = (value: number): string => String(value).padStart(2, "0");
+
+  return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function renderStartGate(): string {
@@ -2043,14 +2336,14 @@ function renderRestOverlay(): string {
   const mapName = map.nameZh ?? map.nameEn ?? `MAP ${restState.mapIndex + 1}`;
   const restTitle = map.status === "completed"
     ? `MAP ${restState.mapIndex + 1} ${mapName} 已结束`
-    : `MAP ${restState.mapIndex + 1} 开始前休息`;
+    : `MAP ${restState.mapIndex + 1} 准备时间`;
 
   return `
     <section class="rest-overlay" role="dialog" aria-modal="false" aria-label="休息倒计时">
       <div class="rest-panel">
         <header class="score-selector-header">
           <div>
-            <span class="selector-eyebrow">休息时间</span>
+            <span class="selector-eyebrow">场间设置</span>
             <h2>${escapeHtml(restTitle)}</h2>
           </div>
           <div class="selector-header-actions">
@@ -2174,52 +2467,118 @@ function renderSettingsPanel(): string {
   `;
 }
 
+function renderInteractiveRandomOverlay(): string {
+  if (!interactiveRandomState || isBroadcastPortal()) {
+    return "";
+  }
+
+  const state = interactiveRandomState;
+  const resolved = state.resolvedSide !== null;
+  const purposeLabel = state.purpose === "map_picker" ? "首次地图选择" : "禁用首次先手方";
+  const leftChoice = state.choices.left ?? 0;
+  const rightChoice = state.choices.right ?? 0;
+
+  return `
+    <section class="interactive-random-overlay" role="dialog" aria-modal="false" aria-label="交互随机">
+      <div class="interactive-random-panel">
+        <header class="score-selector-header">
+          <div>
+            <span class="selector-eyebrow">交互随机 · ${escapeHtml(purposeLabel)}</span>
+            <h2>${resolved ? "计算结果已公布" : "双方分别选择 0 或 1"}</h2>
+          </div>
+          ${resolved ? "" : `<div class="selector-header-actions"><strong>30 秒内选择，超时默认 0</strong></div>`}
+        </header>
+        ${resolved ? "" : renderCountdownProgress("interactive-random-progress")}
+        <div class="interactive-random-teams">
+          ${renderInteractiveRandomTeam("left")}
+          <div class="interactive-random-xor" aria-hidden="true">XOR</div>
+          ${renderInteractiveRandomTeam("right")}
+        </div>
+        <footer class="interactive-random-footer">
+          ${resolved
+            ? `<div class="interactive-random-result"><span>${leftChoice} XOR ${rightChoice} = ${leftChoice ^ rightChoice}</span><strong>${escapeHtml(getTeamName(state.resolvedSide!))}获得${state.purpose === "map_picker" ? "首次选图权" : "禁用首次先手"}</strong></div><button id="continueInteractiveRandom" type="button">继续</button>`
+            : `<p>双方选择互不公开，提交或倒计时结束后统一公布计算结果。</p>`}
+        </footer>
+      </div>
+    </section>
+  `;
+}
+
+function renderInteractiveRandomTeam(side: Side): string {
+  if (!interactiveRandomState) {
+    return "";
+  }
+  const selected = interactiveRandomState.choices[side];
+  const editable = !interactiveRandomState.resolvedSide && portalConfig.side === side;
+  return `
+    <section class="interactive-random-team ${selected !== null ? "is-submitted" : ""}">
+      <span>${side === "left" ? "队伍1" : "队伍2"}</span>
+      <strong>${escapeHtml(getTeamName(side))}</strong>
+      <div>
+        ${([0, 1] as const).map((value) => `<button class="interactive-random-choice ${selected === value ? "is-selected" : ""}" type="button" data-random-value="${value}" ${editable ? "" : "disabled"}>${value}</button>`).join("")}
+      </div>
+      <small>${interactiveRandomState.resolvedSide ? `选择 ${selected ?? 0}` : selected !== null ? "已提交" : editable ? "请选择" : "等待提交"}</small>
+    </section>
+  `;
+}
+
+function bindInteractiveRandomEvents(): void {
+  app.querySelectorAll<HTMLButtonElement>(".interactive-random-choice:not(:disabled)").forEach((button) => {
+    button.addEventListener("click", () => submitInteractiveRandomChoice(Number(button.dataset.randomValue) as 0 | 1));
+  });
+  document.getElementById("continueInteractiveRandom")?.addEventListener("click", continueAfterInteractiveRandom);
+}
+
 function renderConfigPresetManager(selectedPreset: ConfigPreset | null): string {
   const editing = Boolean(selectedPreset || selectedGlobalPresetId === "__new__");
   const editorMeta = globalPresetDraftMeta ?? {
-    id: selectedPreset?.id ?? "",
     name: selectedPreset?.name ?? "",
-    description: selectedPreset?.description ?? "",
   };
   return `
     <section class="global-admin-panel config-preset-manager">
-      <div class="created-room-header">
-        <span>默认配置模板</span>
-        <strong>${configPresets.length} 个</strong>
-      </div>
+      ${renderAdminSectionHeader("默认配置模板", "为新房间保存可重复使用的完整比赛配置。", `${configPresets.length} 个`)}
       <div class="config-preset-toolbar">
-        <button id="newConfigPreset" type="button">新建模板</button>
-        <button id="showPresetJsonImport" type="button">粘贴 JSON 导入</button>
+        <button id="newConfigPreset" class="admin-primary-button" type="button">新建模板</button>
+        <button id="showPresetJsonImport" class="admin-secondary-button" type="button">粘贴 JSON 导入</button>
         <a href="/docs/config/match-config.example.json" target="_blank" rel="noreferrer">查看完整示例</a>
       </div>
       <div class="config-preset-list">
         ${configPresets.map((preset) => `
           <article class="config-preset-card ${preset.id === selectedGlobalPresetId ? "is-selected" : ""}">
-            <div><strong>${escapeHtml(preset.name)}</strong><span>v${preset.revision} · ${escapeHtml(preset.description || "无说明")}</span></div>
+            <div><strong>${escapeHtml(preset.name)}</strong><span>版本 ${preset.revision} · 更新于 ${formatTimestamp(preset.updatedAt)}</span></div>
             <div>
               <button class="edit-config-preset" data-preset-id="${escapeHtml(preset.id)}" type="button">GUI 编辑</button>
               <button class="copy-config-preset-json" data-preset-id="${escapeHtml(preset.id)}" type="button">复制 JSON</button>
               <button class="delete-config-preset" data-preset-id="${escapeHtml(preset.id)}" type="button">删除</button>
             </div>
           </article>
-        `).join("") || `<p>暂无模板，可新建或导入完整 JSON。</p>`}
+        `).join("") || `<div class="admin-empty-state"><strong>暂无模板</strong><p>可新建模板或导入完整 JSON。</p></div>`}
       </div>
       <div id="globalPresetImportPanel" class="config-import-panel" hidden>
-        <label>粘贴完整模板 JSON<textarea id="globalPresetJson" placeholder="粘贴 match-config.example.json 格式的内容"></textarea></label>
-        <button id="importGlobalPresetJson" type="button">校验并导入</button>
+        <header><strong>导入配置模板</strong><p>粘贴 match-config.example.json 格式的完整内容，保存前会进行校验。</p></header>
+        <textarea id="globalPresetJson" aria-label="完整模板 JSON" placeholder="粘贴完整模板 JSON"></textarea>
+        <button id="importGlobalPresetJson" class="admin-primary-button" type="button">校验并导入</button>
       </div>
       ${editing ? `
         <section class="global-preset-editor">
-          <div class="settings-grid">
-            <label>模板 ID<input id="globalPresetId" type="text" value="${escapeHtml(editorMeta.id)}" ${selectedPreset ? "disabled" : ""} placeholder="cup-a" /></label>
-            <label>模板名称<input id="globalPresetName" type="text" value="${escapeHtml(editorMeta.name)}" placeholder="杯赛 A" /></label>
-            <label>模板说明<input id="globalPresetDescription" type="text" value="${escapeHtml(editorMeta.description)}" /></label>
+          <header class="global-preset-editor-heading">
+            <div>
+              <h3>${selectedPreset ? "编辑配置模板" : "新建配置模板"}</h3>
+              <p>${selectedPreset ? `正在编辑“${escapeHtml(selectedPreset.name)}”` : "未保存"}</p>
+            </div>
+          </header>
+          <div class="admin-setting-list preset-metadata-settings">
+            ${renderAdminSettingRow(
+              "模板名称",
+              "用于模板列表和房间配置选择器中的显示名称。",
+              `<input id="globalPresetName" type="text" value="${escapeHtml(editorMeta.name)}" placeholder="杯赛 A" />`,
+            )}
           </div>
           ${renderSharedConfigFields()}
-          <div class="settings-actions">
-            <button id="saveGlobalPreset" class="start-match-button" type="button">保存模板</button>
-            <button id="cancelGlobalPresetEdit" type="button">取消</button>
-          </div>
+          <footer class="admin-section-footer global-preset-editor-actions">
+            <button id="saveGlobalPreset" class="admin-primary-button" type="button">保存模板</button>
+            <button id="cancelGlobalPresetEdit" class="admin-secondary-button" type="button">取消</button>
+          </footer>
         </section>
       ` : ""}
     </section>
@@ -2229,7 +2588,7 @@ function renderConfigPresetManager(selectedPreset: ConfigPreset | null): string 
 function bindGlobalPresetManagerEvents(): void {
   document.getElementById("newConfigPreset")?.addEventListener("click", () => {
     selectedGlobalPresetId = "__new__";
-    globalPresetDraftMeta = { id: "", name: "", description: "" };
+    globalPresetDraftMeta = { name: "" };
     settingsState = structuredClone(defaultSettings);
     renderGlobalAdminPage();
   });
@@ -2251,7 +2610,7 @@ function bindGlobalPresetManagerEvents(): void {
     button.addEventListener("click", () => {
       selectedGlobalPresetId = button.dataset.presetId ?? null;
       const preset = configPresets.find((item) => item.id === selectedGlobalPresetId);
-      globalPresetDraftMeta = preset ? { id: preset.id, name: preset.name, description: preset.description } : null;
+      globalPresetDraftMeta = preset ? { name: preset.name } : null;
       if (preset) {
         settingsState = mergeSettings(defaultSettings, preset.config);
       }
@@ -2270,7 +2629,7 @@ function bindGlobalPresetManagerEvents(): void {
     bindMapPoolDragEvents();
     bindModeOrderDragEvents();
     bindRosterEditorControls();
-    ["matchFormat", "mapSelectionMode"].forEach((id) => {
+    ["matchFormat", "mapSelectionMode", "rosterMode", "fixedFirstMapEnabled", "banEnabled"].forEach((id) => {
       document.getElementById(id)?.addEventListener("change", () => {
         captureGlobalPresetDraftMeta();
         readSettingsFromForm();
@@ -2282,9 +2641,7 @@ function bindGlobalPresetManagerEvents(): void {
 
 function captureGlobalPresetDraftMeta(): void {
   globalPresetDraftMeta = {
-    id: (document.getElementById("globalPresetId") as HTMLInputElement | null)?.value.trim().toLowerCase() ?? "",
     name: (document.getElementById("globalPresetName") as HTMLInputElement | null)?.value.trim() ?? "",
-    description: (document.getElementById("globalPresetDescription") as HTMLInputElement | null)?.value.trim() ?? "",
   };
 }
 
@@ -2293,6 +2650,8 @@ function initializeConfigEditorControls(): void {
     ["matchFormat", settingsState.matchFormat],
     ["mapSelectionMode", settingsState.mapSelectionMode],
     ["firstMapMode", settingsState.firstMapMode],
+    ["firstMapPickerPolicy", settingsState.firstMapPickerPolicy],
+    ["mapPickerPolicy", settingsState.mapPickerPolicy],
     ["rosterMode", settingsState.rosterMode],
     ["firstBanPolicy", settingsState.firstBanPolicy],
     ["openingSidePolicy", settingsState.openingSidePolicy],
@@ -2328,10 +2687,14 @@ async function saveGlobalPresetFromForm(): Promise<void> {
   if (!globalAdminHash || !readSettingsFromForm()) {
     return;
   }
-  const id = (document.getElementById("globalPresetId") as HTMLInputElement | null)?.value.trim().toLowerCase() ?? "";
+  const validationErrors = validateSettingsForSubmit();
+  if (validationErrors.length > 0) {
+    alert(validationErrors.join("\n"));
+    return;
+  }
+  const id = selectedGlobalPresetId && selectedGlobalPresetId !== "__new__" ? selectedGlobalPresetId : "";
   const name = (document.getElementById("globalPresetName") as HTMLInputElement | null)?.value.trim() ?? "";
-  const description = (document.getElementById("globalPresetDescription") as HTMLInputElement | null)?.value.trim() ?? "";
-  const existing = configPresets.some((preset) => preset.id === id);
+  const existing = Boolean(id && configPresets.some((preset) => preset.id === id));
   const response = await fetch(
     existing
       ? `/api/admin/${encodeURIComponent(globalAdminHash)}/config-presets/${encodeURIComponent(id)}`
@@ -2339,7 +2702,7 @@ async function saveGlobalPresetFromForm(): Promise<void> {
     {
       method: existing ? "PUT" : "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ schemaVersion: 1, id, name, description, config: settingsState }),
+      body: JSON.stringify({ schemaVersion: 1, ...(id ? { id } : {}), name, config: settingsState }),
     },
   );
   if (!response.ok) {
@@ -2412,7 +2775,6 @@ async function copyGlobalPresetJson(presetId: string): Promise<void> {
     schemaVersion: 1,
     id: preset.id,
     name: preset.name,
-    description: preset.description,
     config: preset.config,
   }, null, 2));
   alert("模板 JSON 已复制。");
@@ -2437,28 +2799,28 @@ function renderRoomPresetChooser(): string {
 
 function renderSharedConfigFields(): string {
   return `
-    <details class="settings-section" open>
-      <summary>比赛信息与时间</summary>
-      <div class="settings-grid">
-        <label>比赛名称<input id="matchName" type="text" value="${escapeHtml(settingsState.matchName)}" /></label>
-        <label>蓝色方队名<input id="leftTeamName" type="text" value="${escapeHtml(settingsState.teams.left)}" /></label>
-        <label>红色方队名<input id="rightTeamName" type="text" value="${escapeHtml(settingsState.teams.right)}" /></label>
-        <label>
-          比赛赛制
-          <select id="matchFormat">
+    <details class="settings-section admin-config-section" open>
+      <summary>比赛信息</summary>
+      <div class="admin-setting-list">
+        ${renderAdminSettingRow("比赛名称", "显示在房间页面顶部的比赛名称。", `<input id="matchName" type="text" value="${escapeHtml(settingsState.matchName)}" />`)}
+        ${renderAdminSettingRow("队伍1队名", "队伍1在比赛页面中的显示名称。", `<input id="leftTeamName" type="text" value="${escapeHtml(settingsState.teams.left)}" />`)}
+        ${renderAdminSettingRow("队伍2队名", "队伍2在比赛页面中的显示名称。", `<input id="rightTeamName" type="text" value="${escapeHtml(settingsState.teams.right)}" />`)}
+        ${renderAdminSettingRow(
+          "比赛赛制",
+          "FT2、FT3、FT4 分别准备 5、7、9 个地图槽位，允许最多出现 2 场平局。",
+          `<select id="matchFormat">
             <option value="ft2">FT2</option>
             <option value="ft3">FT3</option>
             <option value="ft4">FT4</option>
-          </select>
-        </label>
-        <label>开始前休息<input id="preStartRestSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.preStartRestSeconds}" /></label>
-        <label>选图时间<input id="mapSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.mapSelectSeconds}" /></label>
-        <label>选人时间<input id="playerSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.playerSelectSeconds}" /></label>
-        <label>先后 Ban 选择<input id="firstBanChoiceSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanChoiceSeconds}" /></label>
-        <label>先 Ban 时间<input id="firstBanActionSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanActionSeconds}" /></label>
-        <label>后 Ban 时间<input id="secondBanActionSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.secondBanActionSeconds}" /></label>
-        <label>比分确认<input id="scoreConfirmSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.scoreConfirmSeconds}" /></label>
-        <label>每图赛后休息<input id="postMatchRestSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.postMatchRestSeconds}" /></label>
+          </select>`,
+        )}
+      </div>
+    </details>
+    <details class="settings-section admin-config-section" open>
+      <summary>场间设置</summary>
+      <div class="admin-setting-list">
+        ${renderAdminSettingRow("准备时间", "比赛开始前的准备时间，单位为秒；设置为 0 则禁用。", `<input id="preStartRestSeconds" type="number" min="0" max="3600" value="${settingsState.stageLimits.preStartRestSeconds}" />`)}
+        ${renderAdminSettingRow("场间时间", "每张地图结束后的间隔时间，单位为秒；设置为 0 则禁用。", `<input id="postMatchRestSeconds" type="number" min="0" max="3600" value="${settingsState.stageLimits.postMatchRestSeconds}" />`)}
       </div>
     </details>
     ${renderMapSettingsPanel()}
@@ -2516,62 +2878,116 @@ function renderCheckpointRows(): string {
 function renderMapSettingsPanel(): string {
   const mode = settingsState.mapSelectionMode;
   const showMapPool = mode !== "fixed_map_order";
+  const showFirstMapPicker = showMapPool && !settingsState.fixedFirstMapEnabled;
+  const openAttribute = appMode === "global-admin" ? "open" : "";
 
   return `
-    <details class="settings-section">
+    <details class="settings-section admin-config-section" ${openAttribute}>
       <summary>地图设置</summary>
-      <label>
-        地图选择模式
-        <select id="mapSelectionMode">
-          <option value="unique_map">已选地图不可重复</option>
-          <option value="unique_mode_until_cycle">未轮完类别前不可重复类别</option>
-          <option value="first_mode_then_unique_mode">第一张限定类别，其余轮完类别前不重复</option>
-          <option value="strict_mode_order">按类别顺序选</option>
+      <div class="admin-setting-list">
+        ${renderAdminSettingRow(
+          "地图选择模式",
+          "控制地图是否可重复以及地图模式的轮换方式。",
+          `<select id="mapSelectionMode">
+          <option value="first_mode_then_unique_mode">首图指定模式，未选完所有模式前不可重复选择</option>
+          <option value="unique_mode_until_cycle">首图任意模式，未选完所有模式前不可重复选择</option>
+          <option value="strict_mode_order">指定模式顺序，已选择地图不可重复选择</option>
+          <option value="unique_map">任意选择，已选择地图不可重复选择</option>
           <option value="fixed_map_order">固定地图顺序</option>
-        </select>
-      </label>
+        </select>`,
+        )}
+        ${renderAdminSettingRow("地图选择时间", "每张地图的选择时间，单位为秒。", `<input id="mapSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.mapSelectSeconds}" />`)}
+      </div>
       ${mode === "first_mode_then_unique_mode" ? renderFirstMapModeSetting() : ""}
       ${mode === "strict_mode_order" ? renderModeOrderSetting() : ""}
-      ${showMapPool ? `<div class="visual-map-pool">${getVisualMapPoolMarkup()}</div>` : ""}
+      ${showMapPool ? renderFixedFirstMapSetting() : ""}
+      ${showFirstMapPicker ? renderAdminSettingRow(
+        "首次地图选择",
+        "设置第一张地图由哪一方选择；交互随机由双方选择 0 或 1 后计算 XOR。",
+        renderSidePolicySelect("firstMapPickerPolicy", settingsState.firstMapPickerPolicy),
+      ) : ""}
+      ${showMapPool ? renderAdminSettingRow(
+        "地图选择队伍",
+        "从第二张地图开始，由上一张非平局地图的败者选择。平局时继续向前寻找最近的非平局结果。",
+        `<select id="mapPickerPolicy"><option value="loser_choose">败者选择</option></select>`,
+      ) : ""}
+      ${showMapPool ? `<div class="admin-config-subsection"><header><strong>地图池</strong><p>选择该模板允许使用的地图。</p></header><div class="visual-map-pool">${getVisualMapPoolMarkup()}</div></div>` : ""}
       ${mode === "fixed_map_order" ? renderFixedMapOrderSetting() : ""}
     </details>
   `;
 }
 
 function renderFirstMapModeSetting(): string {
-  return `
-    <label>
-      第一张地图类别
-      <select id="firstMapMode">
+  return renderAdminSettingRow(
+    "第一张地图模式",
+    "指定系列赛首张地图必须使用的模式。",
+    `<select id="firstMapMode">
         ${(mapCatalogState.modes.length ? mapCatalogState.modes : getConfiguredModeOrder())
           .map((mode) => `<option value="${escapeHtml(mode)}">${escapeHtml(getModeLabel(mode))}</option>`)
           .join("")}
-      </select>
-    </label>
-  `;
+      </select>`,
+  );
 }
 
 function renderModeOrderSetting(): string {
-  const orderedModes = getConfiguredModeOrder();
-  const fallbackModes = mapCatalogState.modes.filter((mode) => !orderedModes.includes(mode));
-  const modes = [...orderedModes, ...fallbackModes];
+  const modes = settingsState.modeOrder.length > 0 ? settingsState.modeOrder : getConfiguredModeOrder();
 
   return `
     <div class="mode-order-setting">
-      <span>类别顺序</span>
+      <span>模式顺序</span>
       <div class="mode-order-list">
         ${modes
           .map(
-            (mode) => `
-              <div class="mode-order-item" draggable="true" data-mode-order="${escapeHtml(mode)}">
-                ${escapeHtml(getModeLabel(mode))}
+            (mode, index) => `
+              <div class="mode-order-item" draggable="true" data-mode-order="${escapeHtml(mode)}" data-mode-order-index="${index}">
+                <span>${escapeHtml(getModeLabel(mode))}</span>
+                <button class="remove-mode-order" type="button" aria-label="删除${escapeHtml(getModeLabel(mode))}" title="删除">×</button>
               </div>
             `,
           )
           .join("")}
       </div>
+      <div class="mode-order-add-row">
+        <select id="modeOrderAddSelect" aria-label="选择要增加的地图模式">
+          ${(mapCatalogState.modes.length ? mapCatalogState.modes : Object.keys(settingsState.mapPool))
+            .map((mode) => `<option value="${escapeHtml(mode)}">${escapeHtml(getModeLabel(mode))}</option>`)
+            .join("")}
+        </select>
+        <button id="addModeOrder" type="button">＋ 增加模式</button>
+      </div>
+      <small>保存模板时会校验模式项数不少于 ${settingsState.stageCount}，并检查每种模式有足够的不重复地图。</small>
     </div>
   `;
+}
+
+function renderFixedFirstMapSetting(): string {
+  const options = getAllCatalogMapChoices();
+  return `
+    <div class="fixed-first-map-setting">
+      ${renderAdminSettingRow(
+        "首图固定选择",
+        "开启后，第一张地图只能使用指定地图；保存时会检查它是否符合首图模式规则。",
+        `<label class="admin-switch"><input id="fixedFirstMapEnabled" type="checkbox" ${settingsState.fixedFirstMapEnabled ? "checked" : ""} /><span></span><b>${settingsState.fixedFirstMapEnabled ? "已开启" : "已关闭"}</b></label>`,
+      )}
+      ${renderAdminSettingRow(
+        "固定首图",
+        "开关开启后才能选择。",
+        `<select id="fixedFirstMapName" ${settingsState.fixedFirstMapEnabled ? "" : "disabled"}>
+          <option value="">请选择地图</option>
+          ${options.map((choice) => `<option value="${escapeHtml(choice.nameEn)}" ${normalizeKey(choice.nameEn) === normalizeKey(settingsState.fixedFirstMapName) ? "selected" : ""}>${escapeHtml(getModeLabel(choice.mode))} - ${escapeHtml(getMapNameZh(choice.nameEn))}</option>`).join("")}
+        </select>`,
+      )}
+    </div>
+  `;
+}
+
+function renderSidePolicySelect(id: string, value: SidePolicy): string {
+  return `<select id="${id}">
+    <option value="random" ${value === "random" ? "selected" : ""}>系统随机</option>
+    <option value="interactive_random" ${value === "interactive_random" ? "selected" : ""}>交互随机</option>
+    <option value="left" ${value === "left" ? "selected" : ""}>队伍1先</option>
+    <option value="right" ${value === "right" ? "selected" : ""}>队伍2先</option>
+  </select>`;
 }
 
 function renderFixedMapOrderSetting(): string {
@@ -2593,7 +3009,7 @@ function renderFixedMapOrderSetting(): string {
                 .map(
                   (choice) => `
                     <option value="${escapeHtml(choice.nameEn)}" ${normalizeKey(choice.nameEn) === normalizeKey(current) ? "selected" : ""}>
-                      ${escapeHtml(getModeLabel(choice.mode))} - ${escapeHtml(getDisplayMapName(choice.nameEn))}
+                      ${escapeHtml(getModeLabel(choice.mode))} - ${escapeHtml(getMapNameZh(choice.nameEn))}
                     </option>
                   `,
                 )
@@ -2608,61 +3024,83 @@ function renderFixedMapOrderSetting(): string {
 
 function renderRosterSettingsPanel(): string {
   const rosters = parsePresetRosters();
+  const openAttribute = appMode === "global-admin" ? "open" : "";
 
   return `
-    <details class="settings-section">
+    <details class="settings-section admin-config-section" ${openAttribute}>
       <summary>上场设置</summary>
-      <label>
-        上场成员模式
-        <select id="rosterMode">
+      <div class="admin-setting-list">
+        ${renderAdminSettingRow(
+          "上场成员模式",
+          "设置双方填写上场成员时可使用的方式。",
+          `<select id="rosterMode">
           <option value="free_input">双方自由输入</option>
           <option value="preset_only">仅可从预设成员输入</option>
           <option value="skip">跳过该项</option>
-        </select>
-      </label>
-      <div class="visual-rosters">
+        </select>`,
+        )}
+        ${renderAdminSettingRow("上场成员选择时间", "双方确认上场成员的时间，单位为秒。", `<input id="playerSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.playerSelectSeconds}" />`)}
+      </div>
+      ${settingsState.rosterMode === "preset_only" ? `<div class="visual-rosters">
         ${renderRosterListSetting("left", rosters.left)}
         ${renderRosterListSetting("right", rosters.right)}
-      </div>
+      </div>` : ""}
     </details>
   `;
 }
 
 function renderBanRuleSettingsPanel(): string {
+  const openAttribute = appMode === "global-admin" ? "open" : "";
+
   return `
-    <details class="settings-section">
+    <details class="settings-section admin-config-section" ${openAttribute}>
       <summary>禁用规则</summary>
-      <label>
-        先后Ban规则
-        <select id="firstBanPolicy">
-          <option value="allow_loser_choose">允许败者选择</option>
-          <option value="loser_must_first">败者必须先Ban（跳过选择先后）</option>
-          <option value="no_ban">无Ban</option>
-        </select>
-      </label>
-      <label>
-        首次先手方
-        <select id="openingSidePolicy">
-          <option value="random">系统随机</option>
-          <option value="red">红色方先手</option>
-          <option value="blue">蓝色方先手</option>
-        </select>
-      </label>
+      <div class="admin-setting-list">
+        ${renderAdminSettingRow(
+          "是否启用禁用规则",
+          "关闭后将跳过全部英雄禁用步骤。",
+          `<label class="admin-switch"><input id="banEnabled" type="checkbox" ${settingsState.banEnabled ? "checked" : ""} /><span></span><b>${settingsState.banEnabled ? "已开启" : "已关闭"}</b></label>`,
+        )}
+        ${settingsState.banEnabled ? `
+        ${renderAdminSettingRow(
+          "先后禁用选择规则",
+          "设置每张地图开始前双方的禁用顺序。",
+          `<select id="firstBanPolicy">
+          <option value="allow_loser_choose">败者选择先后</option>
+          <option value="loser_must_first">败者先手禁用</option>
+        </select>`,
+        )}
+        ${renderAdminSettingRow(
+          "禁用首次先手方",
+          "交互随机时，双方各选 0 或 1，XOR 为 0 则队伍1先手，为 1 则队伍2先手。选择时间为 30 秒，超时默认 0。",
+          renderSidePolicySelect("openingSidePolicy", settingsState.openingSidePolicy),
+        )}
+        ${renderAdminSettingRow("先后禁用选择时间", "败者选择先后顺序的时间，单位为秒。", `<input id="firstBanChoiceSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanChoiceSeconds}" />`)}
+        ${renderAdminSettingRow("先手禁用时间", "先手方完成禁用的时间，单位为秒。", `<input id="firstBanActionSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanActionSeconds}" />`)}
+        ${renderAdminSettingRow("后手禁用时间", "后手方完成禁用的时间，单位为秒。", `<input id="secondBanActionSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.secondBanActionSeconds}" />`)}
+        ` : ""}
+      </div>
     </details>
   `;
 }
 
 function renderScoreRuleSettingsPanel(): string {
+  const openAttribute = appMode === "global-admin" ? "open" : "";
+
   return `
-    <details class="settings-section">
+    <details class="settings-section admin-config-section" ${openAttribute}>
       <summary>比分规则</summary>
-      <label>
-        比分录入模式
-        <select id="scoreReportMode">
+      <div class="admin-setting-list">
+        ${renderAdminSettingRow(
+          "比分录入模式",
+          "选择比分由管理员录入，或由队伍提交并确认。",
+          `<select id="scoreReportMode">
           <option value="admin_only">管理员填写比分</option>
           <option value="team_submit_opponent_confirm">任一队伍填写，另一方确认</option>
-        </select>
-      </label>
+        </select>`,
+        )}
+        ${renderAdminSettingRow("比分确认时间", "一方提交比分后，另一方确认的时间，单位为秒。", `<input id="scoreConfirmSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.scoreConfirmSeconds}" />`)}
+      </div>
     </details>
   `;
 }
@@ -2720,8 +3158,8 @@ function getVisualMapPoolMarkup(): string {
                 return `
                   <label class="map-pool-option" draggable="true" data-map-pool-key="${escapeHtml(getMapKey(mode, map.nameEn))}">
                     <input class="map-pool-checkbox" type="checkbox" data-map-mode="${escapeHtml(mode)}" value="${escapeHtml(map.nameEn)}" ${checked ? "checked" : ""} />
-                    <img src="${map.imageUrl}" alt="${escapeHtml(getDisplayMapName(map.nameEn))}" />
-                    <span>${escapeHtml(getDisplayMapName(map.nameEn))}</span>
+                    <img src="${map.imageUrl}" alt="${escapeHtml(getMapNameZh(map.nameEn))}" />
+                    <span>${escapeHtml(getMapNameZh(map.nameEn))}</span>
                   </label>
                 `;
               })
@@ -2736,7 +3174,7 @@ function getVisualMapPoolMarkup(): string {
 function renderRosterListSetting(side: Side, members: string[]): string {
   return `
     <section class="visual-roster-list visual-roster-${side}">
-      <h3>${side === "left" ? "蓝色方" : "红色方"}</h3>
+      <h3>${side === "left" ? "队伍1" : "队伍2"}</h3>
       <div class="visual-roster-items" data-roster-side="${side}">
         ${members.map((member) => renderRosterMemberInput(side, member)).join("")}
       </div>
@@ -2920,6 +3358,8 @@ function bindSettingsEvents(): void {
   const mapSelectionMode = document.getElementById("mapSelectionMode") as HTMLSelectElement | null;
   const matchFormat = document.getElementById("matchFormat") as HTMLSelectElement | null;
   const firstMapMode = document.getElementById("firstMapMode") as HTMLSelectElement | null;
+  const firstMapPickerPolicy = document.getElementById("firstMapPickerPolicy") as HTMLSelectElement | null;
+  const mapPickerPolicy = document.getElementById("mapPickerPolicy") as HTMLSelectElement | null;
   const rosterMode = document.getElementById("rosterMode") as HTMLSelectElement | null;
   const firstBanPolicy = document.getElementById("firstBanPolicy") as HTMLSelectElement | null;
   const openingSidePolicy = document.getElementById("openingSidePolicy") as HTMLSelectElement | null;
@@ -2945,6 +3385,14 @@ function bindSettingsEvents(): void {
     firstMapMode.value = settingsState.firstMapMode;
   }
 
+  if (firstMapPickerPolicy) {
+    firstMapPickerPolicy.value = settingsState.firstMapPickerPolicy;
+  }
+
+  if (mapPickerPolicy) {
+    mapPickerPolicy.value = settingsState.mapPickerPolicy;
+  }
+
   if (rosterMode) {
     rosterMode.value = settingsState.rosterMode;
   }
@@ -2960,6 +3408,13 @@ function bindSettingsEvents(): void {
   if (scoreReportMode) {
     scoreReportMode.value = settingsState.scoreReportMode;
   }
+
+  [rosterMode, document.getElementById("fixedFirstMapEnabled"), document.getElementById("banEnabled")]
+    .filter((control): control is HTMLElement => Boolean(control))
+    .forEach((control) => control.addEventListener("change", () => {
+      readSettingsFromForm();
+      renderCurrent();
+    }));
 
   document.getElementById("applyRoomPreset")?.addEventListener("click", () => void applyRoomPreset());
   document.getElementById("resetBuiltinConfig")?.addEventListener("click", () => void importRoomConfig(defaultSettings, "builtin"));
@@ -3046,7 +3501,7 @@ function bindMapPoolDragEvents(): void {
 function bindModeOrderDragEvents(): void {
   app.querySelectorAll<HTMLElement>(".mode-order-item").forEach((item) => {
     item.addEventListener("dragstart", (event) => {
-      event.dataTransfer?.setData("text/plain", item.dataset.modeOrder ?? "");
+      event.dataTransfer?.setData("text/plain", item.dataset.modeOrderIndex ?? "");
       item.classList.add("map-pool-dragging");
     });
 
@@ -3067,9 +3522,9 @@ function bindModeOrderDragEvents(): void {
     item.addEventListener("drop", (event) => {
       event.preventDefault();
       item.classList.remove("map-pool-drag-over");
-      const sourceMode = event.dataTransfer?.getData("text/plain");
+      const sourceIndex = event.dataTransfer?.getData("text/plain");
       const source = [...app.querySelectorAll<HTMLElement>(".mode-order-item")]
-        .find((entry) => entry.dataset.modeOrder === sourceMode);
+        .find((entry) => entry.dataset.modeOrderIndex === sourceIndex);
 
       if (!source || source === item || source.parentElement !== item.parentElement) {
         return;
@@ -3078,6 +3533,35 @@ function bindModeOrderDragEvents(): void {
       item.parentElement?.insertBefore(source, item);
     });
   });
+
+  app.querySelectorAll<HTMLButtonElement>(".remove-mode-order").forEach((button) => {
+    button.addEventListener("click", () => {
+      button.closest(".mode-order-item")?.remove();
+      settingsState.modeOrder = [...app.querySelectorAll<HTMLElement>(".mode-order-item")]
+        .map((item) => item.dataset.modeOrder)
+        .filter((mode): mode is string => Boolean(mode));
+      readSettingsFromForm();
+      rerenderActiveConfigEditor();
+    });
+  });
+
+  document.getElementById("addModeOrder")?.addEventListener("click", () => {
+    const select = document.getElementById("modeOrderAddSelect") as HTMLSelectElement | null;
+    readSettingsFromForm();
+    if (select?.value) {
+      settingsState.modeOrder.push(select.value);
+    }
+    rerenderActiveConfigEditor();
+  });
+}
+
+function rerenderActiveConfigEditor(): void {
+  if (appMode === "global-admin") {
+    captureGlobalPresetDraftMeta();
+    renderGlobalAdminPage();
+    return;
+  }
+  renderCurrent();
 }
 
 function resetRoomToBeginning(started: boolean): void {
@@ -3099,10 +3583,22 @@ function resetRoomToBeginning(started: boolean): void {
   hiddenOverlay = null;
   adminNotice = null;
   openingSide = resolveOpeningSide();
+  firstMapPickerSide = resolveSidePolicy(settingsState.firstMapPickerPolicy);
+  interactiveRandomState = null;
+  interactiveRandomResults = {};
 
   if (started) {
-    restState = { open: true, mapIndex: 0, skipReady: createRestSkipReadyState() };
-    mapSelectorState = null;
+    if (settingsState.stageLimits.preStartRestSeconds > 0) {
+      restState = { open: true, mapIndex: 0, skipReady: createRestSkipReadyState() };
+      mapSelectorState = null;
+    } else {
+      restState = null;
+      openNextMapSelector();
+    }
+    if (!settingsState.fixedFirstMapEnabled && settingsState.firstMapPickerPolicy === "interactive_random") {
+      startInteractiveRandom("map_picker", 0);
+      mapSelectorState = null;
+    }
   } else {
     mapSelectorState = null;
   }
@@ -3132,12 +3628,17 @@ function readSettingsFromForm(): boolean {
   const mapSelectionMode = document.getElementById("mapSelectionMode") as HTMLSelectElement | null;
   const matchFormat = document.getElementById("matchFormat") as HTMLSelectElement | null;
   const firstMapMode = document.getElementById("firstMapMode") as HTMLSelectElement | null;
+  const firstMapPickerPolicy = document.getElementById("firstMapPickerPolicy") as HTMLSelectElement | null;
+  const mapPickerPolicy = document.getElementById("mapPickerPolicy") as HTMLSelectElement | null;
   const rosterMode = document.getElementById("rosterMode") as HTMLSelectElement | null;
   const firstBanPolicy = document.getElementById("firstBanPolicy") as HTMLSelectElement | null;
   const openingSidePolicy = document.getElementById("openingSidePolicy") as HTMLSelectElement | null;
   const scoreReportMode = document.getElementById("scoreReportMode") as HTMLSelectElement | null;
   const fixedMapOrderText = document.getElementById("fixedMapOrderText") as HTMLTextAreaElement | null;
   const fixedMapOrderSelects = [...app.querySelectorAll<HTMLSelectElement>(".fixed-map-order-select")];
+  const fixedFirstMapEnabled = document.getElementById("fixedFirstMapEnabled") as HTMLInputElement | null;
+  const fixedFirstMapName = document.getElementById("fixedFirstMapName") as HTMLSelectElement | null;
+  const banEnabled = document.getElementById("banEnabled") as HTMLInputElement | null;
   const matchName = document.getElementById("matchName") as HTMLInputElement | null;
   const leftTeamName = document.getElementById("leftTeamName") as HTMLInputElement | null;
   const rightTeamName = document.getElementById("rightTeamName") as HTMLInputElement | null;
@@ -3147,8 +3648,21 @@ function readSettingsFromForm(): boolean {
   settingsState.stageCount = getStageCountForMatchFormat(nextMatchFormat);
   settingsState.checkpoints = resizeCheckpoints(settingsState.checkpoints, settingsState.stageCount);
   settingsState.mapSelectionMode = (mapSelectionMode?.value ?? settingsState.mapSelectionMode) as MapSelectionMode;
+  if (settingsState.mapSelectionMode === "fixed_map_order") {
+    settingsState.fixedFirstMapEnabled = false;
+  }
   settingsState.firstMapMode = firstMapMode?.value ?? settingsState.firstMapMode;
+  if (app.querySelector(".mode-order-item")) {
+    settingsState.modeOrder = getVisualModeOrder();
+  }
+  settingsState.fixedFirstMapEnabled = settingsState.mapSelectionMode === "fixed_map_order"
+    ? false
+    : fixedFirstMapEnabled?.checked ?? settingsState.fixedFirstMapEnabled;
+  settingsState.fixedFirstMapName = fixedFirstMapName?.value ?? settingsState.fixedFirstMapName;
+  settingsState.firstMapPickerPolicy = (firstMapPickerPolicy?.value ?? settingsState.firstMapPickerPolicy) as FirstMapPickerPolicy;
+  settingsState.mapPickerPolicy = (mapPickerPolicy?.value ?? settingsState.mapPickerPolicy) as MapPickerPolicy;
   settingsState.rosterMode = (rosterMode?.value ?? settingsState.rosterMode) as PlayerInputMode;
+  settingsState.banEnabled = banEnabled?.checked ?? settingsState.banEnabled;
   settingsState.firstBanPolicy = (firstBanPolicy?.value ?? settingsState.firstBanPolicy) as FirstBanPolicy;
   settingsState.openingSidePolicy = (openingSidePolicy?.value ?? settingsState.openingSidePolicy) as OpeningSidePolicy;
   settingsState.scoreReportMode = (scoreReportMode?.value ?? settingsState.scoreReportMode) as ScoreReportMode;
@@ -3156,7 +3670,9 @@ function readSettingsFromForm(): boolean {
     ? fixedMapOrderSelects.map((select) => select.value).filter(Boolean).join("\n")
     : fixedMapOrderText?.value ?? settingsState.fixedMapOrderText;
   settingsState.mapPool = readVisualMapPool();
-  settingsState.presetRosterText = readVisualRosters();
+  if (settingsState.rosterMode === "preset_only") {
+    settingsState.presetRosterText = readVisualRosters();
+  }
   settingsState.matchName = matchName?.value.trim() || settingsState.matchName;
   settingsState.teams = {
     left: leftTeamName?.value.trim() || settingsState.teams.left,
@@ -3166,11 +3682,67 @@ function readSettingsFromForm(): boolean {
   return true;
 }
 
+function validateSettingsForSubmit(): string[] {
+  const errors: string[] = [];
+  const requiredMaps = settingsState.stageCount;
+
+  if (settingsState.mapSelectionMode === "fixed_map_order") {
+    const fixedOrder = parseFixedMapOrder();
+    if (fixedOrder.length < requiredMaps) {
+      errors.push(`${getMatchFormatLabel(settingsState.matchFormat)} 固定地图顺序至少需要 ${requiredMaps} 张地图。`);
+    }
+    if (new Set(fixedOrder.map(normalizeKey)).size !== fixedOrder.length) {
+      errors.push("固定地图顺序中的地图不能重复。");
+    }
+    return errors;
+  }
+
+  const selectedMapCount = Object.values(settingsState.mapPool).reduce((count, names) => count + names.length, 0);
+  if (selectedMapCount < requiredMaps) {
+    errors.push(`${getMatchFormatLabel(settingsState.matchFormat)} 至少需要选择 ${requiredMaps} 张地图，以支持最多 2 场平局。`);
+  }
+
+  if (settingsState.mapSelectionMode === "strict_mode_order") {
+    if (settingsState.modeOrder.length < requiredMaps) {
+      errors.push(`模式顺序至少需要 ${requiredMaps} 项。`);
+    } else {
+      const requiredByMode = new Map<string, number>();
+      settingsState.modeOrder.slice(0, requiredMaps).forEach((mode) => {
+        requiredByMode.set(mode, (requiredByMode.get(mode) ?? 0) + 1);
+      });
+      requiredByMode.forEach((count, mode) => {
+        const available = settingsState.mapPool[mode]?.length ?? 0;
+        if (available < count) {
+          errors.push(`${getModeLabel(mode)}在模式顺序中出现 ${count} 次，但地图池只有 ${available} 张。`);
+        }
+      });
+    }
+  }
+
+  if (settingsState.fixedFirstMapEnabled) {
+    const fixedChoice = findCatalogMapByName(settingsState.fixedFirstMapName);
+    if (!fixedChoice || !(settingsState.mapPool[fixedChoice.mode] ?? []).some((name) => normalizeKey(name) === normalizeKey(fixedChoice.nameEn))) {
+      errors.push("固定首图必须从当前地图池中选择。");
+    } else if (settingsState.mapSelectionMode === "first_mode_then_unique_mode" && fixedChoice.mode !== settingsState.firstMapMode) {
+      errors.push(`固定首图必须属于${getModeLabel(settingsState.firstMapMode)}模式。`);
+    } else if (settingsState.mapSelectionMode === "strict_mode_order" && fixedChoice.mode !== settingsState.modeOrder[0]) {
+      errors.push("固定首图的模式必须与模式顺序第一项一致。");
+    }
+  }
+
+  return errors;
+}
+
 async function saveRoomConfigDraft(renderAfter = true): Promise<boolean> {
   if (!roomToken || !isAdminPortal() || roomConfigState?.status === "locked") {
     return false;
   }
   if (document.getElementById("matchFormat") && !readSettingsFromForm()) {
+    return false;
+  }
+  const validationErrors = validateSettingsForSubmit();
+  if (validationErrors.length > 0) {
+    alert(validationErrors.join("\n"));
     return false;
   }
   const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config`, {
@@ -3218,6 +3790,79 @@ async function applyRoomPreset(): Promise<void> {
   }
   roomConfigState = await response.json() as RoomConfigState;
   settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  renderCurrent();
+}
+
+function startInteractiveRandom(purpose: InteractiveRandomPurpose, mapIndex: number): void {
+  const resolvedSide = interactiveRandomResults[purpose] ?? null;
+  interactiveRandomState = {
+    purpose,
+    mapIndex,
+    choices: { left: null, right: null },
+    resolvedSide,
+  };
+  hiddenOverlay = null;
+}
+
+function submitInteractiveRandomChoice(value: 0 | 1): void {
+  if (!interactiveRandomState || interactiveRandomState.resolvedSide || !portalConfig.side) {
+    return;
+  }
+  interactiveRandomState.choices[portalConfig.side] = value;
+  if (interactiveRandomState.choices.left !== null && interactiveRandomState.choices.right !== null) {
+    finalizeInteractiveRandom(false);
+    return;
+  }
+  publishSharedRoomSnapshot(createRoomOperation("room", "interactive_random_submitted", {
+    purpose: interactiveRandomState.purpose,
+    side: portalConfig.side,
+  }));
+  renderCurrent();
+}
+
+function finalizeInteractiveRandom(timedOut: boolean): void {
+  if (!interactiveRandomState || interactiveRandomState.resolvedSide) {
+    return;
+  }
+  const left = interactiveRandomState.choices.left ?? 0;
+  const right = interactiveRandomState.choices.right ?? 0;
+  interactiveRandomState.choices = { left, right };
+  const resultSide: Side = (left ^ right) === 0 ? "left" : "right";
+  interactiveRandomState.resolvedSide = resultSide;
+  interactiveRandomResults[interactiveRandomState.purpose] = resultSide;
+  if (interactiveRandomState.purpose === "map_picker") {
+    firstMapPickerSide = resultSide;
+  } else {
+    openingSide = resultSide;
+  }
+  const message = `${left} XOR ${right} = ${left ^ right}，${getTeamName(resultSide)}获得${interactiveRandomState.purpose === "map_picker" ? "首次选图权" : "禁用首次先手"}。`;
+  adminNotice = message;
+  createTeamAckNotice(message);
+  publishSharedRoomSnapshot(createRoomOperation("room", "interactive_random_resolved", {
+    purpose: interactiveRandomState.purpose,
+    left,
+    right,
+    resultSide,
+    timedOut,
+  }));
+  renderCurrent();
+}
+
+function continueAfterInteractiveRandom(): void {
+  if (!interactiveRandomState?.resolvedSide) {
+    return;
+  }
+  const { purpose, mapIndex } = interactiveRandomState;
+  interactiveRandomState = null;
+  if (purpose === "map_picker") {
+    if (!restState) {
+      openNextMapSelector();
+    }
+  } else {
+    openBanSelectorForMap(mapIndex);
+  }
+  resetCountdown();
+  publishSharedRoomSnapshot(createRoomOperation("room", "interactive_random_continued", { purpose, mapIndex }));
   renderCurrent();
 }
 
@@ -3369,7 +4014,7 @@ function readVisualMapPool(): Record<string, string[]> {
   const mapPool: Record<string, string[]> = {};
   const fixedOrderSelects = [...app.querySelectorAll<HTMLSelectElement>(".fixed-map-order-select")];
 
-  if (fixedOrderSelects.length > 0) {
+  if (settingsState.mapSelectionMode === "fixed_map_order" && fixedOrderSelects.length > 0) {
     fixedOrderSelects.forEach((select) => {
       const map = findCatalogMapByName(select.value);
 
@@ -3384,7 +4029,8 @@ function readVisualMapPool(): Record<string, string[]> {
     return Object.keys(mapPool).length > 0 ? mapPool : settingsState.mapPool;
   }
 
-  getVisualModeOrder().forEach((mode) => {
+  const orderedModes = [...new Set(getVisualModeOrder())];
+  orderedModes.forEach((mode) => {
     app.querySelectorAll<HTMLInputElement>(`.map-pool-checkbox[data-map-mode="${cssEscape(mode)}"]`).forEach((checkbox) => {
       if (!checkbox.checked) {
         return;
@@ -3406,7 +4052,7 @@ function getVisualModeOrder(): string[] {
     .map((checkbox) => checkbox.dataset.mapMode)
     .filter((mode): mode is string => Boolean(mode));
 
-  return [...new Set([...orderedModes, ...checkboxModes])];
+  return orderedModes.length > 0 ? orderedModes : [...new Set(checkboxModes)];
 }
 
 function cssEscape(value: string): string {
@@ -3745,13 +4391,24 @@ function confirmLineups(): void {
 }
 
 function openBanSelectorForMap(mapIndex: number): void {
-  if (!currentState || settingsState.firstBanPolicy === "no_ban") {
+  if (!currentState || !settingsState.banEnabled) {
     banSelectorState = null;
     openScoreSelectorForMap(mapIndex);
     return;
   }
 
-  const chooserSide = getMapPickerSide(currentState, mapIndex);
+  if (
+    mapIndex === 0
+    && settingsState.openingSidePolicy === "interactive_random"
+    && !interactiveRandomResults.opening_ban
+  ) {
+    banSelectorState = null;
+    startInteractiveRandom("opening_ban", mapIndex);
+    resetCountdown();
+    return;
+  }
+
+  const chooserSide = mapIndex === 0 ? openingSide : getMapPickerSide(currentState, mapIndex);
   const firstBanSide = settingsState.firstBanPolicy === "loser_must_first" ? chooserSide : null;
 
   if (firstBanSide) {
@@ -4089,6 +4746,11 @@ function finishMatchIfSeriesWon(): boolean {
 }
 
 function openRestPeriod(mapIndex: number): void {
+  if (settingsState.stageLimits.postMatchRestSeconds === 0) {
+    restState = null;
+    openNextMapSelector();
+    return;
+  }
   restState = {
     open: true,
     mapIndex,
@@ -4496,6 +5158,10 @@ function findTargetMapIndex(state: MatchState): number {
 }
 
 function getMapPickerSide(state: MatchState, targetMapIndex: number): Side {
+  if (targetMapIndex === 0) {
+    return firstMapPickerSide;
+  }
+
   for (let index = targetMapIndex - 1; index >= 0; index -= 1) {
     const map = state.maps[index];
     const result = compareScores(map.score.left, map.score.right);
@@ -4531,7 +5197,7 @@ function getSeriesWinnerSide(state: MatchState | null = currentState): Side | nu
 }
 
 function getWinsNeeded(): number {
-  return Math.floor(settingsState.stageCount / 2) + 1;
+  return { ft2: 2, ft3: 3, ft4: 4 }[settingsState.matchFormat];
 }
 
 function getMapAvailability(choice: MapChoice): MapAvailability {
@@ -4551,6 +5217,14 @@ function getMapAvailability(choice: MapChoice): MapAvailability {
 
   if (settingsState.mapSelectionMode === "fixed_map_order") {
     return getFixedOrderAvailability(choice);
+  }
+
+  if (
+    mapSelectorState.targetMapIndex === 0
+    && settingsState.fixedFirstMapEnabled
+    && normalizeKey(choice.nameEn) !== normalizeKey(settingsState.fixedFirstMapName)
+  ) {
+    return { available: false, reason: `首图固定为 ${getMapNameZh(settingsState.fixedFirstMapName)}` };
   }
 
   if (settingsState.mapSelectionMode === "strict_mode_order") {
@@ -4581,14 +5255,21 @@ function getMapAvailability(choice: MapChoice): MapAvailability {
 }
 
 function isModeBlockedBeforeCycle(mode: string): boolean {
-  const usedModes = getUsedModes();
-  const modeOrder = getConfiguredModeOrder();
+  const modeOrder = settingsState.modeOrder.length > 0 ? settingsState.modeOrder : getConfiguredModeOrder();
+  const configuredModes = [...new Set(modeOrder)];
+  const currentCycle = new Set<string>();
 
-  if (usedModes.size < modeOrder.length && usedModes.has(mode)) {
-    return true;
-  }
+  currentState?.maps.slice(0, mapSelectorState?.targetMapIndex ?? 0).forEach((map) => {
+    if (!map.mode || !configuredModes.includes(map.mode)) {
+      return;
+    }
+    currentCycle.add(map.mode);
+    if (currentCycle.size === configuredModes.length) {
+      currentCycle.clear();
+    }
+  });
 
-  return false;
+  return currentCycle.has(mode);
 }
 
 function getFixedOrderAvailability(choice: MapChoice): MapAvailability {
@@ -4630,22 +5311,6 @@ function isUsedMapChoice(choice: MapChoice): boolean {
   return getUsedMapNames().has(normalizeKey(choice.nameEn));
 }
 
-function getUsedModes(): Set<string> {
-  const usedModes = new Set<string>();
-
-  if (!currentState || !mapSelectorState) {
-    return usedModes;
-  }
-
-  currentState.maps.forEach((map, index) => {
-    if (index < mapSelectorState!.targetMapIndex && map.mode) {
-      usedModes.add(map.mode);
-    }
-  });
-
-  return usedModes;
-}
-
 function isMapInConfiguredPool(choice: MapChoice): boolean {
   const configuredNames = settingsState.mapPool[choice.mode] ?? [];
 
@@ -4662,7 +5327,7 @@ function getRequiredStrictMode(): string | null {
     return null;
   }
 
-  const modeOrder = getConfiguredModeOrder();
+  const modeOrder = settingsState.modeOrder.length > 0 ? settingsState.modeOrder : getConfiguredModeOrder();
 
   if (modeOrder.length === 0) {
     return null;
@@ -5177,10 +5842,10 @@ function getModeLabel(mode: string): string {
 
 function getMapSelectionModeLabel(mode: MapSelectionMode): string {
   const labels: Record<MapSelectionMode, string> = {
-    unique_map: "已选地图不可重复",
-    unique_mode_until_cycle: "先轮完地图类型",
-    first_mode_then_unique_mode: "首图限定类别，之后轮完类别前不重复",
-    strict_mode_order: "按地图类型顺序",
+    unique_map: "任意选择，已选择地图不可重复选择",
+    unique_mode_until_cycle: "首图任意模式，未选完所有模式前不可重复选择",
+    first_mode_then_unique_mode: "首图指定模式，未选完所有模式前不可重复选择",
+    strict_mode_order: "指定模式顺序，已选择地图不可重复选择",
     fixed_map_order: "固定地图顺序",
   };
 
@@ -5189,9 +5854,9 @@ function getMapSelectionModeLabel(mode: MapSelectionMode): string {
 
 function getStageCountForMatchFormat(format: MatchFormat): number {
   const stageCounts: Record<MatchFormat, number> = {
-    ft2: 3,
-    ft3: 5,
-    ft4: 7,
+    ft2: 5,
+    ft3: 7,
+    ft4: 9,
   };
 
   return stageCounts[format] ?? stageCounts.ft3;
@@ -5217,14 +5882,16 @@ function resizeCheckpoints(checkpoints: SettingsState["checkpoints"], stageCount
 }
 
 function resolveOpeningSide(): Side {
-  if (settingsState.openingSidePolicy === "red") {
+  return resolveSidePolicy(settingsState.openingSidePolicy);
+}
+
+function resolveSidePolicy(policy: SidePolicy): Side {
+  if (policy === "right") {
     return "right";
   }
-
-  if (settingsState.openingSidePolicy === "blue") {
+  if (policy === "left") {
     return "left";
   }
-
   return Math.random() < 0.5 ? "left" : "right";
 }
 
@@ -5258,6 +5925,10 @@ function getCountdownSnapshot(): { remaining: number; percent: number } {
 }
 
 function getActiveCountdownTotalSeconds(): number {
+  if (interactiveRandomState && !interactiveRandomState.resolvedSide) {
+    return 30;
+  }
+
   if (banSelectorState?.open) {
     if (banSelectorState.step === "order-choice") {
       return Math.max(1, settingsState.stageLimits.firstBanChoiceSeconds);
@@ -5361,7 +6032,7 @@ function updateCountdownDom(): void {
 
   document
     .querySelectorAll<HTMLElement>(
-      ".map-selector-progress, .map-selector-progress-mini, .lineup-selector-progress, .ban-selector-progress, .score-selector-progress, .rest-progress",
+      ".map-selector-progress, .map-selector-progress-mini, .lineup-selector-progress, .ban-selector-progress, .score-selector-progress, .rest-progress, .interactive-random-progress",
     )
     .forEach((element) => element.style.setProperty("--progress-width", `${percent}%`));
 
@@ -5382,7 +6053,9 @@ function updateCountdownDom(): void {
   }
 
   if (remaining <= 0) {
-    if (banSelectorState?.open) {
+    if (interactiveRandomState && !interactiveRandomState.resolvedSide) {
+      finalizeInteractiveRandom(true);
+    } else if (banSelectorState?.open) {
       handleBanSelectionTimeout();
     } else if (lineupSelectorState?.open) {
       handleLineupSelectionTimeout();
@@ -5591,14 +6264,25 @@ function mergeSettings(base: SettingsState, override: unknown): SettingsState {
   const partial = override as Partial<SettingsState>;
   const merged = structuredClone(base);
   const matchFormat = partial.matchFormat ?? merged.matchFormat;
-  const stageCount = partial.stageCount ?? getStageCountForMatchFormat(matchFormat);
+  const stageCount = getStageCountForMatchFormat(matchFormat);
   const checkpointOverrides = Array.isArray(partial.checkpoints) ? partial.checkpoints : [];
+  const legacyFirstBanPolicy = (partial as { firstBanPolicy?: string }).firstBanPolicy;
+  const normalizePolicy = (value: unknown, fallback: SidePolicy): SidePolicy => {
+    if (value === "red") return "right";
+    if (value === "blue") return "left";
+    return (["random", "interactive_random", "left", "right"] as unknown[]).includes(value) ? value as SidePolicy : fallback;
+  };
 
   return {
     ...merged,
     ...partial,
     matchFormat,
     stageCount,
+    modeOrder: Array.isArray(partial.modeOrder) && partial.modeOrder.length > 0 ? partial.modeOrder : merged.modeOrder,
+    banEnabled: legacyFirstBanPolicy === "no_ban" ? false : partial.banEnabled ?? merged.banEnabled,
+    firstBanPolicy: legacyFirstBanPolicy === "loser_must_first" ? "loser_must_first" : "allow_loser_choose",
+    openingSidePolicy: normalizePolicy(partial.openingSidePolicy, merged.openingSidePolicy),
+    firstMapPickerPolicy: normalizePolicy(partial.firstMapPickerPolicy, merged.firstMapPickerPolicy),
     checkpoints: resizeCheckpoints(
       merged.checkpoints.map((checkpoint, index) => ({
         ...checkpoint,

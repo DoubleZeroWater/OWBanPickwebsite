@@ -4,7 +4,8 @@ from copy import deepcopy
 from typing import Any
 
 
-MATCH_FORMAT_STAGE_COUNTS = {"ft2": 3, "ft3": 5, "ft4": 7}
+MATCH_FORMAT_STAGE_COUNTS = {"ft2": 5, "ft3": 7, "ft4": 9}
+LEGACY_MATCH_FORMAT_STAGE_COUNTS = {"ft2": 3, "ft3": 5, "ft4": 7}
 MAP_SELECTION_MODES = {
     "unique_map",
     "unique_mode_until_cycle",
@@ -13,8 +14,8 @@ MAP_SELECTION_MODES = {
     "fixed_map_order",
 }
 ROSTER_MODES = {"free_input", "preset_only", "skip"}
-FIRST_BAN_POLICIES = {"allow_loser_choose", "loser_must_first", "no_ban"}
-OPENING_SIDE_POLICIES = {"random", "red", "blue"}
+FIRST_BAN_POLICIES = {"allow_loser_choose", "loser_must_first"}
+SIDE_POLICIES = {"random", "interactive_random", "left", "right"}
 SCORE_REPORT_MODES = {"admin_only", "team_submit_opponent_confirm"}
 CHECKPOINT_KEYS = (
     "preCountdown",
@@ -45,9 +46,15 @@ MATCH_CONFIG_KEYS = {
     "mapPool",
     "mapSelectionMode",
     "firstMapMode",
+    "modeOrder",
     "fixedMapOrderText",
+    "fixedFirstMapEnabled",
+    "fixedFirstMapName",
+    "firstMapPickerPolicy",
+    "mapPickerPolicy",
     "rosterMode",
     "presetRosterText",
+    "banEnabled",
     "firstBanPolicy",
     "openingSidePolicy",
     "scoreReportMode",
@@ -86,14 +93,20 @@ def default_match_config() -> dict[str, Any]:
             "Push": ["Colosseo", "New Queen Street", "Runasapi"],
             "Flashpoint": ["Suravasa", "New Junk City"],
         },
-        "mapSelectionMode": "unique_map",
+        "mapSelectionMode": "first_mode_then_unique_mode",
         "firstMapMode": "Control",
-        "fixedMapOrderText": "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa",
+        "modeOrder": ["Control", "Push", "Hybrid", "Escort", "Flashpoint", "Control", "Push"],
+        "fixedMapOrderText": "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa\nIlios\nRunasapi",
+        "fixedFirstMapEnabled": False,
+        "fixedFirstMapName": "",
+        "firstMapPickerPolicy": "random",
+        "mapPickerPolicy": "loser_choose",
         "rosterMode": "free_input",
         "presetRosterText": "蓝色方: A1,A2,A3,A4,A5\n红色方: B1,B2,B3,B4,B5",
+        "banEnabled": True,
         "firstBanPolicy": "allow_loser_choose",
         "openingSidePolicy": "random",
-        "scoreReportMode": "admin_only",
+        "scoreReportMode": "team_submit_opponent_confirm",
     }
 
 
@@ -133,7 +146,8 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
         match_format = result["matchFormat"]
     stage_count = MATCH_FORMAT_STAGE_COUNTS[match_format]
     supplied_stage_count = source.get("stageCount")
-    if supplied_stage_count is not None and supplied_stage_count != stage_count:
+    legacy_stage_count = LEGACY_MATCH_FORMAT_STAGE_COUNTS[match_format]
+    if supplied_stage_count is not None and supplied_stage_count not in {stage_count, legacy_stage_count}:
         errors.append({"path": "stageCount", "message": f"{match_format} 的 stageCount 必须是 {stage_count}"})
     result["matchFormat"] = match_format
     result["stageCount"] = stage_count
@@ -167,8 +181,9 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
             errors.append({"path": "stageLimits", "message": f"不支持的时间字段：{', '.join(unknown_limits)}"})
         for key in STAGE_LIMIT_KEYS:
             seconds = stage_limits.get(key, result["stageLimits"][key])
-            if isinstance(seconds, bool) or not isinstance(seconds, int) or not 1 <= seconds <= 3600:
-                errors.append({"path": f"stageLimits.{key}", "message": "必须是 1–3600 之间的整数秒数"})
+            minimum = 0 if key in {"preStartRestSeconds", "postMatchRestSeconds"} else 1
+            if isinstance(seconds, bool) or not isinstance(seconds, int) or not minimum <= seconds <= 3600:
+                errors.append({"path": f"stageLimits.{key}", "message": f"必须是 {minimum}–3600 之间的整数秒数"})
             else:
                 result["stageLimits"][key] = seconds
 
@@ -203,11 +218,18 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
         source, "mapSelectionMode", MAP_SELECTION_MODES, result, errors
     )
     result["rosterMode"] = _enum_value(source, "rosterMode", ROSTER_MODES, result, errors)
-    result["firstBanPolicy"] = _enum_value(
-        source, "firstBanPolicy", FIRST_BAN_POLICIES, result, errors
-    )
-    result["openingSidePolicy"] = _enum_value(
-        source, "openingSidePolicy", OPENING_SIDE_POLICIES, result, errors
+    legacy_no_ban = source.get("firstBanPolicy") == "no_ban"
+    result["banEnabled"] = _bool_value(source, "banEnabled", not legacy_no_ban and result["banEnabled"], errors)
+    if legacy_no_ban:
+        result["firstBanPolicy"] = "allow_loser_choose"
+    else:
+        result["firstBanPolicy"] = _enum_value(
+            source, "firstBanPolicy", FIRST_BAN_POLICIES, result, errors
+        )
+    result["openingSidePolicy"] = _side_policy_value(source, "openingSidePolicy", result, errors)
+    result["firstMapPickerPolicy"] = _side_policy_value(source, "firstMapPickerPolicy", result, errors)
+    result["mapPickerPolicy"] = _enum_value(
+        source, "mapPickerPolicy", {"loser_choose"}, result, errors
     )
     result["scoreReportMode"] = _enum_value(
         source, "scoreReportMode", SCORE_REPORT_MODES, result, errors
@@ -218,6 +240,28 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
         errors.append({"path": "firstMapMode", "message": "必须是地图目录中的有效类别"})
     else:
         result["firstMapMode"] = first_map_mode
+
+    mode_order = source.get("modeOrder", result["modeOrder"])
+    if not isinstance(mode_order, list):
+        errors.append({"path": "modeOrder", "message": "必须是地图模式数组"})
+    else:
+        normalized_mode_order: list[str] = []
+        for index, mode in enumerate(mode_order):
+            if not isinstance(mode, str) or (catalog and mode not in catalog):
+                errors.append({"path": f"modeOrder[{index}]", "message": "必须是地图目录中的有效模式"})
+            else:
+                normalized_mode_order.append(mode)
+        if normalized_mode_order:
+            result["modeOrder"] = normalized_mode_order
+
+    result["fixedFirstMapEnabled"] = _bool_value(
+        source, "fixedFirstMapEnabled", result["fixedFirstMapEnabled"], errors
+    )
+    fixed_first_map_name = source.get("fixedFirstMapName", result["fixedFirstMapName"])
+    if not isinstance(fixed_first_map_name, str):
+        errors.append({"path": "fixedFirstMapName", "message": "必须是字符串"})
+    else:
+        result["fixedFirstMapName"] = fixed_first_map_name.strip()
 
     for key in ("fixedMapOrderText", "presetRosterText"):
         text = source.get(key, result[key])
@@ -234,6 +278,39 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
         for index, name in enumerate(fixed_names):
             if all_maps and name.casefold() not in all_maps:
                 errors.append({"path": f"fixedMapOrderText[{index}]", "message": f"地图目录中不存在 {name}"})
+
+    selected_map_count = sum(len(names) for names in result["mapPool"].values())
+    if result["mapSelectionMode"] != "fixed_map_order" and selected_map_count < stage_count:
+        errors.append({"path": "mapPool", "message": f"{match_format.upper()} 至少需要选择 {stage_count} 张地图，以支持最多 2 场平局"})
+
+    if result["mapSelectionMode"] == "strict_mode_order":
+        if len(result["modeOrder"]) < stage_count:
+            errors.append({"path": "modeOrder", "message": f"模式顺序至少需要 {stage_count} 项"})
+        else:
+            for mode in set(result["modeOrder"][:stage_count]):
+                required = result["modeOrder"][:stage_count].count(mode)
+                available = len(result["mapPool"].get(mode, []))
+                if available < required:
+                    errors.append({"path": f"mapPool.{mode}", "message": f"模式顺序需要 {required} 张{mode}地图，当前只有 {available} 张"})
+
+    if result["fixedFirstMapEnabled"]:
+        if result["mapSelectionMode"] == "fixed_map_order":
+            errors.append({"path": "fixedFirstMapEnabled", "message": "固定地图顺序下不能单独设置首图"})
+        fixed_map = next(
+            (
+                (mode, name)
+                for mode, names in result["mapPool"].items()
+                for name in names
+                if name.casefold() == result["fixedFirstMapName"].casefold()
+            ),
+            None,
+        )
+        if fixed_map is None:
+            errors.append({"path": "fixedFirstMapName", "message": "首图必须来自当前地图池"})
+        elif result["mapSelectionMode"] == "first_mode_then_unique_mode" and fixed_map[0] != result["firstMapMode"]:
+            errors.append({"path": "fixedFirstMapName", "message": "首图模式与第一张地图模式不一致"})
+        elif result["mapSelectionMode"] == "strict_mode_order" and result["modeOrder"] and fixed_map[0] != result["modeOrder"][0]:
+            errors.append({"path": "fixedFirstMapName", "message": "首图模式与模式顺序第一项不一致"})
 
     result["checkpoints"] = _normalize_checkpoints(source.get("checkpoints"), stage_count, errors)
 
@@ -256,15 +333,45 @@ def _enum_value(
     return str(value)
 
 
+def _bool_value(
+    source: dict[str, Any],
+    key: str,
+    default: bool,
+    errors: list[dict[str, str]],
+) -> bool:
+    value = source.get(key, default)
+    if not isinstance(value, bool):
+        errors.append({"path": key, "message": "必须是布尔值"})
+        return default
+    return value
+
+
+def _side_policy_value(
+    source: dict[str, Any],
+    key: str,
+    result: dict[str, Any],
+    errors: list[dict[str, str]],
+) -> str:
+    value = source.get(key, result[key])
+    value = {"red": "right", "blue": "left"}.get(value, value)
+    if value not in SIDE_POLICIES:
+        errors.append({"path": key, "message": "必须是 random、interactive_random、left 或 right"})
+        return result[key]
+    return str(value)
+
+
 def _normalize_checkpoints(
     value: Any, stage_count: int, errors: list[dict[str, str]]
 ) -> list[dict[str, dict[str, Any]]]:
     defaults = create_default_checkpoints(stage_count)
     if value is None:
         return defaults
-    if not isinstance(value, list) or len(value) != stage_count:
-        errors.append({"path": "checkpoints", "message": f"必须包含 {stage_count} 个地图阶段"})
+    if not isinstance(value, list):
+        errors.append({"path": "checkpoints", "message": f"必须包含不超过 {stage_count} 个地图阶段"})
         return defaults
+    if len(value) > stage_count:
+        errors.append({"path": "checkpoints", "message": f"最多包含 {stage_count} 个地图阶段"})
+        value = value[:stage_count]
     normalized = deepcopy(defaults)
     for stage_index, stage in enumerate(value):
         if not isinstance(stage, dict):
