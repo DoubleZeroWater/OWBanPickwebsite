@@ -95,14 +95,14 @@ test("landing page joins rooms, creates role entrances, copies hashes, and stays
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin });
   const redCard = page.locator(".room-link-card", { hasText: "队伍1入口" });
   await redCard.locator(".copy-room-hash-button").click();
-  await expect(page.getByText(`队伍1入口哈希 ${room.links.A.hash} 已复制。`)).toBeVisible();
+  await expect(page.getByText(`队伍1入口 ${room.links.A.hash} 已复制。`)).toBeVisible();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(room.links.A.hash);
 
   await Promise.all([
     page.waitForURL(`**/r/${room.links.A.hash}`),
     redCard.getByRole("link", { name: "进入" }).click(),
   ]);
-  await expect(page.locator(".portal-badge")).toHaveText("红队入口");
+  await expect(page.locator(".portal-badge")).toHaveText("队伍1入口");
 
   await page.goto("/");
   await page.locator("#joinRoomHash").fill(room.links.A.hash.toUpperCase());
@@ -110,7 +110,7 @@ test("landing page joins rooms, creates role entrances, copies hashes, and stays
     page.waitForURL(`**/r/${room.links.A.hash}`),
     page.getByRole("button", { name: "进入房间" }).click(),
   ]);
-  await expect(page.locator(".portal-badge")).toHaveText("红队入口");
+  await expect(page.locator(".portal-badge")).toHaveText("队伍1入口");
 });
 
 test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ page, baseURL }) => {
@@ -122,32 +122,65 @@ test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ 
   expect(new Set([firstRoom.roomId, ...Object.values(firstRoom.links).map((link) => link.hash)]).size).toBe(5);
 
   await page.goto(firstRoom.links.C.url);
-  await expect(page.locator(".portal-badge")).toHaveText("房间管理员入口");
+  await expect(page.locator(".portal-badge")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "比赛配置" })).toBeVisible();
 
-  const redPage = await page.context().newPage();
-  await redPage.goto(firstRoom.links.A.url);
-  await expect(redPage.locator(".portal-badge")).toHaveText("红队入口");
-  const bluePage = await page.context().newPage();
-  await bluePage.goto(firstRoom.links.B.url);
-  await expect(bluePage.locator(".portal-badge")).toHaveText("蓝队入口");
-  await redPage.keyboard.press("i");
-  await expect(redPage.getByRole("heading", { name: "比赛配置" })).toHaveCount(0);
+  const team1Page = await page.context().newPage();
+  await team1Page.goto(firstRoom.links.A.url);
+  await expect(team1Page.locator(".portal-badge")).toHaveText("队伍1入口");
+  const team2Page = await page.context().newPage();
+  await team2Page.goto(firstRoom.links.B.url);
+  await expect(team2Page.locator(".portal-badge")).toHaveText("队伍2入口");
+  await team1Page.keyboard.press("i");
+  await expect(team1Page.getByRole("heading", { name: "比赛配置" })).toHaveCount(0);
 
   await page.locator("details", { hasText: "地图设置" }).locator("summary").click();
+  await page.locator("#fixedFirstMapEnabled").uncheck();
+  await expect(page.locator("#firstMapPickerPolicy")).toBeEnabled();
   await page.locator("#firstMapPickerPolicy").selectOption("interactive_random");
   await page.locator("#confirmRoomConfig").click();
-  await expect(page.getByText("已确认，等待开始").first()).toBeVisible();
+  await expect(page.locator(".match-phase-label")).toHaveText("确认配置阶段");
+  await expect(team1Page.getByRole("button", { name: "是" })).toBeVisible();
+  await expect(team2Page.getByRole("button", { name: "是" })).toBeVisible();
+  await team1Page.getByRole("button", { name: "是" }).click();
+  await team2Page.getByRole("button", { name: "是" }).click();
   await page.locator("#startMatchFromSettings").click();
-  await expect(redPage.getByText("比赛尚未开始")).toHaveCount(0, { timeout: 10_000 });
-  await expect(redPage.locator('.interactive-random-choice:not(:disabled)', { hasText: "1" })).toBeVisible();
-  await redPage.locator('.interactive-random-choice:not(:disabled)', { hasText: "1" }).click();
-  await expect(bluePage.locator('.interactive-random-choice:not(:disabled)', { hasText: "0" })).toBeVisible({ timeout: 10_000 });
-  await bluePage.locator('.interactive-random-choice:not(:disabled)', { hasText: "0" }).click();
-  await expect(page.getByText("0 XOR 1 = 1", { exact: true })).toBeVisible({ timeout: 10_000 });
+  await expect(team1Page.locator(".match-phase-label")).toHaveText("比赛进行阶段", { timeout: 10_000 });
+  await team1Page.getByRole("dialog", { name: "比赛通知" }).getByRole("button", { name: "确认" }).click();
+  await team2Page.getByRole("dialog", { name: "比赛通知" }).getByRole("button", { name: "确认" }).click();
+  await expect(team1Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "1" })).toBeVisible();
+  await team1Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "1" }).click();
+  await expect(team2Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "0" })).toBeVisible({ timeout: 10_000 });
+  await team2Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "0" }).click();
+  await expect(page.getByText("1 XOR 0 = 1", { exact: true })).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "继续" }).click();
-  await redPage.close();
-  await bluePage.close();
+  await team1Page.close();
+  await team2Page.close();
+
+  const autoStartRoom = await createRoom(page);
+  await page.goto(autoStartRoom.links.C.url);
+  await page.locator("#teamsCanEditOwnName").check();
+  await page.locator("#startWithDefaultConfig").check();
+  const autoTeam1Page = await page.context().newPage();
+  const autoTeam2Page = await page.context().newPage();
+  await autoTeam1Page.goto(autoStartRoom.links.A.url);
+  await autoTeam2Page.goto(autoStartRoom.links.B.url);
+  await expect(autoTeam1Page.getByRole("dialog", { name: "赛前准备" })).toBeVisible();
+  await expect(autoTeam1Page.getByRole("button", { name: "确认队伍名称" })).toHaveCount(0);
+  const modalPosition = await autoTeam1Page.locator(".start-gate-team-modal").evaluate((element) => (
+    getComputedStyle(element).position
+  ));
+  expect(modalPosition).toBe("fixed");
+  await autoTeam1Page.getByRole("textbox", { name: "队伍名称" }).fill("A队");
+  await autoTeam2Page.getByRole("textbox", { name: "队伍名称" }).fill("B队");
+  await autoTeam1Page.getByRole("button", { name: "是" }).click();
+  await expect(autoTeam2Page.getByRole("textbox", { name: "队伍名称" })).toHaveValue("B队");
+  await autoTeam2Page.getByRole("button", { name: "是" }).click();
+  await expect(autoTeam1Page.locator(".match-phase-label")).toHaveText("比赛进行阶段", { timeout: 10_000 });
+  await expect(autoTeam2Page.locator(".room-presence-left strong")).toHaveText("A队");
+  await expect(autoTeam2Page.locator(".room-presence-right strong")).toHaveText("B队");
+  await autoTeam1Page.close();
+  await autoTeam2Page.close();
 
   const adminHash = readAdminHash();
   await page.goto(`${baseURL}/admin/${adminHash}`);
@@ -206,6 +239,87 @@ test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ 
   await expect(page.getByText("房间已经关闭或因不活跃而过期。")).toBeVisible();
 
   await expectEventuallyRateLimited(page);
+});
+
+test("global admin refreshes the English catalog and edits the Chinese mapping", async ({ page, baseURL }) => {
+  const adminHash = readAdminHash();
+  const template = {
+    schemaVersion: 1,
+    catalogHash: "sha256:new",
+    modes: { Escort: "" },
+    maps: { "Circuit Royal": "" },
+    heroes: { Ana: "" },
+  };
+  const diagnostics = {
+    valid: true,
+    versionMismatch: false,
+    hashMismatch: false,
+    missing: { modes: [], maps: [], heroes: [] },
+    extra: { modes: [], maps: [], heroes: [] },
+    blank: { modes: [], maps: [], heroes: [] },
+    typeErrors: [],
+  };
+  const maintenance = {
+    catalogHash: "sha256:current",
+    catalogSource: "bundled",
+    sources: { heroes: "https://overwatch.fandom.com/wiki/Heroes", maps: "https://overwatch.fandom.com/wiki/Overwatch_Wiki" },
+    updatedAt: Math.floor(Date.now() / 1000),
+    counts: { modes: 5, maps: 30, heroes: 52 },
+    translation: { source: "bundled", active: true, diagnostics, document: template },
+    translationTemplate: template,
+    job: null,
+  };
+
+  await page.route("**/api/admin/*/catalog-maintenance", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify(maintenance),
+  }));
+  await page.route("**/api/admin/*/catalog-refresh", (route) => route.fulfill({
+    status: 202,
+    contentType: "application/json",
+    body: JSON.stringify({ id: "job-1", status: "running", stage: "fetch", progress: 10, message: "正在读取", error: null }),
+  }));
+  await page.route("**/api/admin/*/catalog-refresh/job-1", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      id: "job-1",
+      status: "completed",
+      stage: "completed",
+      progress: 100,
+      message: "完成",
+      error: null,
+      result: { counts: { modes: 5, maps: 30, heroes: 52 }, catalogHash: "sha256:new", translationTemplate: template },
+    }),
+  }));
+  await page.route("**/api/admin/*/catalog-translation", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ active: false, diagnostics: { ...diagnostics, valid: false, hashMismatch: true } }),
+  }));
+
+  const origin = new URL(baseURL ?? "http://127.0.0.1:5175").origin;
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin });
+  await page.goto(`${baseURL}/admin/${adminHash}`);
+  await expect(page.getByRole("heading", { name: "英雄与地图数据" })).toBeVisible();
+  await expect(page.getByText("52 英雄 · 30 地图")).toBeVisible();
+
+  await page.getByRole("button", { name: "爬取英文更新" }).click();
+  const templateDialog = page.getByRole("dialog", { name: "英文到中文映射模板" });
+  await expect(templateDialog).toBeVisible({ timeout: 5_000 });
+  await expect(templateDialog.locator("textarea")).toContainText('"Circuit Royal"');
+  await expect(templateDialog.locator("footer span")).toContainText(/已自动复制|请按 Ctrl\+C/);
+  await templateDialog.getByRole("button", { name: "关闭映射模板" }).click();
+
+  await page.getByRole("button", { name: "更新中文映射" }).click();
+  const translationDialog = page.getByRole("dialog", { name: "更新中文映射" });
+  await translationDialog.locator("textarea").fill("{not-json");
+  await translationDialog.getByRole("button", { name: "保存映射" }).click();
+  await expect(translationDialog.getByText("JSON 格式错误，旧映射未被覆盖。")).toBeVisible();
+  await translationDialog.locator("textarea").fill(JSON.stringify({ schemaVersion: 1 }));
+  await translationDialog.getByRole("button", { name: "保存映射" }).click();
+  await expect(page.getByText("中文映射已保存，但与当前目录不匹配；网站现统一显示英文。")).toBeVisible();
 });
 
 async function createRoom(page: Page): Promise<CreatedRoom> {

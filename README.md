@@ -15,7 +15,11 @@ python backend/app.py
 
 Flask 启动时会在控制台打印全局管理地址。管理页可以关闭活动房间、修改默认设置，并查看或下载永久房间历史 JSON。
 
-地图图片、地图模式图标、英雄头像会在 Flask 启动前通过 `scripts/scrape_assets.py` 自动刷新，也可按需手动重新抓取：
+全局管理页的“英雄与地图数据”区域可以从英文 Fandom 更新当前英雄、头像、职责图标，以及 Escort、Hybrid、Control、Push、Flashpoint 五类地图和图片。更新先在临时目录完成，失败时继续使用上一版完整目录；运行期数据保存在 `backend/data/runtime/catalog/`，容器重建后仍会保留。
+
+每次成功爬取都会生成并尝试复制一份英文到中文的映射模板。中文映射的格式为 `schemaVersion`、`catalogHash`、`modes`、`maps`、`heroes`；只有哈希、键集合和所有中文值完整匹配时才启用中文，否则所有目录名称统一显示英文。爬取不会覆盖管理员保存的映射。
+
+仓库维护者也可手动刷新内置清单和静态资源，供全新部署及 Sites 只读展示版使用：
 
 ```bash
 python scripts/scrape_assets.py

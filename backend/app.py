@@ -4,8 +4,6 @@ import json
 import os
 import re
 import secrets
-import subprocess
-import sys
 import threading
 import time
 import unicodedata
@@ -14,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, redirect, request, send_file, send_from_directory
+
+try:
+    from backend import catalog as catalog_data
+except ModuleNotFoundError:  # Support `python backend/app.py` from the repository root.
+    import catalog as catalog_data  # type: ignore[no-redef]
 
 try:
     from backend.match_config import (
@@ -35,7 +38,7 @@ STATIC_DIR = ROOT / "static"
 CONFIG_DOCS_DIR = STATIC_DIR / "config"
 ASSETS_DATA_PATH = ROOT / "backend" / "data" / "assets.json"
 MAPS_DATA_PATH = ROOT / "backend" / "data" / "maps.json"
-ASSET_SCRIPT_PATH = ROOT / "scripts" / "scrape_assets.py"
+BUNDLED_TRANSLATION_PATH = ROOT / "backend" / "data" / "catalog_translation.zh-CN.json"
 MAP_PLACEHOLDER = "/static/placeholders/map-blank.svg"
 HERO_PLACEHOLDER = "/static/placeholders/hero-blank.svg"
 SETTINGS_PRESET_PATH = ROOT / "backend" / "data" / "settings_preset.json"
@@ -45,9 +48,10 @@ ROOM_STORE_PATH = RUNTIME_DATA_DIR / "rooms.json"
 ROOM_HISTORY_DIR = RUNTIME_DATA_DIR / "room_history"
 ROOM_HISTORY_INDEX_PATH = RUNTIME_DATA_DIR / "room_history_index.json"
 CONFIG_PRESETS_DIR = RUNTIME_DATA_DIR / "config_presets"
+RUNTIME_CATALOG_DIR = RUNTIME_DATA_DIR / "catalog"
 ROOM_ROLES = {
-    "A": {"role": "red-team", "label": "红队入口", "side": "right"},
-    "B": {"role": "blue-team", "label": "蓝队入口", "side": "left"},
+    "A": {"role": "blue-team", "label": "队伍1入口", "side": "left"},
+    "B": {"role": "red-team", "label": "队伍2入口", "side": "right"},
     "C": {"role": "admin", "label": "房间管理员入口", "side": None},
     "D": {"role": "broadcast", "label": "直播入口", "side": None},
 }
@@ -60,7 +64,11 @@ SHORT_CODE_PATTERN = re.compile(r"^[0-9a-z]{4}$")
 ARCHIVE_KEY_PATTERN = re.compile(r"^[0-9a-z]{4}(?:-[0-9a-z]{4}){3}$")
 CONFIG_PRESET_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 OPERATION_PART_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
+# Visiting this fixed, unlisted URL creates a room without applying the per-IP limit.
+# Set OW_UNLIMITED_CREATE_HASH when deploying if this URL needs to be rotated.
+DEFAULT_UNLIMITED_CREATE_HASH = "4b7dc102e5fa8c39b6d1e4f0729a5cb8e3f61d94a70c2be58f39d6a1c4e8072b"
 MAX_SHORT_CODE_ATTEMPTS = 10_000
+PORTAL_PRESENCE_TTL_SECONDS = 5
 ALLOWED_OPERATION_CATEGORIES = {
     "room",
     "settings",
@@ -76,10 +84,14 @@ ALLOWED_OPERATION_CATEGORIES = {
 DEFAULT_GLOBAL_SETTINGS = {
     "roomsPerHour": 5,
     "inactiveTimeoutMinutes": 30,
+    "notificationDurationSeconds": 20,
     "defaultSettings": None,
     "defaultPresetId": None,
 }
 room_store_lock = threading.Lock()
+catalog_refresh_lock = threading.Lock()
+catalog_refresh_jobs: dict[str, dict[str, Any]] = {}
+active_catalog_refresh_job_id: str | None = None
 
 
 class CodeSpaceExhausted(RuntimeError):
@@ -127,7 +139,59 @@ def create_app() -> Flask:
 
     @app.get("/api/maps/catalog")
     def maps_catalog() -> Any:
-        return jsonify(build_maps_catalog())
+        response = jsonify(build_maps_catalog())
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/runtime-assets/<path:filename>")
+    def runtime_catalog_asset(filename: str) -> Any:
+        assets, source = catalog_data.load_catalog_assets(ASSETS_DATA_PATH, RUNTIME_CATALOG_DIR)
+        normalized = filename.replace("\\", "/").strip("/")
+        if source != "runtime" or normalized not in catalog_data.allowed_runtime_asset_paths(assets):
+            return jsonify({"error": "not_found"}), 404
+        return send_from_directory(RUNTIME_CATALOG_DIR / "current", normalized)
+
+    @app.get("/api/admin/<admin_hash>/catalog-maintenance")
+    def admin_catalog_maintenance(admin_hash: str) -> Any:
+        if not is_global_admin_hash_valid(admin_hash):
+            return jsonify({"error": "not_found"}), 404
+        payload = catalog_data.build_maintenance_status(
+            ASSETS_DATA_PATH,
+            BUNDLED_TRANSLATION_PATH,
+            RUNTIME_CATALOG_DIR,
+        )
+        with catalog_refresh_lock:
+            payload["job"] = current_catalog_refresh_job_unlocked()
+        return jsonify(payload)
+
+    @app.post("/api/admin/<admin_hash>/catalog-refresh")
+    def admin_catalog_refresh(admin_hash: str) -> Any:
+        if not is_global_admin_hash_valid(admin_hash):
+            return jsonify({"error": "not_found"}), 404
+        job, started = start_catalog_refresh_job()
+        return jsonify(job), 202 if started else 409
+
+    @app.get("/api/admin/<admin_hash>/catalog-refresh/<job_id>")
+    def admin_catalog_refresh_status(admin_hash: str, job_id: str) -> Any:
+        if not is_global_admin_hash_valid(admin_hash):
+            return jsonify({"error": "not_found"}), 404
+        with catalog_refresh_lock:
+            job = catalog_refresh_jobs.get(job_id)
+            if job is None:
+                return jsonify({"error": "not_found"}), 404
+            return jsonify(deepcopy(job))
+
+    @app.put("/api/admin/<admin_hash>/catalog-translation")
+    def admin_catalog_translation(admin_hash: str) -> Any:
+        if not is_global_admin_hash_valid(admin_hash):
+            return jsonify({"error": "not_found"}), 404
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid_json_object"}), 400
+        assets, _source = catalog_data.load_catalog_assets(ASSETS_DATA_PATH, RUNTIME_CATALOG_DIR)
+        diagnostics = catalog_data.validate_translation(assets, payload)
+        catalog_data.save_json_atomic(RUNTIME_CATALOG_DIR / "translation.json", payload)
+        return jsonify({"ok": True, "active": diagnostics["valid"], "diagnostics": diagnostics})
 
     @app.get("/docs/config/<path:filename>")
     def config_document(filename: str) -> Any:
@@ -235,6 +299,30 @@ def create_app() -> Flask:
 
         return jsonify(format_created_room(room))
 
+    @app.post("/api/rooms/unlimited/<create_hash>")
+    def create_unlimited_room(create_hash: str) -> Any:
+        if not is_unlimited_create_hash(create_hash):
+            return jsonify({"error": "not_found"}), 404
+
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            now = current_timestamp()
+            store_changed = cleanup_inactive_rooms_unlocked(store, now)
+            try:
+                room = create_room_record_unlocked(store, now)
+            except CodeSpaceExhausted:
+                if store_changed:
+                    save_room_store_unlocked(store)
+                return jsonify({"error": "code_space_exhausted"}), 503
+
+            try:
+                save_room_store_unlocked(store)
+            except Exception:
+                rollback_created_room_unlocked(store, room)
+                raise
+
+        return jsonify(format_created_room(room))
+
     @app.get("/api/rooms/token/<room_token>")
     def get_room_token(room_token: str) -> Any:
         with room_store_lock:
@@ -254,7 +342,158 @@ def create_app() -> Flask:
             touch_room_unlocked(room, now)
             save_room_store_unlocked(store)
 
-        return jsonify(format_room_token_payload(room, portal_code))
+        return jsonify(format_room_token_payload(
+            room,
+            portal_code,
+            store.get("globalSettings", {}).get("notificationDurationSeconds"),
+        ))
+
+    @app.post("/api/rooms/token/<room_token>/presence")
+    def update_room_presence(room_token: str) -> Any:
+        payload = request.get_json(silent=True) or {}
+        requested_ready = payload.get("ready")
+        requested_name = payload.get("name")
+        if requested_ready is not None and not isinstance(requested_ready, bool):
+            return jsonify({"error": "invalid_ready_state"}), 400
+        if requested_name is not None and (
+            not isinstance(requested_name, str)
+            or not requested_name.strip()
+            or len(requested_name.strip()) > 60
+        ):
+            return jsonify({"error": "invalid_team_name"}), 400
+
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+
+            room, portal_code = lookup
+            now = current_timestamp()
+            presence = ensure_room_presence_unlocked(room)
+            presence[portal_code]["lastSeenAt"] = now
+            if portal_code in {"A", "B"} and requested_ready is not None:
+                if requested_ready is False:
+                    return jsonify({"error": "ready_cannot_be_revoked"}), 409
+
+            config_state = ensure_room_config_unlocked(room)
+            preparation_open = (
+                config_state["status"] in {"ready", "locked"}
+                or config_state["value"].get("startWithDefaultConfig") is True
+            )
+            if portal_code in {"A", "B"} and requested_ready is True:
+                if not preparation_open:
+                    return jsonify({"error": "config_not_ready", "config": config_state}), 409
+                if config_state["value"].get("teamsCanEditOwnName") is True:
+                    if requested_name is not None:
+                        if config_state["status"] == "locked":
+                            return jsonify({"error": "config_locked"}), 409
+                        if presence[portal_code]["ready"]:
+                            return jsonify({"error": "team_already_ready"}), 409
+                        side = ROOM_ROLES[portal_code]["side"]
+                        next_name = requested_name.strip()
+                        config_state["value"]["teams"][side] = next_name
+                        config_state["revision"] = int(config_state.get("revision") or 0) + 1
+                        room["settings"] = deepcopy(config_state["value"])
+                        presence[portal_code]["nameConfirmed"] = True
+                        record_room_config_event_unlocked(
+                            room,
+                            "team_name_confirmed",
+                            portal_code,
+                            {"side": side, "name": next_name},
+                        )
+                    elif not presence[portal_code]["nameConfirmed"]:
+                        return jsonify({"error": "team_name_not_confirmed"}), 409
+                presence[portal_code]["ready"] = True
+
+            auto_started = False
+            team_ready = bool(presence["A"]["ready"] and presence["B"]["ready"])
+            if (
+                config_state["status"] != "locked"
+                and config_state["value"].get("startWithDefaultConfig") is True
+                and team_ready
+            ):
+                try:
+                    config_state["value"] = normalize_match_config(
+                        config_state["value"], load_assets().get("maps", {})
+                    )
+                except MatchConfigValidationError as exc:
+                    return jsonify({"error": "invalid_config", "details": exc.errors}), 400
+                config_state["status"] = "locked"
+                config_state["confirmedAt"] = config_state.get("confirmedAt") or now
+                config_state["lockedAt"] = now
+                room["settings"] = deepcopy(config_state["value"])
+                record_room_config_event_unlocked(
+                    room,
+                    "auto_started_after_team_ready",
+                    portal_code,
+                    {"teamReady": True},
+                )
+                auto_started = True
+
+            touch_room_unlocked(room, now)
+            save_room_store_unlocked(store)
+            response = {
+                "presence": format_room_presence(room, now),
+                "config": config_state,
+                "autoStarted": auto_started,
+                "version": room.get("version", 0),
+            }
+
+        return jsonify(response)
+
+    @app.put("/api/rooms/token/<room_token>/team-name")
+    def update_own_team_name(room_token: str) -> Any:
+        payload = request.get_json(silent=True) or {}
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 60:
+            return jsonify({"error": "invalid_team_name"}), 400
+
+        with room_store_lock:
+            store = load_room_store_unlocked()
+            lookup = find_room_by_token_unlocked(store, room_token)
+            if not lookup:
+                return jsonify({"error": "not_found"}), 404
+
+            room, portal_code = lookup
+            if portal_code not in {"A", "B"}:
+                return jsonify({"error": "forbidden"}), 403
+
+            config_state = ensure_room_config_unlocked(room)
+            if config_state["status"] == "locked":
+                return jsonify({"error": "config_locked"}), 409
+            if config_state["value"].get("teamsCanEditOwnName") is not True:
+                return jsonify({"error": "team_name_edit_disabled"}), 409
+            if not (
+                config_state["status"] == "ready"
+                or config_state["value"].get("startWithDefaultConfig") is True
+            ):
+                return jsonify({"error": "config_not_ready"}), 409
+
+            presence = ensure_room_presence_unlocked(room)
+            if presence[portal_code]["ready"]:
+                return jsonify({"error": "team_already_ready"}), 409
+
+            side = ROOM_ROLES[portal_code]["side"]
+            next_name = name.strip()
+            config_state["value"]["teams"][side] = next_name
+            config_state["revision"] = int(config_state.get("revision") or 0) + 1
+            room["settings"] = deepcopy(config_state["value"])
+            presence[portal_code]["nameConfirmed"] = True
+            now = current_timestamp()
+            touch_room_unlocked(room, now)
+            record_room_config_event_unlocked(
+                room,
+                "team_name_confirmed",
+                portal_code,
+                {"side": side, "name": next_name},
+            )
+            save_room_store_unlocked(store)
+
+            return jsonify({
+                "config": config_state,
+                "presence": format_room_presence(room, now),
+            })
 
     @app.get("/api/rooms/token/<room_token>/config-presets")
     def get_room_config_presets(room_token: str) -> Any:
@@ -307,6 +546,7 @@ def create_app() -> Flask:
             config_state["source"] = normalize_room_config_source(payload.get("source"))
             config_state["confirmedAt"] = None
             room["settings"] = normalized
+            reset_room_readiness_unlocked(room)
             record_room_config_event_unlocked(room, "updated", portal_code)
             save_room_store_unlocked(store)
             return jsonify(config_state)
@@ -340,6 +580,7 @@ def create_app() -> Flask:
             }
             config_state["confirmedAt"] = None
             room["settings"] = deepcopy(preset["config"])
+            reset_room_readiness_unlocked(room)
             record_room_config_event_unlocked(room, "preset_applied", portal_code, {"presetId": preset_id})
             save_room_store_unlocked(store)
             return jsonify(config_state)
@@ -369,6 +610,8 @@ def create_app() -> Flask:
 
     @app.post("/api/rooms/token/<room_token>/start")
     def start_room(room_token: str) -> Any:
+        payload = request.get_json(silent=True) or {}
+        force_start = payload.get("force") is True
         with room_store_lock:
             store = load_room_store_unlocked()
             lookup = find_room_by_token_unlocked(store, room_token)
@@ -380,9 +623,19 @@ def create_app() -> Flask:
             config_state = ensure_room_config_unlocked(room)
             if config_state["status"] != "ready":
                 return jsonify({"error": "config_not_ready", "config": config_state}), 409
+            presence = ensure_room_presence_unlocked(room)
+            if not force_start and not (presence["A"]["ready"] and presence["B"]["ready"]):
+                return jsonify({
+                    "error": "teams_not_ready",
+                    "presence": format_room_presence(room),
+                }), 409
             config_state["status"] = "locked"
             config_state["lockedAt"] = current_timestamp()
-            record_room_config_event_unlocked(room, "locked", portal_code)
+            record_room_config_event_unlocked(
+                room,
+                "force_started" if force_start else "locked",
+                portal_code,
+            )
             save_room_store_unlocked(store)
             return jsonify({"ok": True, "config": config_state, "version": room.get("version", 0)})
 
@@ -401,6 +654,7 @@ def create_app() -> Flask:
             config_state["revision"] += 1
             config_state["confirmedAt"] = None
             config_state["lockedAt"] = None
+            reset_room_readiness_unlocked(room)
             next_version = int(room.get("version") or 0) + 1
             now = current_timestamp()
             append_room_history_unlocked(
@@ -436,7 +690,16 @@ def create_app() -> Flask:
             touch_room_unlocked(room, now)
             save_room_store_unlocked(store)
 
-        return jsonify({"version": room.get("version", 0), "snapshot": room.get("snapshot")})
+        return jsonify({
+            "version": room.get("version", 0),
+            "snapshot": room.get("snapshot"),
+            "notificationDurationSeconds": clamp_int(
+                store.get("globalSettings", {}).get("notificationDurationSeconds"),
+                1,
+                300,
+                DEFAULT_GLOBAL_SETTINGS["notificationDurationSeconds"],
+            ),
+        })
 
     @app.put("/api/rooms/token/<room_token>/snapshot")
     def update_room_snapshot(room_token: str) -> Any:
@@ -467,6 +730,18 @@ def create_app() -> Flask:
             next_snapshot = payload.get("snapshot")
             if not isinstance(next_snapshot, dict):
                 return jsonify({"error": "invalid_snapshot"}), 400
+            merge_team_lineup_snapshot_unlocked(
+                room.get("snapshot"), next_snapshot, portal_code, operation
+            )
+            merge_team_score_pause_snapshot_unlocked(
+                room.get("snapshot"), next_snapshot, portal_code, operation
+            )
+            merge_team_interactive_random_snapshot_unlocked(
+                room.get("snapshot"), next_snapshot, portal_code, operation
+            )
+            merge_team_notice_snapshot_unlocked(
+                room.get("snapshot"), next_snapshot, portal_code, operation
+            )
             if operation["category"] == "settings" and portal_code != "C":
                 return jsonify({"error": "forbidden"}), 403
             if bool(next_snapshot.get("roomStarted")) and config_state["status"] != "locked":
@@ -477,10 +752,41 @@ def create_app() -> Flask:
 
             current_version = int(room.get("version") or 0)
 
-            if isinstance(expected_version, int) and expected_version != current_version:
+            version_conflict = isinstance(expected_version, int) and expected_version != current_version
+            merge_safe = is_merge_safe_snapshot_operation(operation)
+            if version_conflict and not merge_safe:
                 if store_changed:
                     save_room_store_unlocked(store)
                 return jsonify({"error": "version_conflict", "version": current_version, "snapshot": room.get("snapshot")}), 409
+
+            if version_conflict and merge_safe:
+                next_snapshot = merge_conflicting_snapshot_unlocked(
+                    room.get("snapshot"), next_snapshot, portal_code, operation
+                )
+
+            normalize_score_submission_pauses_unlocked(
+                room.get("snapshot"), next_snapshot, operation
+            )
+            normalize_score_pause_transition_unlocked(
+                room.get("snapshot"), next_snapshot, portal_code, operation
+            )
+            merge_notification_events_unlocked(room.get("snapshot"), next_snapshot)
+
+            # Normal portal updates must never move a room backwards. A room
+            # administrator can explicitly restore a completed checkpoint from
+            # the live control panel, which is the sole intentional exception.
+            is_admin_stage_restore = (
+                portal_code == "C"
+                and operation.get("category") == "room"
+                and operation.get("action") == "stage_restored"
+            )
+            if (
+                not is_admin_stage_restore
+                and snapshot_progress_key(next_snapshot) < snapshot_progress_key(room.get("snapshot"))
+            ):
+                if store_changed:
+                    save_room_store_unlocked(store)
+                return jsonify({"error": "stage_regression", "version": current_version, "snapshot": room.get("snapshot")}), 409
 
             next_version = current_version + 1
             actor = {
@@ -494,7 +800,7 @@ def create_app() -> Flask:
             touch_room_unlocked(room, now)
             save_room_store_unlocked(store)
 
-        return jsonify({"ok": True, "version": room["version"]})
+        return jsonify({"ok": True, "version": room["version"], "snapshot": room["snapshot"]})
 
     @app.get("/api/admin/<admin_hash>/rooms")
     def admin_rooms(admin_hash: str) -> Any:
@@ -627,6 +933,15 @@ def create_app() -> Flask:
                 1,
                 60 * 24 * 30,
                 settings.get("inactiveTimeoutMinutes", 30),
+            )
+            settings["notificationDurationSeconds"] = clamp_int(
+                payload.get("notificationDurationSeconds"),
+                1,
+                300,
+                settings.get(
+                    "notificationDurationSeconds",
+                    DEFAULT_GLOBAL_SETTINGS["notificationDurationSeconds"],
+                ),
             )
 
             if "defaultSettings" in payload:
@@ -803,6 +1118,45 @@ def ensure_room_config_unlocked(room: dict[str, Any]) -> dict[str, Any]:
     return config_state
 
 
+def ensure_room_presence_unlocked(room: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw_presence = room.get("presence") if isinstance(room.get("presence"), dict) else {}
+    presence: dict[str, dict[str, Any]] = {}
+    for portal_code in ROOM_ROLES:
+        raw_entry = raw_presence.get(portal_code) if isinstance(raw_presence.get(portal_code), dict) else {}
+        presence[portal_code] = {
+            "lastSeenAt": int(raw_entry.get("lastSeenAt") or 0),
+            "ready": bool(raw_entry.get("ready")) if portal_code in {"A", "B"} else False,
+            "nameConfirmed": bool(raw_entry.get("nameConfirmed")) if portal_code in {"A", "B"} else False,
+        }
+    room["presence"] = presence
+    return presence
+
+
+def reset_room_readiness_unlocked(room: dict[str, Any]) -> None:
+    presence = ensure_room_presence_unlocked(room)
+    presence["A"]["ready"] = False
+    presence["B"]["ready"] = False
+    presence["A"]["nameConfirmed"] = False
+    presence["B"]["nameConfirmed"] = False
+
+
+def format_room_presence(room: dict[str, Any], now: int | None = None) -> dict[str, dict[str, Any]]:
+    timestamp = current_timestamp() if now is None else now
+    presence = ensure_room_presence_unlocked(room)
+    return {
+        portal_code: {
+            "connected": bool(
+                presence[portal_code]["lastSeenAt"]
+                and timestamp - presence[portal_code]["lastSeenAt"] <= PORTAL_PRESENCE_TTL_SECONDS
+            ),
+            "ready": bool(presence[portal_code]["ready"]),
+            "nameConfirmed": bool(presence[portal_code]["nameConfirmed"]),
+            "lastSeenAt": presence[portal_code]["lastSeenAt"],
+        }
+        for portal_code in ("B", "C", "A")
+    }
+
+
 def normalize_room_config_source(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {"type": "manual"}
@@ -884,7 +1238,8 @@ def initialize_room_store() -> None:
         reconcile_active_rooms_unlocked(store)
         cleanup_inactive_rooms_unlocked(store, current_timestamp())
         save_room_store_unlocked(store)
-        print(f"Global admin URL: /admin/{store['adminHash']}")
+        print(f"Unlimited room creation URL: /r/{unlimited_create_hash()}")
+        print(f"Admin manage URL: /admin/{store['adminHash']}")
 
 
 def generate_admin_hash() -> str:
@@ -947,6 +1302,10 @@ def create_room_record_unlocked(store: dict[str, Any], now: int) -> dict[str, An
             "version": 0,
             "snapshot": None,
             "settings": store.get("globalSettings", {}).get("defaultSettings"),
+            "presence": {
+                portal_code: {"lastSeenAt": 0, "ready": False, "nameConfirmed": False}
+                for portal_code in ROOM_ROLES
+            },
         }
         default_preset_id = store.get("globalSettings", {}).get("defaultPresetId")
         default_preset = load_config_preset(str(default_preset_id)) if default_preset_id else None
@@ -1005,6 +1364,430 @@ def normalize_operation(value: Any) -> dict[str, Any]:
         raise ValueError("Operation details must be an object")
 
     return {"category": category, "action": action, "details": details}
+
+
+def merge_team_lineup_snapshot_unlocked(
+    current_snapshot: Any,
+    next_snapshot: dict[str, Any],
+    portal_code: str,
+    operation: dict[str, Any],
+) -> None:
+    if portal_code == "C" or operation.get("category") != "lineup":
+        return
+    side = ROOM_ROLES.get(portal_code, {}).get("side")
+    if side not in {"left", "right"} or not isinstance(current_snapshot, dict):
+        return
+    current_lineup = current_snapshot.get("lineupSelectorState")
+    next_lineup = next_snapshot.get("lineupSelectorState")
+    if not isinstance(current_lineup, dict) or not isinstance(next_lineup, dict):
+        return
+    if current_lineup.get("mapIndex") != next_lineup.get("mapIndex"):
+        return
+
+    other_side = "right" if side == "left" else "left"
+    current_values = current_lineup.get("values") if isinstance(current_lineup.get("values"), dict) else {}
+    next_values = next_lineup.setdefault("values", {})
+    if isinstance(next_values, dict) and isinstance(current_values.get(other_side), dict):
+        next_values[other_side] = deepcopy(current_values[other_side])
+
+    current_ready = current_lineup.get("ready") if isinstance(current_lineup.get("ready"), dict) else {}
+    next_ready = next_lineup.setdefault("ready", {})
+    if isinstance(next_ready, dict):
+        next_ready[other_side] = bool(current_ready.get(other_side))
+
+
+def merge_team_score_pause_snapshot_unlocked(
+    current_snapshot: Any,
+    next_snapshot: dict[str, Any],
+    portal_code: str,
+    operation: dict[str, Any],
+) -> None:
+    if portal_code == "C" or operation.get("category") != "pause":
+        return
+    if not str(operation.get("action") or "").startswith("score_team_"):
+        return
+    side = ROOM_ROLES.get(portal_code, {}).get("side")
+    if side not in {"left", "right"} or not isinstance(current_snapshot, dict):
+        return
+    current_score = current_snapshot.get("scoreSelectorState")
+    next_score = next_snapshot.get("scoreSelectorState")
+    if not isinstance(current_score, dict) or not isinstance(next_score, dict):
+        return
+    if current_score.get("mapIndex") != next_score.get("mapIndex"):
+        return
+
+    other_side = "right" if side == "left" else "left"
+    current_pauses = current_score.get("teamPauses") if isinstance(current_score.get("teamPauses"), dict) else {}
+    next_pauses = next_score.setdefault("teamPauses", {})
+    if isinstance(next_pauses, dict) and isinstance(current_pauses.get(other_side), dict):
+        next_pauses[other_side] = deepcopy(current_pauses[other_side])
+
+    if isinstance(next_pauses, dict):
+        any_active = any(
+            isinstance(next_pauses.get(candidate), dict) and bool(next_pauses[candidate].get("active"))
+            for candidate in ("left", "right")
+        )
+        if not any_active:
+            next_score["countdownPauseStartedAt"] = None
+        elif not isinstance(next_score.get("countdownPauseStartedAt"), (int, float)):
+            current_started_at = current_score.get("countdownPauseStartedAt")
+            own_pause = next_pauses.get(side) if isinstance(next_pauses.get(side), dict) else {}
+            next_score["countdownPauseStartedAt"] = (
+                current_started_at
+                if isinstance(current_started_at, (int, float))
+                else own_pause.get("startedAt")
+            )
+
+
+def normalize_score_pause_transition_unlocked(
+    current_snapshot: Any,
+    next_snapshot: dict[str, Any],
+    portal_code: str,
+    operation: dict[str, Any],
+) -> None:
+    """Make the server authoritative for score-phase pause clocks and counters."""
+    if operation.get("category") != "pause":
+        return
+    action = str(operation.get("action") or "")
+    if action not in {"score_team_started", "score_team_resumed"}:
+        return
+    if not isinstance(current_snapshot, dict):
+        return
+
+    details = operation.get("details") if isinstance(operation.get("details"), dict) else {}
+    side = details.get("side")
+    if side not in {"left", "right"}:
+        return
+    actor_side = ROOM_ROLES.get(portal_code, {}).get("side")
+    if portal_code != "C" and actor_side != side:
+        return
+
+    current_score = current_snapshot.get("scoreSelectorState")
+    next_score = next_snapshot.get("scoreSelectorState")
+    if not isinstance(current_score, dict) or not isinstance(next_score, dict):
+        return
+    if current_score.get("mapIndex") != next_score.get("mapIndex"):
+        return
+
+    if current_score.get("submittedBy"):
+        current_pauses = current_score.get("teamPauses")
+        if isinstance(current_pauses, dict):
+            next_score["teamPauses"] = deepcopy(current_pauses)
+        next_score["countdownPauseStartedAt"] = None
+        return
+
+    current_pauses = current_score.get("teamPauses")
+    next_pauses = next_score.setdefault("teamPauses", {})
+    if not isinstance(current_pauses, dict) or not isinstance(next_pauses, dict):
+        return
+    current_pause = current_pauses.get(side)
+    if not isinstance(current_pause, dict):
+        return
+
+    normalized = deepcopy(current_pause)
+    now_ms = int(time.time() * 1000)
+    is_active = bool(current_pause.get("active"))
+    total_ms = max(0, int(current_pause.get("totalMs") or 0))
+    count = max(0, int(current_pause.get("count") or 0))
+
+    if action == "score_team_started":
+        if not is_active:
+            normalized.update(
+                {
+                    "active": True,
+                    "startedAt": now_ms,
+                    "totalMs": total_ms,
+                    "count": count + 1,
+                }
+            )
+    elif is_active:
+        started_at = current_pause.get("startedAt")
+        elapsed_ms = max(0, now_ms - int(started_at)) if isinstance(started_at, (int, float)) else 0
+        normalized.update(
+            {
+                "active": False,
+                "startedAt": None,
+                "totalMs": total_ms + elapsed_ms,
+                "count": count,
+            }
+        )
+
+    next_pauses[side] = normalized
+    active_starts = [
+        pause.get("startedAt")
+        for pause in next_pauses.values()
+        if isinstance(pause, dict)
+        and pause.get("active")
+        and isinstance(pause.get("startedAt"), (int, float))
+    ]
+    next_score["countdownPauseStartedAt"] = min(active_starts) if active_starts else None
+
+
+def normalize_score_submission_pauses_unlocked(
+    current_snapshot: Any,
+    next_snapshot: dict[str, Any],
+    operation: dict[str, Any],
+) -> None:
+    """Stop every team pause when a score is submitted for confirmation."""
+    if operation.get("category") != "score" or operation.get("action") != "submitted":
+        return
+    if not isinstance(current_snapshot, dict):
+        return
+
+    current_score = current_snapshot.get("scoreSelectorState")
+    next_score = next_snapshot.get("scoreSelectorState")
+    if not isinstance(current_score, dict) or not isinstance(next_score, dict):
+        return
+    if current_score.get("mapIndex") != next_score.get("mapIndex"):
+        return
+
+    current_pauses = current_score.get("teamPauses")
+    if not isinstance(current_pauses, dict):
+        return
+
+    now_ms = int(time.time() * 1000)
+    normalized_pauses: dict[str, Any] = {}
+    for side in ("left", "right"):
+        current_pause = current_pauses.get(side)
+        if not isinstance(current_pause, dict):
+            continue
+        normalized = deepcopy(current_pause)
+        if current_pause.get("active"):
+            started_at = current_pause.get("startedAt")
+            elapsed_ms = max(0, now_ms - int(started_at)) if isinstance(started_at, (int, float)) else 0
+            normalized["totalMs"] = max(0, int(current_pause.get("totalMs") or 0)) + elapsed_ms
+        normalized["active"] = False
+        normalized["startedAt"] = None
+        normalized_pauses[side] = normalized
+
+    next_score["teamPauses"] = normalized_pauses
+    next_score["countdownPauseStartedAt"] = None
+
+
+def merge_team_interactive_random_snapshot_unlocked(
+    current_snapshot: Any,
+    next_snapshot: dict[str, Any],
+    portal_code: str,
+    operation: dict[str, Any],
+) -> None:
+    if operation.get("action") != "interactive_random_submitted":
+        return
+    side = ROOM_ROLES.get(portal_code, {}).get("side")
+    if side not in {"left", "right"} or not isinstance(current_snapshot, dict):
+        return
+    current_random = current_snapshot.get("interactiveRandomState")
+    next_random = next_snapshot.get("interactiveRandomState")
+    if not isinstance(current_random, dict) or not isinstance(next_random, dict):
+        return
+    if (
+        current_random.get("purpose") != next_random.get("purpose")
+        or current_random.get("mapIndex") != next_random.get("mapIndex")
+    ):
+        return
+    other_side = "right" if side == "left" else "left"
+    current_choices = current_random.get("choices") if isinstance(current_random.get("choices"), dict) else {}
+    next_choices = next_random.setdefault("choices", {})
+    if isinstance(next_choices, dict):
+        next_choices[other_side] = current_choices.get(other_side)
+
+
+def merge_team_notice_snapshot_unlocked(
+    current_snapshot: Any,
+    next_snapshot: dict[str, Any],
+    portal_code: str,
+    operation: dict[str, Any],
+) -> None:
+    if operation.get("category") != "notice" or operation.get("action") != "acknowledged":
+        return
+    side = ROOM_ROLES.get(portal_code, {}).get("side")
+    if side not in {"left", "right"} or not isinstance(current_snapshot, dict):
+        return
+    current_notice = current_snapshot.get("teamAckNotice")
+    next_notice = next_snapshot.get("teamAckNotice")
+    if not isinstance(current_notice, dict):
+        return
+    if isinstance(next_notice, dict) and current_notice.get("message") != next_notice.get("message"):
+        return
+    other_side = "right" if side == "left" else "left"
+    current_ack = current_notice.get("acknowledged") if isinstance(current_notice.get("acknowledged"), dict) else {}
+    merged_ack = {side: True, other_side: bool(current_ack.get(other_side))}
+    if all(merged_ack.get(candidate, False) for candidate in ("left", "right")):
+        next_snapshot["teamAckNotice"] = None
+        return
+    if not isinstance(next_notice, dict):
+        next_notice = deepcopy(current_notice)
+        next_snapshot["teamAckNotice"] = next_notice
+    next_notice["acknowledged"] = merged_ack
+
+
+def merge_notification_events_unlocked(current_snapshot: Any, next_snapshot: dict[str, Any]) -> None:
+    """Preserve the ordered notification stream across concurrent portal updates."""
+    current_events = (
+        current_snapshot.get("notificationEvents")
+        if isinstance(current_snapshot, dict)
+        and isinstance(current_snapshot.get("notificationEvents"), list)
+        else []
+    )
+    next_events = (
+        next_snapshot.get("notificationEvents")
+        if isinstance(next_snapshot.get("notificationEvents"), list)
+        else []
+    )
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for event in [*current_events, *next_events]:
+        if not isinstance(event, dict):
+            continue
+        event_id = event.get("id")
+        segments = event.get("segments")
+        if not isinstance(event_id, str) or not event_id or event_id in seen_ids:
+            continue
+        if not isinstance(segments, list) or not segments:
+            continue
+        seen_ids.add(event_id)
+        merged.append(event)
+
+    merged.sort(key=lambda event: (int(event.get("createdAt") or 0), str(event.get("id") or "")))
+    next_snapshot["notificationEvents"] = merged[-100:]
+
+
+def is_merge_safe_snapshot_operation(operation: dict[str, Any]) -> bool:
+    category = operation.get("category")
+    action = str(operation.get("action") or "")
+    return (
+        (category == "lineup" and action == "ready")
+        or (category == "pause" and action.startswith("score_team_"))
+        or action == "interactive_random_submitted"
+        or (category == "notice" and action == "acknowledged")
+    )
+
+
+def merge_conflicting_snapshot_unlocked(
+    current_snapshot: Any,
+    next_snapshot: dict[str, Any],
+    portal_code: str,
+    operation: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge only the actor-owned field when two clients submit from the same version."""
+    if not isinstance(current_snapshot, dict):
+        return next_snapshot
+    side = ROOM_ROLES.get(portal_code, {}).get("side")
+    if side not in {"left", "right"}:
+        return deepcopy(current_snapshot)
+
+    merged = deepcopy(current_snapshot)
+    category = operation.get("category")
+    action = str(operation.get("action") or "")
+
+    if category == "lineup" and action == "ready":
+        current_lineup = merged.get("lineupSelectorState")
+        incoming_lineup = next_snapshot.get("lineupSelectorState")
+        if not isinstance(current_lineup, dict) or not isinstance(incoming_lineup, dict):
+            return merged
+        if current_lineup.get("mapIndex") != incoming_lineup.get("mapIndex"):
+            return merged
+        incoming_values = incoming_lineup.get("values")
+        incoming_ready = incoming_lineup.get("ready")
+        if isinstance(incoming_values, dict) and isinstance(incoming_values.get(side), dict):
+            current_lineup.setdefault("values", {})[side] = deepcopy(incoming_values[side])
+        if isinstance(incoming_ready, dict):
+            current_lineup.setdefault("ready", {})[side] = bool(incoming_ready.get(side))
+        return merged
+
+    if category == "pause" and action.startswith("score_team_"):
+        current_score = merged.get("scoreSelectorState")
+        incoming_score = next_snapshot.get("scoreSelectorState")
+        if not isinstance(current_score, dict) or not isinstance(incoming_score, dict):
+            return merged
+        if current_score.get("mapIndex") != incoming_score.get("mapIndex"):
+            return merged
+        incoming_pauses = incoming_score.get("teamPauses")
+        if isinstance(incoming_pauses, dict) and isinstance(incoming_pauses.get(side), dict):
+            current_score.setdefault("teamPauses", {})[side] = deepcopy(incoming_pauses[side])
+        pauses = current_score.get("teamPauses") if isinstance(current_score.get("teamPauses"), dict) else {}
+        active_entries = [
+            value for value in pauses.values()
+            if isinstance(value, dict) and value.get("active")
+        ]
+        if not active_entries:
+            current_score["countdownPauseStartedAt"] = None
+        elif not isinstance(current_score.get("countdownPauseStartedAt"), (int, float)):
+            starts = [value.get("startedAt") for value in active_entries if isinstance(value.get("startedAt"), (int, float))]
+            current_score["countdownPauseStartedAt"] = min(starts) if starts else None
+        return merged
+
+    if action == "interactive_random_submitted":
+        current_random = merged.get("interactiveRandomState")
+        incoming_random = next_snapshot.get("interactiveRandomState")
+        if not isinstance(current_random, dict) or not isinstance(incoming_random, dict):
+            return merged
+        if (
+            current_random.get("purpose") != incoming_random.get("purpose")
+            or current_random.get("mapIndex") != incoming_random.get("mapIndex")
+        ):
+            return merged
+        incoming_choices = incoming_random.get("choices")
+        if isinstance(incoming_choices, dict):
+            current_random.setdefault("choices", {})[side] = incoming_choices.get(side)
+        choices = current_random.get("choices") if isinstance(current_random.get("choices"), dict) else {}
+        if choices.get("left") in {0, 1} and choices.get("right") in {0, 1}:
+            resolved_side = "left" if (choices["left"] ^ choices["right"]) == 0 else "right"
+            current_random["resolvedSide"] = resolved_side
+            incoming_results = next_snapshot.get("interactiveRandomResults")
+            if isinstance(incoming_results, dict):
+                merged["interactiveRandomResults"] = deepcopy(incoming_results)
+        return merged
+
+    if category == "notice" and action == "acknowledged":
+        current_notice = merged.get("teamAckNotice")
+        if not isinstance(current_notice, dict):
+            return merged
+        current_notice.setdefault("acknowledged", {})[side] = True
+        if all(bool(current_notice["acknowledged"].get(candidate)) for candidate in ("left", "right")):
+            merged["teamAckNotice"] = None
+        return merged
+
+    return merged
+
+
+def snapshot_progress_key(snapshot: Any) -> tuple[int, int, int]:
+    """Return a monotonic BP-stage key so an old full snapshot cannot rewind a room."""
+    if not isinstance(snapshot, dict):
+        return (-1, -1, -1)
+    state = snapshot.get("currentState") if isinstance(snapshot.get("currentState"), dict) else {}
+    maps = state.get("maps") if isinstance(state.get("maps"), list) else []
+    completed_count = 0
+    for item in maps:
+        if isinstance(item, dict) and item.get("status") == "completed":
+            completed_count += 1
+        else:
+            break
+
+    stages: list[tuple[str, int]] = [
+        ("mapSelectorState", 1),
+        ("sideSelectorState", 2),
+        ("lineupSelectorState", 3),
+        ("banSelectorState", 4),
+        ("scoreSelectorState", 7),
+        ("restState", 8),
+    ]
+    for field, rank in stages:
+        value = snapshot.get(field)
+        if not isinstance(value, dict) or not value.get("open"):
+            continue
+        map_index = value.get("targetMapIndex") if field == "mapSelectorState" else value.get("mapIndex")
+        if not isinstance(map_index, int):
+            map_index = completed_count
+        if field == "banSelectorState":
+            rank += {"order-choice": 0, "first-ban": 1, "second-ban": 2}.get(value.get("step"), 0)
+        if field == "restState" and 0 <= map_index < len(maps):
+            item = maps[map_index]
+            if isinstance(item, dict) and item.get("status") != "completed":
+                rank = 0
+        return (completed_count, map_index, rank)
+
+    return (completed_count, completed_count, 9 if completed_count else 0)
 
 
 def build_initial_history_document(room: dict[str, Any]) -> dict[str, Any]:
@@ -1327,6 +2110,14 @@ def get_client_ip() -> str:
     return request.remote_addr or "unknown"
 
 
+def unlimited_create_hash() -> str:
+    return os.environ.get("OW_UNLIMITED_CREATE_HASH") or DEFAULT_UNLIMITED_CREATE_HASH
+
+
+def is_unlimited_create_hash(value: str) -> bool:
+    return secrets.compare_digest(value, unlimited_create_hash())
+
+
 def prune_creation_window_unlocked(store: dict[str, Any], client_ip: str, now: int) -> list[int]:
     create_log = store.setdefault("createLog", {})
     window_start = now - 3600
@@ -1422,7 +2213,9 @@ def format_room_links(room: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def format_room_token_payload(room: dict[str, Any], portal_code: str) -> dict[str, Any]:
+def format_room_token_payload(
+    room: dict[str, Any], portal_code: str, notification_duration_seconds: Any = None
+) -> dict[str, Any]:
     config_state = ensure_room_config_unlocked(room)
     return {
         "room": {
@@ -1432,8 +2225,15 @@ def format_room_token_payload(room: dict[str, Any], portal_code: str) -> dict[st
             "closedAt": None,
             "settings": room.get("settings"),
             "config": config_state,
+            "presence": format_room_presence(room),
         },
         "portal": {"code": portal_code, **ROOM_ROLES[portal_code]},
+        "notificationDurationSeconds": clamp_int(
+            notification_duration_seconds,
+            1,
+            300,
+            DEFAULT_GLOBAL_SETTINGS["notificationDurationSeconds"],
+        ),
         "version": room.get("version", 0),
         "snapshot": room.get("snapshot"),
     }
@@ -1557,43 +2357,110 @@ def build_match_state(room_code: str) -> dict[str, Any]:
 
 
 def build_maps_catalog() -> dict[str, Any]:
-    assets = load_assets()
-    maps = assets.get("maps", {})
-
-    return {
-        "modes": assets.get("modes") or list(maps.keys()),
-        "modeIcons": assets.get("modeIcons", {}),
-        "maps": maps,
-        "heroes": assets.get("heroes", []),
-    }
+    return catalog_data.build_catalog_response(
+        ASSETS_DATA_PATH,
+        BUNDLED_TRANSLATION_PATH,
+        RUNTIME_CATALOG_DIR,
+    )
 
 
-def refresh_static_assets() -> None:
-    if os.environ.get("OW_REFRESH_ASSETS_ON_STARTUP", "").lower() not in {"1", "true", "yes"}:
-        return
+def is_global_admin_hash_valid(admin_hash: str) -> bool:
+    with room_store_lock:
+        store = load_room_store_unlocked()
+        return is_admin_hash_valid_unlocked(store, admin_hash)
 
-    if not ASSET_SCRIPT_PATH.exists():
-        return
+
+def current_catalog_refresh_job_unlocked() -> dict[str, Any] | None:
+    if active_catalog_refresh_job_id is None:
+        return None
+    job = catalog_refresh_jobs.get(active_catalog_refresh_job_id)
+    return deepcopy(job) if job else None
+
+
+def start_catalog_refresh_job() -> tuple[dict[str, Any], bool]:
+    global active_catalog_refresh_job_id
+
+    with catalog_refresh_lock:
+        current = current_catalog_refresh_job_unlocked()
+        if current and current.get("status") in {"queued", "running"}:
+            return current, False
+
+        job_id = secrets.token_hex(12)
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "message": "任务已进入队列",
+            "createdAt": current_timestamp(),
+            "startedAt": None,
+            "finishedAt": None,
+            "error": None,
+            "result": None,
+        }
+        catalog_refresh_jobs[job_id] = job
+        active_catalog_refresh_job_id = job_id
+
+    thread = threading.Thread(
+        target=run_catalog_refresh_job,
+        args=(job_id,),
+        name=f"catalog-refresh-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return deepcopy(job), True
+
+
+def run_catalog_refresh_job(job_id: str) -> None:
+    global active_catalog_refresh_job_id
+
+    def report(stage: str, percent: int, message: str) -> None:
+        with catalog_refresh_lock:
+            job = catalog_refresh_jobs[job_id]
+            job.update({"status": "running", "stage": stage, "progress": percent, "message": message})
+
+    with catalog_refresh_lock:
+        catalog_refresh_jobs[job_id].update(
+            {"status": "running", "startedAt": current_timestamp(), "message": "正在连接 Fandom"}
+        )
 
     try:
-        result = subprocess.run(
-            [sys.executable, str(ASSET_SCRIPT_PATH)],
-            cwd=ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
+        assets = catalog_data.refresh_runtime_catalog(RUNTIME_CATALOG_DIR, report)
+        result = {
+            "counts": {
+                "modes": len(assets.get("modes", [])),
+                "maps": sum(len(items) for items in assets.get("maps", {}).values()),
+                "heroes": len(assets.get("heroes", [])),
+            },
+            "catalogHash": catalog_data.compute_catalog_hash(assets),
+            "translationTemplate": catalog_data.build_translation_template(assets),
+        }
+        with catalog_refresh_lock:
+            catalog_refresh_jobs[job_id].update(
+                {
+                    "status": "completed",
+                    "stage": "completed",
+                    "progress": 100,
+                    "message": "英文目录更新完成",
+                    "finishedAt": current_timestamp(),
+                    "result": result,
+                }
+            )
     except Exception as exc:
-        print(f"Asset refresh skipped: {exc}")
-        return
-
-    if result.stdout:
-        print(result.stdout.strip())
-    if result.returncode != 0:
-        print(result.stderr.strip())
-        print(f"Asset refresh exited with {result.returncode}; continuing with cached data.")
-
+        with catalog_refresh_lock:
+            catalog_refresh_jobs[job_id].update(
+                {
+                    "status": "failed",
+                    "stage": "failed",
+                    "message": "更新失败，已保留上一版目录",
+                    "finishedAt": current_timestamp(),
+                    "error": str(exc),
+                }
+            )
+    finally:
+        with catalog_refresh_lock:
+            if active_catalog_refresh_job_id == job_id:
+                active_catalog_refresh_job_id = job_id
 
 
 def load_settings_preset() -> dict[str, Any]:
@@ -1607,9 +2474,9 @@ def load_settings_preset() -> dict[str, Any]:
     return {"presets": {}, "last": None}
 
 def load_assets() -> dict[str, Any]:
-    if ASSETS_DATA_PATH.exists():
-        with ASSETS_DATA_PATH.open(encoding="utf-8") as file:
-            return json.load(file)
+    assets, _source = catalog_data.load_catalog_assets(ASSETS_DATA_PATH, RUNTIME_CATALOG_DIR)
+    if assets:
+        return assets
 
     if not MAPS_DATA_PATH.exists():
         return {}
@@ -1662,7 +2529,6 @@ def normalize_key(value: str) -> str:
     return "".join(character.lower() for character in stripped if character.isalnum())
 
 
-refresh_static_assets()
 initialize_room_store()
 app = create_app()
 

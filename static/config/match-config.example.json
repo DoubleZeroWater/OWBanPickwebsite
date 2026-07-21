@@ -9,6 +9,8 @@
       "right": "红色方"
     },
     "matchFormat": "ft3",
+    "startWithDefaultConfig": false,
+    "teamsCanEditOwnName": false,
     "stageCount": 7,
     "checkpoints": [
       {
@@ -82,11 +84,16 @@
     "fixedFirstMapName": "",
     "firstMapPickerPolicy": "interactive_random",
     "mapPickerPolicy": "loser_choose",
+    "mapTimeoutPolicy": "warn_extend_30",
+    "symmetricSideChoiceEnabled": false,
+    "sideChoicePickerPolicy": "previous_loser",
     "rosterMode": "free_input",
+    "lineupTimeoutPolicy": "warn_extend_30",
     "presetRosterText": "蓝色方: Blue1,Blue2,Blue3,Blue4,Blue5\n红色方: Red1,Red2,Red3,Red4,Red5",
     "banEnabled": true,
     "firstBanPolicy": "allow_loser_choose",
     "openingSidePolicy": "random",
+    "banTimeoutPolicy": "warn_extend_30",
     "scoreReportMode": "team_submit_opponent_confirm"
   }
 }

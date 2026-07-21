@@ -17,6 +17,16 @@ ROSTER_MODES = {"free_input", "preset_only", "skip"}
 FIRST_BAN_POLICIES = {"allow_loser_choose", "loser_must_first"}
 SIDE_POLICIES = {"random", "interactive_random", "left", "right"}
 SCORE_REPORT_MODES = {"admin_only", "team_submit_opponent_confirm"}
+MAP_TIMEOUT_POLICIES = {"warn_extend_30", "random_legal_map", "forfeit_map", "admin_decision"}
+LINEUP_TIMEOUT_POLICIES = {"warn_extend_30", "forfeit_map", "admin_decision"}
+BAN_TIMEOUT_POLICIES = {"warn_extend_30", "random_legal_ban", "forfeit_map", "admin_decision"}
+SIDE_CHOICE_PICKER_POLICIES = {
+    "previous_winner",
+    "previous_loser",
+    "opening_winner",
+    "interactive_random",
+    "random",
+}
 CHECKPOINT_KEYS = (
     "preCountdown",
     "mapPick",
@@ -40,6 +50,8 @@ MATCH_CONFIG_KEYS = {
     "matchName",
     "teams",
     "matchFormat",
+    "startWithDefaultConfig",
+    "teamsCanEditOwnName",
     "stageCount",
     "checkpoints",
     "stageLimits",
@@ -52,11 +64,16 @@ MATCH_CONFIG_KEYS = {
     "fixedFirstMapName",
     "firstMapPickerPolicy",
     "mapPickerPolicy",
+    "mapTimeoutPolicy",
+    "symmetricSideChoiceEnabled",
+    "sideChoicePickerPolicy",
     "rosterMode",
     "presetRosterText",
+    "lineupTimeoutPolicy",
     "banEnabled",
     "firstBanPolicy",
     "openingSidePolicy",
+    "banTimeoutPolicy",
     "scoreReportMode",
 }
 
@@ -74,6 +91,8 @@ def default_match_config() -> dict[str, Any]:
         "matchName": "OW Ban Pick Invitational",
         "teams": {"left": "蓝色方", "right": "红色方"},
         "matchFormat": match_format,
+        "startWithDefaultConfig": False,
+        "teamsCanEditOwnName": False,
         "stageCount": stage_count,
         "checkpoints": create_default_checkpoints(stage_count),
         "stageLimits": {
@@ -98,14 +117,19 @@ def default_match_config() -> dict[str, Any]:
         "modeOrder": ["Control", "Push", "Hybrid", "Escort", "Flashpoint", "Control", "Push"],
         "fixedMapOrderText": "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa\nIlios\nRunasapi",
         "fixedFirstMapEnabled": False,
-        "fixedFirstMapName": "",
+        "fixedFirstMapName": "Antarctic Peninsula",
         "firstMapPickerPolicy": "random",
         "mapPickerPolicy": "loser_choose",
+        "mapTimeoutPolicy": "warn_extend_30",
+        "symmetricSideChoiceEnabled": False,
+        "sideChoicePickerPolicy": "previous_loser",
         "rosterMode": "free_input",
         "presetRosterText": "蓝色方: A1,A2,A3,A4,A5\n红色方: B1,B2,B3,B4,B5",
         "banEnabled": True,
+        "lineupTimeoutPolicy": "warn_extend_30",
         "firstBanPolicy": "allow_loser_choose",
         "openingSidePolicy": "random",
+        "banTimeoutPolicy": "warn_extend_30",
         "scoreReportMode": "team_submit_opponent_confirm",
     }
 
@@ -151,6 +175,12 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
         errors.append({"path": "stageCount", "message": f"{match_format} 的 stageCount 必须是 {stage_count}"})
     result["matchFormat"] = match_format
     result["stageCount"] = stage_count
+    result["startWithDefaultConfig"] = _bool_value(
+        source, "startWithDefaultConfig", result["startWithDefaultConfig"], errors
+    )
+    result["teamsCanEditOwnName"] = _bool_value(
+        source, "teamsCanEditOwnName", result["teamsCanEditOwnName"], errors
+    )
 
     match_name = source.get("matchName", result["matchName"])
     if not isinstance(match_name, str) or not match_name.strip() or len(match_name.strip()) > 120:
@@ -230,6 +260,28 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
     result["firstMapPickerPolicy"] = _side_policy_value(source, "firstMapPickerPolicy", result, errors)
     result["mapPickerPolicy"] = _enum_value(
         source, "mapPickerPolicy", {"loser_choose"}, result, errors
+    )
+    result["mapTimeoutPolicy"] = _enum_value(
+        source, "mapTimeoutPolicy", MAP_TIMEOUT_POLICIES, result, errors
+    )
+    result["symmetricSideChoiceEnabled"] = _bool_value(
+        source,
+        "symmetricSideChoiceEnabled",
+        result["symmetricSideChoiceEnabled"],
+        errors,
+    )
+    result["sideChoicePickerPolicy"] = _enum_value(
+        source,
+        "sideChoicePickerPolicy",
+        SIDE_CHOICE_PICKER_POLICIES,
+        result,
+        errors,
+    )
+    result["lineupTimeoutPolicy"] = _enum_value(
+        source, "lineupTimeoutPolicy", LINEUP_TIMEOUT_POLICIES, result, errors
+    )
+    result["banTimeoutPolicy"] = _enum_value(
+        source, "banTimeoutPolicy", BAN_TIMEOUT_POLICIES, result, errors
     )
     result["scoreReportMode"] = _enum_value(
         source, "scoreReportMode", SCORE_REPORT_MODES, result, errors
