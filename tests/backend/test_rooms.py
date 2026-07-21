@@ -733,6 +733,48 @@ class RoomPersistenceTests(unittest.TestCase):
         with self.assertRaises(room_app.MatchConfigValidationError):
             room_app.normalize_match_config(invalid_order, room_app.load_assets().get("maps", {}))
 
+    def test_side_choice_settings_split_first_and_subsequent_maps(self) -> None:
+        config = room_app.default_match_config()
+        config["firstSideChoicePolicy"] = "left_attack"
+        config["subsequentSideChoicePolicy"] = "previous_winner"
+        config["openingSidePolicy"] = "follow_map_picker"
+        normalized = room_app.normalize_match_config(config, room_app.load_assets().get("maps", {}))
+        self.assertEqual(normalized["firstSideChoicePolicy"], "left_attack")
+        self.assertEqual(normalized["subsequentSideChoicePolicy"], "previous_winner")
+        self.assertEqual(normalized["openingSidePolicy"], "follow_map_picker")
+
+        no_first_side_choice = room_app.default_match_config()
+        no_first_side_choice["firstSideChoicePolicy"] = "none"
+        normalized_none = room_app.normalize_match_config(
+            no_first_side_choice,
+            room_app.load_assets().get("maps", {}),
+        )
+        self.assertEqual(normalized_none["firstSideChoicePolicy"], "none")
+
+        legacy = room_app.default_match_config()
+        legacy.pop("firstSideChoicePolicy")
+        legacy.pop("subsequentSideChoicePolicy")
+        legacy["sideChoicePickerPolicy"] = "previous_winner"
+        migrated = room_app.normalize_match_config(legacy, room_app.load_assets().get("maps", {}))
+        self.assertEqual(migrated["firstSideChoicePolicy"], "map_picker")
+        self.assertEqual(migrated["subsequentSideChoicePolicy"], "previous_winner")
+
+        invalid_fixed = room_app.default_match_config()
+        invalid_fixed["fixedFirstMapEnabled"] = True
+        invalid_fixed["firstSideChoicePolicy"] = "map_picker"
+        with self.assertRaises(room_app.MatchConfigValidationError):
+            room_app.normalize_match_config(invalid_fixed, room_app.load_assets().get("maps", {}))
+
+        invalid_fixed_opening_ban = room_app.default_match_config()
+        invalid_fixed_opening_ban["fixedFirstMapEnabled"] = True
+        invalid_fixed_opening_ban["firstSideChoicePolicy"] = "left"
+        invalid_fixed_opening_ban["openingSidePolicy"] = "follow_map_picker"
+        with self.assertRaises(room_app.MatchConfigValidationError):
+            room_app.normalize_match_config(
+                invalid_fixed_opening_ban,
+                room_app.load_assets().get("maps", {}),
+            )
+
     def test_room_config_requires_admin_and_locks_until_destructive_rollback(self) -> None:
         room = self.create_room()
         admin_token = room["links"]["C"]["hash"]

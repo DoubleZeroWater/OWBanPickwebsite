@@ -21,10 +21,11 @@ type OverlayKind = "map" | "side" | "lineup" | "ban" | "score" | "rest";
 type CheckpointKey = keyof SettingsState["checkpoints"][number];
 type MatchFormat = "ft2" | "ft3" | "ft4";
 type SidePolicy = "random" | "interactive_random" | "left" | "right";
-type OpeningSidePolicy = SidePolicy;
+type OpeningSidePolicy = SidePolicy | "follow_map_picker";
 type FirstMapPickerPolicy = SidePolicy;
 type MapPickerPolicy = "loser_choose";
-type SideChoicePickerPolicy = "previous_winner" | "previous_loser" | "opening_winner" | "interactive_random" | "random";
+type FirstSideChoicePolicy = "none" | "map_picker" | "left" | "right" | "left_attack" | "left_defense";
+type SubsequentSideChoicePolicy = "previous_winner" | "previous_loser";
 type MapTimeoutPolicy = "warn_extend_30" | "random_legal_map" | "forfeit_map" | "admin_decision";
 type LineupTimeoutPolicy = "warn_extend_30" | "forfeit_map" | "admin_decision";
 type BanTimeoutPolicy = "warn_extend_30" | "random_legal_ban" | "forfeit_map" | "admin_decision";
@@ -114,7 +115,8 @@ interface SettingsState {
   mapPickerPolicy: MapPickerPolicy;
   mapTimeoutPolicy: MapTimeoutPolicy;
   symmetricSideChoiceEnabled: boolean;
-  sideChoicePickerPolicy: SideChoicePickerPolicy;
+  firstSideChoicePolicy: FirstSideChoicePolicy;
+  subsequentSideChoicePolicy: SubsequentSideChoicePolicy;
   rosterMode: PlayerInputMode;
   presetRosterText: string;
   lineupTimeoutPolicy: LineupTimeoutPolicy;
@@ -339,6 +341,7 @@ interface SharedRoomSnapshot {
   lineupSelectorState: LineupSelectorState | null;
   banSelectorState: BanSelectorState | null;
   scoreSelectorState: ScoreSelectorState | null;
+  matchTeamPauseTotals?: Record<Side, number>;
   restState: RestState | null;
   pauseState: PauseState;
   teamAckNotice: TeamAckNotice | null;
@@ -520,7 +523,8 @@ const defaultSettings: SettingsState = {
   mapPickerPolicy: "loser_choose",
   mapTimeoutPolicy: "warn_extend_30",
   symmetricSideChoiceEnabled: false,
-  sideChoicePickerPolicy: "previous_loser",
+  firstSideChoicePolicy: "map_picker",
+  subsequentSideChoicePolicy: "previous_loser",
   rosterMode: "free_input",
   presetRosterText: "蓝色方: A1,A2,A3,A4,A5\n红色方: B1,B2,B3,B4,B5",
   banEnabled: true,
@@ -567,20 +571,20 @@ let sideSelectorState: SideSelectorState | null = null;
 let lineupSelectorState: LineupSelectorState | null = null;
 let banSelectorState: BanSelectorState | null = null;
 let scoreSelectorState: ScoreSelectorState | null = null;
+let matchTeamPauseTotals: Record<Side, number> = { left: 0, right: 0 };
 let selectionConfirmationState: SelectionConfirmationState | null = null;
 let restState: RestState | null = null;
 let pauseState: PauseState = { active: false, startedAt: null, totalPausedMs: 0, matchTotalPausedMs: 0, collapsed: false };
-let teamAckNotice: TeamAckNotice | null = null;
 let hiddenOverlay: OverlayKind | null = null;
 let adminNotice: string | null = null;
-let syncNotice: string | null = null;
-let openingSide: Side = resolveOpeningSide();
 let firstMapPickerSide: Side = resolveSidePolicy(defaultSettings.firstMapPickerPolicy);
+let openingSide: Side = resolveOpeningSide();
 let interactiveRandomState: InteractiveRandomState | null = null;
 let interactiveRandomResults: Partial<Record<string, Side>> = {};
 let confirmedLineups: ConfirmedLineups = {};
 let localLineupDrafts: Record<number, Partial<Record<Side, Record<string, string>>>> = {};
 let localScoreDraft: { mapIndex: number; values: Record<Side, string> } | null = null;
+const INTERACTIVE_RANDOM_RESULT_SECONDS = 3;
 let countdownStartedAt = Date.now();
 let countdownStartSeconds = defaultSettings.stageLimits.mapSelectSeconds;
 let countdownTimerId: number | null = null;
@@ -837,7 +841,7 @@ function createStageEntryNotifications(offset: number): MatchNotificationEvent[]
     const event = createRightNotification(
       sideSelectorState.pickerSide,
       sideChoiceRightLabel(sideSelectorState.mapIndex),
-      settingsState.sideChoicePickerPolicy,
+      sideSelectorState.mapIndex === 0 ? settingsState.firstSideChoicePolicy : settingsState.subsequentSideChoicePolicy,
       offset + events.length,
     );
     if (event) events.push(event);
@@ -865,10 +869,10 @@ function createNotificationEventsForOperation(operation: RoomOperation): MatchNo
           : "双方准备就绪，管理员开始了比赛",
     )]);
     const firstMap = currentState.maps[0];
-    if (firstMap?.nameEn && (settingsState.fixedFirstMapEnabled || settingsState.mapSelectionMode === "fixed_map_order")) {
+    if (!restState?.open && firstMap?.nameEn && (settingsState.fixedFirstMapEnabled || settingsState.mapSelectionMode === "fixed_map_order")) {
       add([textSegment("本张地图为固定地图"), strongSegment(getMapNameZh(firstMap.nameEn))]);
       events.push(...createStageEntryNotifications(events.length));
-    } else {
+    } else if (!restState?.open) {
       const rightEvent = createRightNotification(
         firstMapPickerSide,
         "选图权",
@@ -876,6 +880,26 @@ function createNotificationEventsForOperation(operation: RoomOperation): MatchNo
         events.length,
       );
       if (rightEvent) events.push(rightEvent);
+    }
+  }
+
+  if (category === "room" && action === "stage_restored") {
+    const checkpointKey = String(details.checkpoint ?? "") as CheckpointKey;
+    const checkpointLabel = settingsState.checkpoints[mapIndex]?.[checkpointKey]?.label?.trim() || "未知";
+    const stageLabel = `MAP ${mapIndex + 1}：${checkpointLabel}${checkpointLabel.endsWith("阶段") ? "" : "阶段"}`;
+    add([textSegment("管理员将比赛回退到了"), strongSegment(stageLabel)]);
+  }
+
+  if (category === "room" && action === "interactive_random_continued") {
+    const purpose = String(details.purpose ?? "");
+    if (purpose === "opening_ban" && banSelectorState) {
+      const event = createRightNotification(
+        banSelectorState.chooserSide,
+        banRightLabel(),
+        "direct",
+        events.length,
+      );
+      if (event) events.push(event);
     }
   }
 
@@ -898,6 +922,17 @@ function createNotificationEventsForOperation(operation: RoomOperation): MatchNo
     if (fixedMap?.nameEn && (settingsState.fixedFirstMapEnabled || settingsState.mapSelectionMode === "fixed_map_order")) {
       add([textSegment("本张地图为固定地图"), strongSegment(getMapNameZh(fixedMap.nameEn))]);
       events.push(...createStageEntryNotifications(events.length));
+    } else {
+      const nextPickerSide = (details.pickerSide as Side | undefined)
+        ?? mapSelectorState?.pickerSide
+        ?? firstMapPickerSide;
+      const rightEvent = createRightNotification(
+        nextPickerSide,
+        "选图权",
+        "direct",
+        events.length,
+      );
+      if (rightEvent) events.push(rightEvent);
     }
   }
 
@@ -951,6 +986,22 @@ function createNotificationEventsForOperation(operation: RoomOperation): MatchNo
     }
   }
 
+  if (category === "ban" && action === "hero_confirmed") {
+    const side = details.side as Side;
+    const heroName = getHeroDisplayName(String(details.hero ?? ""));
+    const source = String(details.selectionSource ?? "manual");
+    if (source === "timeout_random") {
+      add([teamSegment(side), textSegment("英雄禁用选择超时，随机禁用了"), strongSegment(heroName)]);
+    } else if (source === "admin_random") {
+      add([textSegment("管理员为"), teamSegment(side), textSegment("随机禁用了"), strongSegment(heroName)]);
+    } else {
+      add([
+        ...(isAdminPortal() ? [textSegment("管理员为")] : []),
+        teamSegment(side), textSegment("禁用了"), strongSegment(heroName),
+      ]);
+    }
+  }
+
   if (["map", "ban", "lineup"].includes(category) && action === "timeout_extended") {
     const side = (details.side as Side | undefined) ?? (details.incompleteSide as Side | undefined);
     const subject = side ? [teamSegment(side)] : [strongSegment("双方队伍")];
@@ -984,6 +1035,12 @@ function createNotificationEventsForOperation(operation: RoomOperation): MatchNo
     const rightScore = Number(details.rightScore);
     if (leftScore !== rightScore) {
       add([teamSegment(leftScore > rightScore ? "left" : "right"), textSegment("本张地图获胜")]);
+    }
+    if (details.matchFinished === true) {
+      add([
+        teamSegment(currentState.teams.left.seriesScore > currentState.teams.right.seriesScore ? "left" : "right"),
+        textSegment("赢得本场比赛"),
+      ]);
     }
   }
 
@@ -1096,14 +1153,17 @@ function createSharedRoomSnapshot(): SharedRoomSnapshot {
     currentState,
     settingsState,
     confirmedLineups,
-    mapSelectorState,
-    sideSelectorState,
+    mapSelectorState: mapSelectorState ? { ...mapSelectorState, selectedMapKey: null } : null,
+    sideSelectorState: sideSelectorState ? { ...sideSelectorState, selectedSide: null } : null,
     lineupSelectorState,
-    banSelectorState,
+    banSelectorState: banSelectorState
+      ? { ...banSelectorState, selectedOrder: null, selectedHeroKey: null }
+      : null,
     scoreSelectorState,
+    matchTeamPauseTotals,
     restState,
     pauseState,
-    teamAckNotice,
+    teamAckNotice: null,
     adminNotice,
     openingSide,
     firstMapPickerSide,
@@ -1146,7 +1206,9 @@ async function pushServerSnapshot(snapshot: SharedRoomSnapshot, operation: RoomO
         applySharedRoomSnapshot(payload.snapshot as SharedRoomSnapshot);
       }
 
-      syncNotice = "比赛阶段已经更新，本次操作未生效。";
+      const conflictEvent = makeNotificationEvent([textSegment("比赛阶段已经更新，本次操作未生效。")]);
+      notificationEvents = [...notificationEvents, conflictEvent].slice(-100);
+      showNotification(conflictEvent);
       renderCurrent();
 
       return;
@@ -1155,9 +1217,19 @@ async function pushServerSnapshot(snapshot: SharedRoomSnapshot, operation: RoomO
     if (response.ok) {
       const payload = await response.json() as { version?: number; snapshot?: SharedRoomSnapshot };
       serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
-      syncNotice = null;
       if (payload.snapshot) {
         applySharedRoomSnapshot(payload.snapshot);
+      }
+
+      // Only the client that submitted the final concurrent lineup confirmation
+      // may advance the match. Observers must treat the merged snapshot as read-only;
+      // otherwise every team/admin client races to publish the same stage change.
+      if (
+        operation.category === "lineup"
+        && operation.action === "ready"
+        && isLineupReadyToFinalize()
+      ) {
+        finalizeLineupSelection();
       }
     }
   } finally {
@@ -1176,7 +1248,10 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
     return;
   }
 
+  const localMapState = mapSelectorState;
+  const localSideState = sideSelectorState;
   const localLineupState = lineupSelectorState;
+  const localBanState = banSelectorState;
   const localInteractiveRandomState = interactiveRandomState;
   const incomingLineupState = normalizeLineupSelectorState(snapshot.lineupSelectorState);
 
@@ -1187,11 +1262,21 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
     !snapshot.roomStarted && roomConfigState?.value ? roomConfigState.value : snapshot.settingsState,
   );
   confirmedLineups = snapshot.confirmedLineups ?? {};
-  mapSelectorState = snapshot.mapSelectorState;
-  sideSelectorState = snapshot.sideSelectorState ?? null;
+  mapSelectorState = snapshot.mapSelectorState
+    ? { ...snapshot.mapSelectorState, selectedMapKey: null }
+    : null;
+  sideSelectorState = snapshot.sideSelectorState
+    ? { ...snapshot.sideSelectorState, selectedSide: null }
+    : null;
   lineupSelectorState = incomingLineupState;
-  banSelectorState = snapshot.banSelectorState ?? null;
+  banSelectorState = snapshot.banSelectorState
+    ? { ...snapshot.banSelectorState, selectedOrder: null, selectedHeroKey: null }
+    : null;
   scoreSelectorState = normalizeScoreSelectorState(snapshot.scoreSelectorState);
+  matchTeamPauseTotals = {
+    left: Math.max(0, Number(snapshot.matchTeamPauseTotals?.left ?? 0)),
+    right: Math.max(0, Number(snapshot.matchTeamPauseTotals?.right ?? 0)),
+  };
   restState = snapshot.restState ?? null;
   pauseState = {
     active: Boolean(snapshot.pauseState?.active),
@@ -1200,7 +1285,6 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
     matchTotalPausedMs: snapshot.pauseState?.matchTotalPausedMs ?? snapshot.pauseState?.totalPausedMs ?? 0,
     collapsed: Boolean(snapshot.pauseState?.collapsed),
   };
-  teamAckNotice = isObsoleteRandomResultNotice(snapshot.teamAckNotice) ? null : snapshot.teamAckNotice ?? null;
   adminNotice = isObsoleteBanConfirmationNotice(snapshot.adminNotice) ? null : snapshot.adminNotice ?? null;
   openingSide = snapshot.openingSide ?? resolveOpeningSide();
   firstMapPickerSide = snapshot.firstMapPickerSide ?? resolveSidePolicy(settingsState.firstMapPickerPolicy);
@@ -1209,6 +1293,40 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
   countdownStartedAt = snapshot.countdownStartedAt;
   countdownStartSeconds = snapshot.countdownStartSeconds;
   ingestNotificationEvents(snapshot.notificationEvents ?? [], shouldRender);
+
+  if (
+    localMapState?.open
+    && mapSelectorState?.open
+    && localMapState.targetMapIndex === mapSelectorState.targetMapIndex
+    && (isAdminPortal() || portalConfig.side === mapSelectorState.pickerSide)
+  ) {
+    mapSelectorState.selectedMapKey = localMapState.selectedMapKey;
+  }
+
+  if (
+    localSideState?.open
+    && sideSelectorState?.open
+    && localSideState.mapIndex === sideSelectorState.mapIndex
+    && (isAdminPortal() || portalConfig.side === sideSelectorState.pickerSide)
+  ) {
+    sideSelectorState.selectedSide = localSideState.selectedSide;
+  }
+
+  if (
+    localBanState?.open
+    && banSelectorState?.open
+    && localBanState.mapIndex === banSelectorState.mapIndex
+    && localBanState.step === banSelectorState.step
+  ) {
+    const ownsBanDraft = isAdminPortal()
+      || (banSelectorState.step === "order-choice"
+        ? portalConfig.side === banSelectorState.chooserSide
+        : portalConfig.side === banSelectorState.activeSide);
+    if (ownsBanDraft) {
+      banSelectorState.selectedOrder = localBanState.selectedOrder;
+      banSelectorState.selectedHeroKey = localBanState.selectedHeroKey;
+    }
+  }
 
   if (
     localLineupState?.open
@@ -1240,11 +1358,6 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
         lineupSelectorState!.values[side] = { ...lineupSelectorState!.values[side], ...draft };
       }
     });
-  }
-
-  if (isLineupReadyToFinalize()) {
-    finalizeLineupSelection();
-    return;
   }
 
   if (
@@ -1326,7 +1439,6 @@ async function pullServerSnapshot(): Promise<void> {
     }
 
     serverSnapshotVersion = nextVersion;
-    syncNotice = null;
     applySharedRoomSnapshot(payload.snapshot);
   } finally {
     serverSnapshotPullInFlight = false;
@@ -1429,7 +1541,6 @@ async function loadInitialData(): Promise<void> {
       portalConfig = roomPayload.portal;
       notificationDurationSeconds = Math.max(1, Number(roomPayload.notificationDurationSeconds ?? 20));
       document.body.classList.toggle("room-admin-page-body", portalConfig.role === "admin");
-      document.body.classList.toggle("global-admin-page-body", portalConfig.role === "admin");
       serverSnapshotVersion = Number(roomPayload.version ?? 0);
       roomConfigState = roomPayload.room.config ?? null;
       roomPresence = roomPayload.room.presence ?? createDisconnectedPresence();
@@ -1487,13 +1598,13 @@ async function loadInitialData(): Promise<void> {
     lineupSelectorState = null;
     banSelectorState = null;
     scoreSelectorState = null;
+    matchTeamPauseTotals = { left: 0, right: 0 };
     restState = null;
     pauseState = { active: false, startedAt: null, totalPausedMs: 0, matchTotalPausedMs: 0, collapsed: false };
-    teamAckNotice = null;
     hiddenOverlay = null;
     adminNotice = null;
-    openingSide = resolveOpeningSide();
     firstMapPickerSide = resolveSidePolicy(settingsState.firstMapPickerPolicy);
+    openingSide = resolveOpeningSide();
     interactiveRandomState = null;
     interactiveRandomResults = {};
     confirmedLineups = {};
@@ -1538,15 +1649,13 @@ function renderCurrent(): void {
           <h1>${escapeHtml(currentState.matchName)}</h1>
           <span>${escapeHtml(getMatchFormatLabel(settingsState.matchFormat))}</span>
           <em class="match-phase-label">${roomStarted ? "比赛进行阶段" : roomConfigState?.status === "ready" ? "确认配置阶段" : "待配置阶段"}</em>
-          ${isAdminPortal() ? "" : `<b class="portal-badge portal-badge-${portalConfig.role}">${escapeHtml(portalConfig.label)}</b>`}
+          <b class="portal-badge portal-badge-${portalConfig.role}">${escapeHtml(portalConfig.label)}</b>
         </div>
         ${renderTeamHeader("right", currentState.teams.right)}
       </header>
       <section class="map-stack" aria-label="地图列表">
         ${getVisibleMaps(currentState).map(({ map, index }) => renderMapRow(map, index, currentState!.teams)).join("")}
       </section>
-      ${adminNotice ? `<div class="admin-notice">${escapeHtml(adminNotice)}</div>` : ""}
-      ${syncNotice ? `<div class="sync-notice" role="status">${escapeHtml(syncNotice)}</div>` : ""}
       ${renderPresenceBar()}
       ${roomStarted ? "" : renderStartGate()}
       ${canUseSettings() && (settingsPanelOpen || roomStarted) ? renderSettingsPanel() : ""}
@@ -1559,7 +1668,6 @@ function renderCurrent(): void {
       ${renderInteractiveRandomOverlay()}
       ${renderMinimizedOverlay()}
       ${renderPauseOverlay()}
-      ${renderTeamAckNotice()}
       ${renderSelectionConfirmation()}
     </main>
   `;
@@ -1574,7 +1682,6 @@ function renderCurrent(): void {
   bindRestEvents();
   bindInteractiveRandomEvents();
   bindPauseEvents();
-  bindTeamAckEvents();
   bindSelectionConfirmationEvents();
   bindOverlayNavigationEvents();
   bindSettingsEvents();
@@ -2850,8 +2957,8 @@ function renderModeStripItem(mode: string): string {
 
   return `
     <div class="mode-strip-item ${active ? "mode-strip-item-active" : ""} ${availableCount === 0 ? "mode-strip-item-locked" : ""}" data-mode="${escapeHtml(mode)}">
-      ${iconUrl ? `<img src="${iconUrl}" alt="${escapeHtml(getModeLabel(mode))}" />` : ""}
-      <span>${escapeHtml(getModeLabel(mode))}</span>
+      <span class="mode-strip-icon">${iconUrl ? `<img src="${iconUrl}" alt="${escapeHtml(getModeLabel(mode))}" />` : ""}</span>
+      <span class="mode-strip-label">${escapeHtml(getModeLabel(mode))}</span>
     </div>
   `;
 }
@@ -2993,10 +3100,6 @@ function renderLineupSelector(): string {
           ${renderLineupTeam("right")}
         </div>
         <footer class="lineup-selector-footer">
-          <div class="lineup-status">
-            <span>阵容规则</span>
-            <strong>${escapeHtml(getLineupStatusText())}</strong>
-          </div>
           <button class="confirm-lineup-pick" id="confirmLineupPick" type="button" ${canConfirm ? "" : "disabled"}>
             ${getLineupConfirmButtonLabel()}
           </button>
@@ -3031,7 +3134,7 @@ function renderLineupTeam(side: Side): string {
   return `
     <section class="lineup-team-card lineup-team-${side} ${editable ? "" : "lineup-team-readonly"} ${ready ? "lineup-team-ready" : ""}" aria-label="${escapeHtml(team?.name ?? "")} 上场成员">
       <header class="lineup-team-header">
-        <span>${side === "left" ? "蓝方" : "红方"}</span>
+        <span>${side === "left" ? "队伍1" : "队伍2"}</span>
         <h3>${escapeHtml(team?.name ?? "")}</h3>
         <b>${accessLabel}</b>
       </header>
@@ -3145,7 +3248,7 @@ function renderBanSelector(): string {
             <span>当前选择</span>
             <strong>${escapeHtml(getBanSelectionSummary())}</strong>
           </div>
-          ${banSelectorState.step === "order-choice" ? "" : `<button class="confirm-ban-pick" id="confirmBanPick" type="button" ${canConfirm ? "" : "disabled"}>${escapeHtml(getBanConfirmButtonLabel())}</button>`}
+          <button class="confirm-ban-pick" id="confirmBanPick" type="button" ${canConfirm ? "" : "disabled"}>${escapeHtml(getBanConfirmButtonLabel())}</button>
           ${renderAdminViolationControls("ban")}
         </footer>
       </div>
@@ -3206,7 +3309,7 @@ function renderBanLineupSide(side: Side): string {
     <aside class="ban-lineup-side ban-lineup-${side} ${active ? "ban-lineup-active" : ""}">
       <header>
         <div class="ban-lineup-heading">
-          <div><span>${side === "left" ? "蓝方阵容" : "红方阵容"}</span><h3>${escapeHtml(getTeamName(side))}</h3></div>
+          <div><span>${side === "left" ? "队伍1阵容" : "队伍2阵容"}</span><h3>${escapeHtml(getTeamName(side))}</h3></div>
           ${sideBan ? `<div class="ban-lineup-picked-hero"><img src="${sideBan.imageUrl}" alt="${escapeHtml(getHeroDisplayName(sideBan.nameEn))}" /><i class="ban-forbidden-icon"></i></div>` : orderLabel ? `<b class="ban-order-label">${orderLabel}</b>` : ""}
         </div>
       </header>
@@ -3233,7 +3336,8 @@ function renderHeroRoleColumn(role: string): string {
   return `
     <section class="hero-role-column hero-role-${normalizeKey(role)}" aria-label="${escapeHtml(label)}">
       <header>
-        <img class="hero-role-image" src="${getRoleHeaderImageUrl(role)}" alt="${escapeHtml(label)}" />
+        <img class="hero-role-image" src="${getRoleHeaderImageUrl(role)}" alt="" />
+        <h3>${escapeHtml(label)}</h3>
       </header>
       <div class="hero-grid">
         ${heroes.map((hero) => renderHeroOption(hero)).join("")}
@@ -3370,7 +3474,7 @@ function renderScoreRejectButton(): string {
     return "";
   }
 
-  return `<button class="reject-score-pick" id="rejectScorePick" type="button">不确认</button>`;
+  return `<button class="reject-score-pick" id="rejectScorePick" type="button">申诉错误比分</button>`;
 }
 
 function renderScoreInput(side: Side): string {
@@ -3454,26 +3558,6 @@ function renderPauseOverlay(): string {
   `;
 }
 
-function renderTeamAckNotice(): string {
-  if (!teamAckNotice || isAdminPortal() || isBroadcastPortal() || !portalConfig.side) {
-    return "";
-  }
-
-  if (teamAckNotice.acknowledged[portalConfig.side]) {
-    return "";
-  }
-
-  return `
-    <section class="team-ack-overlay" role="dialog" aria-modal="false" aria-label="比赛通知">
-      <div class="team-ack-panel">
-        <span>比赛通知</span>
-        <strong>${escapeHtml(teamAckNotice.message)}</strong>
-        <button id="ackTeamNotice" type="button">确认</button>
-      </div>
-    </section>
-  `;
-}
-
 function renderMinimizedOverlay(): string {
   const kind = getActiveOverlayKind();
 
@@ -3494,9 +3578,16 @@ function renderMinimizedOverlay(): string {
 }
 
 function renderSettingsPanel(): string {
+  const status = roomConfigState?.status ?? "draft";
   const locked = roomConfigState?.status === "locked";
-  if (locked) {
-    return `
+  const readOnly = status !== "draft";
+  const source = roomConfigState?.source.type === "preset"
+    ? `来自模板：${roomConfigState.source.presetName ?? roomConfigState.source.presetId ?? "未知模板"}`
+    : roomConfigState?.source.type === "json"
+      ? "来自 JSON 导入"
+      : "房间独立配置";
+  const liveControls = locked
+    ? `
       <section class="settings-panel admin-live-panel" aria-label="管理员入口">
         <div class="config-editor-heading">
           <div><h2>管理员入口</h2><p>比赛阶段控制与回退</p></div>
@@ -3511,36 +3602,27 @@ function renderSettingsPanel(): string {
           ${renderCheckpointRows()}
         </div>
       </section>
-    `;
-  }
-  const source = roomConfigState?.source.type === "preset"
-    ? `来自模板：${roomConfigState.source.presetName ?? roomConfigState.source.presetId ?? "未知模板"}`
-    : roomConfigState?.source.type === "json"
-      ? "来自 JSON 导入"
-      : "房间独立配置";
+    `
+    : "";
   return `
+    ${liveControls}
     <section class="settings-panel">
       <div class="config-editor-heading">
         <div>
           <h2>比赛配置</h2>
-          <p>${escapeHtml(source)}</p>
+          <p>${escapeHtml(source)}${readOnly ? " · 已确认，仅供查看" : ""}</p>
         </div>
       </div>
-      <div class="settings-actions settings-actions-top">
-        ${roomStarted ? `<span class="global-pause-total">全局累计暂停 ${formatGlobalPause()}</span><button id="toggleGlobalPause" type="button">${pauseState.active ? "恢复全局时间" : "全局暂停"}</button>` : ""}
-      </div>
-      ${roomStarted ? `<div class="checkpoint-table">${renderCheckpointRows()}</div>` : ""}
-      <fieldset class="config-editor-fields" ${locked ? "disabled" : ""}>
+      ${roomStarted && !locked ? `
+        <div class="settings-actions settings-actions-top">
+          <span class="global-pause-total">全局累计暂停 ${formatGlobalPause()}</span>
+          <button id="toggleGlobalPause" type="button">${pauseState.active ? "恢复全局时间" : "全局暂停"}</button>
+        </div>
+        <div class="checkpoint-table">${renderCheckpointRows()}</div>
+      ` : ""}
+      <fieldset class="config-editor-fields" ${readOnly ? "disabled" : ""}>
         ${renderRoomPresetChooser()}
         ${renderSharedConfigFields()}
-        <div class="settings-actions config-primary-actions">
-          <button id="saveRoomConfig" type="button">保存草稿</button>
-          <button id="confirmRoomConfig" class="start-match-button" type="button">确认配置</button>
-          ${roomConfigState?.status === "ready" ? `
-            <button id="startMatchFromSettings" class="start-match-button" type="button" ${areBothTeamsReady() ? "" : "disabled"}>开始比赛</button>
-            <button id="forceStartMatchFromSettings" class="force-start-button" type="button">管理员强制开始</button>
-          ` : ""}
-        </div>
       </fieldset>
     </section>
   `;
@@ -3569,9 +3651,8 @@ function renderInteractiveRandomOverlay(): string {
             <span class="selector-eyebrow">交互随机 · ${escapeHtml(purposeLabel)}</span>
             <h2>${resolved ? "计算结果已公布" : "双方分别选择 0 或 1"}</h2>
           </div>
-          ${resolved ? "" : `<div class="selector-header-actions"><strong>30 秒内选择，超时默认 0</strong></div>`}
         </header>
-        ${resolved ? "" : renderCountdownProgress("interactive-random-progress")}
+        ${renderCountdownProgress("interactive-random-progress")}
         <div class="interactive-random-teams">
           ${renderInteractiveRandomTeam("left")}
           <div class="interactive-random-xor" aria-hidden="true">XOR</div>
@@ -3580,7 +3661,7 @@ function renderInteractiveRandomOverlay(): string {
         <footer class="interactive-random-footer">
           ${resolved
             ? `<div class="interactive-random-result"><span>${leftChoice} XOR ${rightChoice} = ${leftChoice ^ rightChoice}</span><strong>${escapeHtml(getTeamName(state.resolvedSide!))}获得${state.purpose === "map_picker" ? "首次选图权" : state.purpose === "opening_ban" ? "禁用首次先手" : "攻防选择权"}</strong></div><button id="continueInteractiveRandom" type="button">继续</button>`
-            : `<p>双方选择互不公开，提交或倒计时结束后统一公布计算结果。</p>`}
+            : `<p>XOR 结果为 0 时，队伍1先选；为 1 时，队伍2先选。</p>`}
         </footer>
       </div>
     </section>
@@ -3736,7 +3817,8 @@ function initializeConfigEditorControls(): void {
     ["firstMapPickerPolicy", settingsState.firstMapPickerPolicy],
     ["mapPickerPolicy", settingsState.mapPickerPolicy],
     ["mapTimeoutPolicy", settingsState.mapTimeoutPolicy],
-    ["sideChoicePickerPolicy", settingsState.sideChoicePickerPolicy],
+    ["firstSideChoicePolicy", settingsState.firstSideChoicePolicy],
+    ["subsequentSideChoicePolicy", settingsState.subsequentSideChoicePolicy],
     ["rosterMode", settingsState.rosterMode],
     ["lineupTimeoutPolicy", settingsState.lineupTimeoutPolicy],
     ["firstBanPolicy", settingsState.firstBanPolicy],
@@ -3903,6 +3985,11 @@ function renderSharedConfigFields(): string {
           `<label class="admin-switch"><input id="teamsCanEditOwnName" type="checkbox" ${settingsState.teamsCanEditOwnName ? "checked" : ""} /><span></span><b>${settingsState.teamsCanEditOwnName ? "是" : "否"}</b></label>`,
         )}
         ${renderAdminSettingRow(
+          "以默认配置开始",
+          "开启后，两支队伍均准备完毕时自动使用当前房间配置开始比赛。",
+          `<label class="admin-switch"><input id="startWithDefaultConfig" type="checkbox" ${settingsState.startWithDefaultConfig ? "checked" : ""} /><span></span><b>${settingsState.startWithDefaultConfig ? "是" : "否"}</b></label>`,
+        )}
+        ${renderAdminSettingRow(
           "比赛赛制",
           "FT2、FT3、FT4 分别准备 5、7、9 个地图槽位，允许最多出现 2 场平局。",
           `<select id="matchFormat">
@@ -3916,11 +4003,6 @@ function renderSharedConfigFields(): string {
     <details class="settings-section admin-config-section" open>
       <summary>场间设置</summary>
       <div class="admin-setting-list">
-        ${renderAdminSettingRow(
-          "以默认配置开始",
-          "开启后，两支队伍均准备完毕时自动使用当前房间配置开始比赛。",
-          `<label class="admin-switch"><input id="startWithDefaultConfig" type="checkbox" ${settingsState.startWithDefaultConfig ? "checked" : ""} /><span></span><b>${settingsState.startWithDefaultConfig ? "是" : "否"}</b></label>`,
-        )}
         ${renderAdminSettingRow("准备时间", "比赛开始前的准备时间，单位为秒；设置为 0 则禁用。", `<input id="preStartRestSeconds" type="number" min="0" max="3600" value="${settingsState.stageLimits.preStartRestSeconds}" />`)}
         ${renderAdminSettingRow("场间时间", "每张地图结束后的间隔时间，单位为秒；设置为 0 则禁用。", `<input id="postMatchRestSeconds" type="number" min="0" max="3600" value="${settingsState.stageLimits.postMatchRestSeconds}" />`)}
       </div>
@@ -4026,14 +4108,23 @@ function renderMapSettingsPanel(): string {
           `<label class="admin-switch"><input id="symmetricSideChoiceEnabled" type="checkbox" ${settingsState.symmetricSideChoiceEnabled ? "checked" : ""} /><span></span><b>${settingsState.symmetricSideChoiceEnabled ? "已开启" : "已关闭"}</b></label>`,
         )}
         ${renderAdminSettingRow(
-          "攻防选择方",
-          "设置由哪一方决定本张地图的攻防或阵营。第一张地图没有上一张结果时，使用开场随机结果。",
-          `<select id="sideChoicePickerPolicy">
-            <option value="previous_winner">上一张地图胜者</option>
+          "第一张地图攻防选择方",
+          "设置首图由谁决定攻防或阵营；选择“无”会跳过首图攻防/阵营选择；使用固定首图时不能选择“第一张地图选择方”。",
+          `<select id="firstSideChoicePolicy">
+            <option value="none">无</option>
+            <option value="map_picker" ${settingsState.fixedFirstMapEnabled ? "disabled" : ""}>第一张地图选择方</option>
+            <option value="left">队伍1</option>
+            <option value="right">队伍2</option>
+            <option value="left_attack">队伍1进攻方 / 红色方（根据地图自适应）</option>
+            <option value="left_defense">队伍1防守方 / 蓝色方（根据地图自适应）</option>
+          </select>`,
+        )}
+        ${renderAdminSettingRow(
+          "后续地图攻防选择方",
+          "从第二张地图开始，根据上一张地图结果决定攻防或阵营选择权。",
+          `<select id="subsequentSideChoicePolicy">
             <option value="previous_loser">上一张地图败者</option>
-            <option value="opening_winner">开场随机胜者</option>
-            <option value="interactive_random">双方交互随机</option>
-            <option value="random">系统随机</option>
+            <option value="previous_winner">上一张地图胜者</option>
           </select>`,
         )}
       </div>
@@ -4111,6 +4202,7 @@ function renderScoreTeamPause(side: Side): string {
       <dl>
         <div><dt>本小局暂停次数</dt><dd>${teamPause.count}</dd></div>
         <div><dt>本小局累计暂停</dt><dd data-score-pause-total="${side}">${formatDurationMs(getTeamPauseTotalMs(side))}</dd></div>
+        <div><dt>全局累计暂停</dt><dd data-score-pause-match-total="${side}">${formatDurationMs(getMatchTeamPauseTotalMs(side))}</dd></div>
         <div><dt>本次暂停</dt><dd data-score-pause-current="${side}">${formatDurationMs(getTeamPauseCurrentMs(side))}</dd></div>
       </dl>
       <button type="button" data-score-pause-side="${side}" ${canControl ? "" : "disabled"}>${teamPause.active ? "取消暂停" : "暂停计时"}</button>
@@ -4138,15 +4230,25 @@ function renderSelectionConfirmation(): string {
   }
 
   const kind = selectionConfirmationState.kind;
-  const title = kind === "map" ? "确认选择地图" : kind === "lineup" ? "确认上场成员" : "确认禁用英雄";
+  const title = kind === "map"
+    ? "确认选择地图"
+    : kind === "lineup"
+      ? "确认上场成员"
+      : banSelectorState?.step === "order-choice"
+        ? "确认禁用顺序"
+        : "确认禁用英雄";
   let summary = "";
 
   if (kind === "map") {
     const choice = findMapChoiceByKey(mapSelectorState?.selectedMapKey ?? null);
     summary = choice ? `${getModeLabel(choice.mode)} · ${getDisplayMapName(choice.nameEn)}` : "尚未选择地图";
   } else if (kind === "ban") {
-    const hero = findHeroByKey(banSelectorState?.selectedHeroKey ?? null);
-    summary = hero ? getHeroDisplayName(hero.nameEn) : "尚未选择英雄";
+    if (banSelectorState?.step === "order-choice") {
+      summary = getBanSelectionSummary();
+    } else {
+      const hero = findHeroByKey(banSelectorState?.selectedHeroKey ?? null);
+      summary = hero ? getHeroDisplayName(hero.nameEn) : "尚未选择英雄";
+    }
   } else if (lineupSelectorState) {
     const sides = isAdminPortal() ? (["left", "right"] as Side[]) : portalConfig.side ? [portalConfig.side] : [];
     summary = sides.map((side) => {
@@ -4190,6 +4292,20 @@ function bindSelectionConfirmationEvents(): void {
 
 function renderSidePolicySelect(id: string, value: SidePolicy, disabled = false): string {
   return `<select id="${id}" ${disabled ? "disabled" : ""}>
+    <option value="random" ${value === "random" ? "selected" : ""}>系统随机</option>
+    <option value="interactive_random" ${value === "interactive_random" ? "selected" : ""}>交互随机</option>
+    <option value="left" ${value === "left" ? "selected" : ""}>队伍1先</option>
+    <option value="right" ${value === "right" ? "selected" : ""}>队伍2先</option>
+  </select>`;
+}
+
+function renderOpeningSidePolicySelect(
+  id: string,
+  value: OpeningSidePolicy,
+  followMapPickerDisabled = false,
+): string {
+  return `<select id="${id}">
+    <option value="follow_map_picker" ${value === "follow_map_picker" ? "selected" : ""} ${followMapPickerDisabled ? "disabled" : ""}>跟随地图选图权</option>
     <option value="random" ${value === "random" ? "selected" : ""}>系统随机</option>
     <option value="interactive_random" ${value === "interactive_random" ? "selected" : ""}>交互随机</option>
     <option value="left" ${value === "left" ? "selected" : ""}>队伍1先</option>
@@ -4288,8 +4404,12 @@ function renderBanRuleSettingsPanel(): string {
         )}
         ${renderAdminSettingRow(
           "禁用首次先手方",
-          "设置首次禁用时由哪一方先手。",
-          renderSidePolicySelect("openingSidePolicy", settingsState.openingSidePolicy),
+          "设置首次禁用时由哪一方先手；固定第一张地图时不能跟随地图选图权。",
+          renderOpeningSidePolicySelect(
+            "openingSidePolicy",
+            settingsState.openingSidePolicy,
+            settingsState.fixedFirstMapEnabled,
+          ),
         )}
         ${renderAdminSettingRow("先后禁用选择时间", "败者选择先后顺序的时间，单位为秒。", `<input id="firstBanChoiceSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanChoiceSeconds}" ${settingsState.firstBanPolicy === "allow_loser_choose" ? "" : "disabled"} />`)}
         ${renderAdminSettingRow("先手禁用时间", "先手方完成禁用的时间，单位为秒。", `<input id="firstBanActionSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.firstBanActionSeconds}" />`)}
@@ -4494,10 +4614,6 @@ function bindSideSelectorEvents(): void {
       sideSelectorState.selectedSide = button.dataset.sideChoice === "picker"
         ? sideSelectorState.pickerSide
         : getOppositeSide(sideSelectorState.pickerSide);
-      publishSharedRoomSnapshot(createRoomOperation("map", "side_choice_selected", {
-        mapIndex: sideSelectorState.mapIndex,
-        selectedSide: sideSelectorState.selectedSide,
-      }));
       renderCurrent();
     });
   });
@@ -4578,12 +4694,6 @@ function bindPauseEvents(): void {
   });
 }
 
-function bindTeamAckEvents(): void {
-  document.getElementById("ackTeamNotice")?.addEventListener("click", () => {
-    acknowledgeTeamNotice();
-  });
-}
-
 function bindOverlayNavigationEvents(): void {
   app.querySelectorAll<HTMLButtonElement>(".return-home-button").forEach((button) => {
     button.addEventListener("click", () => {
@@ -4623,7 +4733,7 @@ function bindSettingsEvents(): void {
   document.getElementById("toggleGlobalPause")?.addEventListener("click", toggleGlobalPause);
   bindCheckpointEvents();
 
-  if (roomConfigState?.status === "locked") {
+  if (roomConfigState?.status !== "draft") {
     return;
   }
 
@@ -4633,7 +4743,8 @@ function bindSettingsEvents(): void {
   const firstMapPickerPolicy = document.getElementById("firstMapPickerPolicy") as HTMLSelectElement | null;
   const mapPickerPolicy = document.getElementById("mapPickerPolicy") as HTMLSelectElement | null;
   const mapTimeoutPolicy = document.getElementById("mapTimeoutPolicy") as HTMLSelectElement | null;
-  const sideChoicePickerPolicy = document.getElementById("sideChoicePickerPolicy") as HTMLSelectElement | null;
+  const firstSideChoicePolicy = document.getElementById("firstSideChoicePolicy") as HTMLSelectElement | null;
+  const subsequentSideChoicePolicy = document.getElementById("subsequentSideChoicePolicy") as HTMLSelectElement | null;
   const rosterMode = document.getElementById("rosterMode") as HTMLSelectElement | null;
   const lineupTimeoutPolicy = document.getElementById("lineupTimeoutPolicy") as HTMLSelectElement | null;
   const firstBanPolicy = document.getElementById("firstBanPolicy") as HTMLSelectElement | null;
@@ -4673,8 +4784,11 @@ function bindSettingsEvents(): void {
     mapTimeoutPolicy.value = settingsState.mapTimeoutPolicy;
   }
 
-  if (sideChoicePickerPolicy) {
-    sideChoicePickerPolicy.value = settingsState.sideChoicePickerPolicy;
+  if (firstSideChoicePolicy) {
+    firstSideChoicePolicy.value = settingsState.firstSideChoicePolicy;
+  }
+  if (subsequentSideChoicePolicy) {
+    subsequentSideChoicePolicy.value = settingsState.subsequentSideChoicePolicy;
   }
 
   if (rosterMode) {
@@ -4719,8 +4833,6 @@ function bindSettingsEvents(): void {
     if (panel) panel.hidden = !panel.hidden;
   });
   document.getElementById("importRoomConfigJson")?.addEventListener("click", () => void importRoomConfigFromJson());
-  document.getElementById("saveRoomConfig")?.addEventListener("click", () => void saveRoomConfigDraft());
-  document.getElementById("confirmRoomConfig")?.addEventListener("click", () => void confirmRoomConfig());
   document.getElementById("startMatchFromSettings")?.addEventListener("click", () => void startRoomMatch(false));
   document.getElementById("forceStartMatchFromSettings")?.addEventListener("click", () => void startRoomMatch(true));
 
@@ -4885,13 +4997,13 @@ function resetRoomToBeginning(
   lineupSelectorState = null;
   banSelectorState = null;
   scoreSelectorState = null;
+  matchTeamPauseTotals = { left: 0, right: 0 };
   restState = null;
   pauseState = { active: false, startedAt: null, totalPausedMs: 0, matchTotalPausedMs: 0, collapsed: false };
-  teamAckNotice = null;
   hiddenOverlay = null;
   adminNotice = null;
-  openingSide = resolveOpeningSide();
   firstMapPickerSide = resolveSidePolicy(settingsState.firstMapPickerPolicy);
+  openingSide = resolveOpeningSide();
   interactiveRandomState = null;
   interactiveRandomResults = {};
 
@@ -4901,11 +5013,12 @@ function resetRoomToBeginning(
       mapSelectorState = null;
     } else {
       restState = null;
-      openNextMapSelector();
-    }
-    if (!settingsState.fixedFirstMapEnabled && settingsState.firstMapPickerPolicy === "interactive_random") {
-      startInteractiveRandom("map_picker", 0);
-      mapSelectorState = null;
+      if (!settingsState.fixedFirstMapEnabled && settingsState.firstMapPickerPolicy === "interactive_random") {
+        startInteractiveRandom("map_picker", 0);
+        mapSelectorState = null;
+      } else {
+        openNextMapSelector();
+      }
     }
   } else {
     mapSelectorState = null;
@@ -4943,7 +5056,8 @@ function readSettingsFromForm(): boolean {
   const firstMapPickerPolicy = document.getElementById("firstMapPickerPolicy") as HTMLSelectElement | null;
   const mapPickerPolicy = document.getElementById("mapPickerPolicy") as HTMLSelectElement | null;
   const mapTimeoutPolicy = document.getElementById("mapTimeoutPolicy") as HTMLSelectElement | null;
-  const sideChoicePickerPolicy = document.getElementById("sideChoicePickerPolicy") as HTMLSelectElement | null;
+  const firstSideChoicePolicy = document.getElementById("firstSideChoicePolicy") as HTMLSelectElement | null;
+  const subsequentSideChoicePolicy = document.getElementById("subsequentSideChoicePolicy") as HTMLSelectElement | null;
   const rosterMode = document.getElementById("rosterMode") as HTMLSelectElement | null;
   const lineupTimeoutPolicy = document.getElementById("lineupTimeoutPolicy") as HTMLSelectElement | null;
   const firstBanPolicy = document.getElementById("firstBanPolicy") as HTMLSelectElement | null;
@@ -4977,12 +5091,19 @@ function readSettingsFromForm(): boolean {
   settingsState.fixedFirstMapEnabled = settingsState.mapSelectionMode === "fixed_map_order"
     ? false
     : fixedFirstMapEnabled?.checked ?? settingsState.fixedFirstMapEnabled;
+  if (settingsState.fixedFirstMapEnabled && settingsState.firstSideChoicePolicy === "map_picker") {
+    settingsState.firstSideChoicePolicy = "left";
+  }
   settingsState.fixedFirstMapName = fixedFirstMapName?.value ?? settingsState.fixedFirstMapName;
   settingsState.firstMapPickerPolicy = (firstMapPickerPolicy?.value ?? settingsState.firstMapPickerPolicy) as FirstMapPickerPolicy;
   settingsState.mapPickerPolicy = (mapPickerPolicy?.value ?? settingsState.mapPickerPolicy) as MapPickerPolicy;
   settingsState.mapTimeoutPolicy = (mapTimeoutPolicy?.value ?? settingsState.mapTimeoutPolicy) as MapTimeoutPolicy;
   settingsState.symmetricSideChoiceEnabled = symmetricSideChoiceEnabled?.checked ?? settingsState.symmetricSideChoiceEnabled;
-  settingsState.sideChoicePickerPolicy = (sideChoicePickerPolicy?.value ?? settingsState.sideChoicePickerPolicy) as SideChoicePickerPolicy;
+  settingsState.firstSideChoicePolicy = (firstSideChoicePolicy?.value ?? settingsState.firstSideChoicePolicy) as FirstSideChoicePolicy;
+  settingsState.subsequentSideChoicePolicy = (subsequentSideChoicePolicy?.value ?? settingsState.subsequentSideChoicePolicy) as SubsequentSideChoicePolicy;
+  if (settingsState.fixedFirstMapEnabled && settingsState.firstSideChoicePolicy === "map_picker") {
+    settingsState.firstSideChoicePolicy = "left";
+  }
   settingsState.rosterMode = (rosterMode?.value ?? settingsState.rosterMode) as PlayerInputMode;
   settingsState.lineupTimeoutPolicy = (lineupTimeoutPolicy?.value ?? settingsState.lineupTimeoutPolicy) as LineupTimeoutPolicy;
   settingsState.banEnabled = banEnabled?.checked ?? settingsState.banEnabled;
@@ -4990,6 +5111,9 @@ function readSettingsFromForm(): boolean {
   settingsState.teamsCanEditOwnName = teamsCanEditOwnName?.checked ?? settingsState.teamsCanEditOwnName;
   settingsState.firstBanPolicy = (firstBanPolicy?.value ?? settingsState.firstBanPolicy) as FirstBanPolicy;
   settingsState.openingSidePolicy = (openingSidePolicy?.value ?? settingsState.openingSidePolicy) as OpeningSidePolicy;
+  if (settingsState.fixedFirstMapEnabled && settingsState.openingSidePolicy === "follow_map_picker") {
+    settingsState.openingSidePolicy = "random";
+  }
   settingsState.banTimeoutPolicy = (banTimeoutPolicy?.value ?? settingsState.banTimeoutPolicy) as BanTimeoutPolicy;
   settingsState.scoreReportMode = (scoreReportMode?.value ?? settingsState.scoreReportMode) as ScoreReportMode;
   settingsState.fixedMapOrderText = fixedMapOrderSelects.length > 0
@@ -5054,13 +5178,16 @@ function validateSettingsForSubmit(): string[] {
     } else if (settingsState.mapSelectionMode === "strict_mode_order" && fixedChoice.mode !== settingsState.modeOrder[0]) {
       errors.push("固定首图的模式必须与模式顺序第一项一致。");
     }
+    if (settingsState.openingSidePolicy === "follow_map_picker") {
+      errors.push("固定第一张地图时，禁用首次先手方不能跟随地图选图权。");
+    }
   }
 
   return errors;
 }
 
 async function saveRoomConfigDraft(renderAfter = true): Promise<boolean> {
-  if (!roomToken || !isAdminPortal() || roomConfigState?.status === "locked") {
+  if (!roomToken || !isAdminPortal() || roomConfigState?.status !== "draft") {
     return false;
   }
   if (document.getElementById("matchFormat") && !readSettingsFromForm()) {
@@ -5158,6 +5285,9 @@ function finalizeInteractiveRandom(timedOut: boolean): void {
   interactiveRandomResults[getInteractiveRandomResultKey(interactiveRandomState.purpose, interactiveRandomState.mapIndex)] = resultSide;
   if (interactiveRandomState.purpose === "map_picker") {
     firstMapPickerSide = resultSide;
+    if (settingsState.openingSidePolicy === "follow_map_picker") {
+      openingSide = resultSide;
+    }
   } else if (interactiveRandomState.purpose === "opening_ban") {
     openingSide = resultSide;
   }
@@ -5169,6 +5299,7 @@ function finalizeInteractiveRandom(timedOut: boolean): void {
     resultSide,
     timedOut,
   }));
+  resetCountdown(INTERACTIVE_RANDOM_RESULT_SECONDS);
   renderCurrent();
 }
 
@@ -5207,7 +5338,7 @@ async function importRoomConfigFromJson(): Promise<void> {
 }
 
 async function importRoomConfig(config: unknown, sourceType: "json" | "builtin"): Promise<void> {
-  if (!roomToken || !isAdminPortal() || roomConfigState?.status === "locked") {
+  if (!roomToken || !isAdminPortal() || roomConfigState?.status !== "draft") {
     return;
   }
   const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config`, {
@@ -5275,7 +5406,13 @@ async function rollbackRoomToConfig(): Promise<void> {
     alert(await getConfigErrorMessage(response));
     return;
   }
-  window.location.reload();
+  const payload = await response.json() as { config: RoomConfigState; version: number };
+  roomConfigState = payload.config;
+  serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
+  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  settingsPanelOpen = true;
+  pendingServerSnapshot = null;
+  resetRoomToBeginning(false);
 }
 
 async function copyRoomConfigJson(): Promise<void> {
@@ -5408,6 +5545,9 @@ function restoreCheckpoint(row: number, key: CheckpointKey): void {
 
   roomStarted = true;
   hiddenOverlay = null;
+  selectionConfirmationState = null;
+  localScoreDraft = null;
+  interactiveRandomState = null;
   adminNotice = `管理员已回退到 MAP ${row + 1}：${settingsState.checkpoints[row][key].label}`;
   createTeamAckNotice(`管理员已回退到 MAP ${row + 1}：${settingsState.checkpoints[row][key].label}`);
 
@@ -5422,31 +5562,44 @@ function restoreCheckpoint(row: number, key: CheckpointKey): void {
   scoreSelectorState = null;
   restState = null;
 
-  if (key === "mapPick" || !currentState.maps[row].nameEn) {
+  if (key === "preCountdown" || key === "mapPick" || !currentState.maps[row].nameEn) {
     currentState.maps[row] = createBlankMap(row);
     delete confirmedLineups[row];
-    mapSelectorState = {
-      open: true,
-      minimized: false,
-      selectedMapKey: null,
-      targetMapIndex: row,
-      pickerSide: getMapPickerSide(currentState, row),
-      timedOut: false,
-    };
+    if (key === "preCountdown") {
+      mapSelectorState = null;
+      restState = { open: true, mapIndex: Math.max(0, row - 1), skipReady: createRestSkipReadyState() };
+    } else {
+      mapSelectorState = {
+        open: true,
+        minimized: false,
+        selectedMapKey: null,
+        targetMapIndex: row,
+        pickerSide: getMapPickerSide(currentState, row),
+        timedOut: false,
+      };
+    }
   } else if (key === "lineupPick") {
     mapSelectorState = null;
     delete confirmedLineups[row];
+    currentState.maps[row].bans = { left: null, right: null };
+    currentState.maps[row].firstBanSide = null;
+    currentState.maps[row].score = { left: null, right: null };
+    currentState.maps[row].status = "after";
     openLineupSelector(row);
   } else if (key === "firstSecondBanChoice" || key === "firstBan") {
     mapSelectorState = null;
     currentState.maps[row].bans = { left: null, right: null };
     currentState.maps[row].firstBanSide = null;
+    currentState.maps[row].score = { left: null, right: null };
+    currentState.maps[row].status = "after";
     openBanSelectorForMap(row);
   } else if (key === "secondBan") {
     mapSelectorState = null;
     const firstSide = currentState.maps[row].firstBanSide ?? getMapPickerSide(currentState, row);
     const secondSide = getOppositeSide(firstSide);
     currentState.maps[row].bans[secondSide] = null;
+    currentState.maps[row].score = { left: null, right: null };
+    currentState.maps[row].status = "after";
     banSelectorState = {
       open: true,
       mapIndex: row,
@@ -5463,14 +5616,31 @@ function restoreCheckpoint(row: number, key: CheckpointKey): void {
     currentState.maps[row].score = { left: null, right: null };
     currentState.maps[row].status = "after";
     openScoreSelectorForMap(row);
-  } else {
-    mapSelectorState = null;
-    restState = { open: true, mapIndex: Math.max(0, row - 1), skipReady: createRestSkipReadyState() };
   }
 
+  recalculateSeriesScoresFromCompletedMaps();
   resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("room", "stage_restored", { mapIndex: row, checkpoint: key }));
   renderCurrent();
+}
+
+function recalculateSeriesScoresFromCompletedMaps(): void {
+  if (!currentState) {
+    return;
+  }
+
+  currentState.teams.left.seriesScore = 0;
+  currentState.teams.right.seriesScore = 0;
+  currentState.maps.forEach((map) => {
+    if (map.status !== "completed") {
+      return;
+    }
+    const leftScore = Number(map.score.left);
+    const rightScore = Number(map.score.right);
+    if (Number.isFinite(leftScore) && Number.isFinite(rightScore) && leftScore !== rightScore) {
+      currentState!.teams[leftScore > rightScore ? "left" : "right"].seriesScore += 1;
+    }
+  });
 }
 
 function canOpenMapSlot(targetMapIndex: number): boolean {
@@ -5557,10 +5727,6 @@ function selectMapChoice(mapKey: string | null): void {
   }
 
   mapSelectorState.selectedMapKey = mapKey;
-  publishSharedRoomSnapshot(createRoomOperation("map", "choice_selected", {
-    mapIndex: mapSelectorState.targetMapIndex,
-    mapKey,
-  }));
   updateSelectedMapDom();
 }
 
@@ -5579,6 +5745,10 @@ function randomLegalMapChoice(automatic = false): void {
   }
 
   mapSelectorState.selectedMapKey = choice.key;
+  if (!automatic) {
+    updateSelectedMapDom();
+    return;
+  }
   const resultMessage = automatic
     ? `${getTeamName(mapSelectorState.pickerSide)}地图选择超时，随机选择结果为${getDisplayMapName(choice.nameEn)}。`
     : `管理员已随机选择地图：${getDisplayMapName(choice.nameEn)}`;
@@ -5686,36 +5856,43 @@ function getInteractiveRandomResultKey(purpose: InteractiveRandomPurpose, mapInd
 }
 
 function resolveSideChoicePicker(mapIndex: number): Side {
-  const policy = settingsState.sideChoicePickerPolicy;
-  if (policy === "random") {
-    const key = getInteractiveRandomResultKey("side_choice", mapIndex);
-    return interactiveRandomResults[key] ?? (Math.random() < 0.5 ? "left" : "right");
+  if (mapIndex <= 0) {
+    const policy = settingsState.firstSideChoicePolicy;
+    if (policy === "map_picker") return firstMapPickerSide;
+    if (policy === "right") return "right";
+    return "left";
   }
-  if (policy === "opening_winner") return openingSide;
-  if (policy === "interactive_random") {
-    return interactiveRandomResults[getInteractiveRandomResultKey("side_choice", mapIndex)] ?? openingSide;
-  }
-  if (mapIndex <= 0 || !currentState) return openingSide;
+  if (!currentState) return firstMapPickerSide;
   const loser = getMapPickerSide(currentState, mapIndex);
-  return policy === "previous_winner" ? getOppositeSide(loser) : loser;
+  return settingsState.subsequentSideChoicePolicy === "previous_winner" ? getOppositeSide(loser) : loser;
+}
+
+function getDirectFirstSideAssignment(mapIndex: number): Side | null {
+  if (mapIndex !== 0) return null;
+  const policy = settingsState.firstSideChoicePolicy;
+  if (policy !== "left_attack" && policy !== "left_defense") return null;
+  const attackDefense = getSideChoiceKind(mapIndex) === "attack_defense";
+  if (policy === "left_attack") return attackDefense ? "left" : "right";
+  return attackDefense ? "right" : "left";
 }
 
 function openSideSelectorForMap(mapIndex: number): void {
-  if (!currentState || !shouldSelectSideForMap(mapIndex)) {
+  if (
+    !currentState
+    || (mapIndex === 0 && settingsState.firstSideChoicePolicy === "none")
+    || !shouldSelectSideForMap(mapIndex)
+  ) {
     sideSelectorState = null;
     openLineupSelector(mapIndex);
     return;
   }
-  const randomKey = getInteractiveRandomResultKey("side_choice", mapIndex);
-  if (settingsState.sideChoicePickerPolicy === "interactive_random" && !interactiveRandomResults[randomKey]) {
+  const directSide = getDirectFirstSideAssignment(mapIndex);
+  if (directSide) {
+    currentState.maps[mapIndex].sideChoiceKind = getSideChoiceKind(mapIndex);
+    currentState.maps[mapIndex].selectedSide = directSide;
     sideSelectorState = null;
-    startInteractiveRandom("side_choice", mapIndex);
-    resetCountdown(30);
+    openLineupSelector(mapIndex);
     return;
-  }
-  if (settingsState.sideChoicePickerPolicy === "random" && !interactiveRandomResults[randomKey]) {
-    const resultSide = resolveSideChoicePicker(mapIndex);
-    interactiveRandomResults[randomKey] = resultSide;
   }
   sideSelectorState = {
     open: true,
@@ -5834,7 +6011,8 @@ function openBanSelectorForMap(mapIndex: number): void {
     return;
   }
 
-  const chooserSide = mapIndex === 0 ? openingSide : getMapPickerSide(currentState, mapIndex);
+  const chooserSide = mapIndex === 0 ? resolveOpeningSide() : getMapPickerSide(currentState, mapIndex);
+  if (mapIndex === 0) openingSide = chooserSide;
   const firstBanSide = settingsState.firstBanPolicy === "loser_must_first" ? chooserSide : null;
 
   if (firstBanSide) {
@@ -5861,7 +6039,7 @@ function selectBanOrder(order: BanOrderChoice | undefined): void {
   }
 
   banSelectorState.selectedOrder = order;
-  confirmBanSelection();
+  renderCurrent();
 }
 
 function selectHeroBan(heroKey: string | null): void {
@@ -5876,10 +6054,6 @@ function selectHeroBan(heroKey: string | null): void {
   }
 
   banSelectorState.selectedHeroKey = heroKey;
-  publishSharedRoomSnapshot(createRoomOperation("ban", "choice_selected", {
-    mapIndex: banSelectorState.mapIndex,
-    heroKey,
-  }));
   renderCurrent();
 }
 
@@ -5890,6 +6064,10 @@ function randomLegalBanChoice(automatic = false): void {
 
   if (banSelectorState.step === "order-choice") {
     banSelectorState.selectedOrder = pickRandomItem<BanOrderChoice>(["first", "second"]);
+    if (!automatic) {
+      renderCurrent();
+      return;
+    }
     adminNotice = "管理员已随机选择禁用顺序。";
     createTeamAckNotice("管理员已随机选择禁用顺序。");
     confirmBanSelection({ selectionSource: automatic ? "timeout_random" : "admin_random" });
@@ -5909,6 +6087,10 @@ function randomLegalBanChoice(automatic = false): void {
   }
 
   banSelectorState.selectedHeroKey = getHeroKey(hero.nameEn);
+  if (!automatic) {
+    renderCurrent();
+    return;
+  }
   const resultMessage = automatic
     ? `${getTeamName(banSelectorState.activeSide)}英雄禁用选择超时，随机选择结果为${getHeroDisplayName(hero.nameEn)}。`
     : `管理员已随机禁用：${getHeroDisplayName(hero.nameEn)}`;
@@ -6120,6 +6302,11 @@ function finalizeScoreSelection(): void {
   const mapIndex = scoreSelectorState.mapIndex;
   const map = currentState.maps[mapIndex];
 
+  stopAllScoreTeamPauses();
+  (["left", "right"] as Side[]).forEach((side) => {
+    matchTeamPauseTotals[side] += scoreSelectorState!.teamPauses[side].totalMs;
+  });
+
   map.score = { left: leftScore, right: rightScore };
   map.status = "completed";
 
@@ -6271,9 +6458,18 @@ function finishRestPeriod(): void {
   }
 
   restState = null;
-  openNextMapSelector();
+  if (mapIndex === 0 && !settingsState.fixedFirstMapEnabled && settingsState.firstMapPickerPolicy === "interactive_random") {
+    startInteractiveRandom("map_picker", 0);
+    mapSelectorState = null;
+  } else {
+    openNextMapSelector();
+  }
   resetCountdown();
-  publishSharedRoomSnapshot(createRoomOperation("rest", "finished", { mapIndex, matchFinished: false }));
+  publishSharedRoomSnapshot(createRoomOperation("rest", "finished", {
+    mapIndex,
+    matchFinished: false,
+    pickerSide: mapSelectorState?.pickerSide,
+  }));
   renderCurrent();
 }
 
@@ -6434,7 +6630,6 @@ function finalizeLineupSelection(setByAdmin = false): void {
   delete localLineupDrafts[mapIndex];
   lineupSelectorState = null;
   adminNotice = null;
-  teamAckNotice = null;
   openBanSelectorForMap(mapIndex);
   resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("lineup", "confirmed", { mapIndex, setByAdmin }));
@@ -7090,14 +7285,20 @@ function getTeamPauseCurrentMs(side: Side): number {
   return state?.active && state.startedAt ? Date.now() - state.startedAt : 0;
 }
 
+function getMatchTeamPauseTotalMs(side: Side): number {
+  return matchTeamPauseTotals[side] + getTeamPauseTotalMs(side);
+}
+
 function updateScorePauseDom(): void {
   if (!scoreSelectorState) {
     return;
   }
   (["left", "right"] as Side[]).forEach((side) => {
     const total = document.querySelector<HTMLElement>(`[data-score-pause-total="${side}"]`);
+    const matchTotal = document.querySelector<HTMLElement>(`[data-score-pause-match-total="${side}"]`);
     const current = document.querySelector<HTMLElement>(`[data-score-pause-current="${side}"]`);
     if (total) total.textContent = formatDurationMs(getTeamPauseTotalMs(side));
+    if (matchTotal) matchTotal.textContent = formatDurationMs(getMatchTeamPauseTotalMs(side));
     if (current) current.textContent = formatDurationMs(getTeamPauseCurrentMs(side));
   });
 }
@@ -7206,12 +7407,12 @@ function getHeroRoleKeyFromText(role: string): string {
 
 function getHeroRoleLabel(role: string): string {
   const labels: Record<string, string> = {
-    tank: "Tank",
-    damage: "Damage",
-    support: "Support",
+    tank: "坦克",
+    damage: "输出",
+    support: "支援",
   };
 
-  return labels[normalizeKey(role)] ?? role;
+  return labels[getHeroRoleKeyFromText(role)] ?? role;
 }
 
 function getRoleHeaderImageUrl(role: string): string {
@@ -7219,9 +7420,9 @@ function getRoleHeaderImageUrl(role: string): string {
   const catalogIcon = roleName ? mapCatalogState.roleIcons?.[roleName]?.imageUrl : undefined;
   if (catalogIcon) return catalogIcon;
   const urls: Record<string, string> = {
-    tank: "/static/role-icons/tank-header.png",
-    damage: "/static/role-icons/offense-header.png",
-    support: "/static/role-icons/support-header.png",
+    tank: "/static/role-icons/tank-3bafe60c3c79.png",
+    damage: "/static/role-icons/damage-3ce6307df3d7.png",
+    support: "/static/role-icons/support-02e199a6fb82.png",
   };
 
   return urls[getHeroRoleKeyFromText(role)] ?? urls.damage;
@@ -7329,19 +7530,7 @@ function getLineupConfirmButtonLabel(): string {
     return "等待管理员处理";
   }
 
-  return `确认${side === "left" ? "蓝方" : "红方"}阵容`;
-}
-
-function getLineupStatusText(): string {
-  if (!lineupSelectorState) {
-    return "输出 / 输出 / 坦克 / 辅助 / 辅助";
-  }
-
-  const getSideStatus = (side: Side): string => `${side === "left" ? "蓝方" : "红方"}${
-    lineupSelectorState!.ready[side] ? "已确认" : "待确认"
-  }`;
-
-  return `输出 / 输出 / 坦克 / 辅助 / 辅助 · ${getSideStatus("left")} / ${getSideStatus("right")}`;
+  return `确认${side === "left" ? "队伍1" : "队伍2"}阵容`;
 }
 
 function getRosterModeLabel(mode: PlayerInputMode): string {
@@ -7426,6 +7615,9 @@ function resizeCheckpoints(checkpoints: SettingsState["checkpoints"], stageCount
 }
 
 function resolveOpeningSide(): Side {
+  if (settingsState.openingSidePolicy === "follow_map_picker") {
+    return firstMapPickerSide;
+  }
   return resolveSidePolicy(settingsState.openingSidePolicy);
 }
 
@@ -7472,8 +7664,8 @@ function getCountdownSnapshot(): { remaining: number; percent: number } {
 }
 
 function getActiveCountdownTotalSeconds(): number {
-  if (interactiveRandomState && !interactiveRandomState.resolvedSide) {
-    return 30;
+  if (interactiveRandomState) {
+    return interactiveRandomState.resolvedSide ? INTERACTIVE_RANDOM_RESULT_SECONDS : 30;
   }
 
   if (banSelectorState?.open) {
@@ -7627,6 +7819,8 @@ function updateCountdownDom(): void {
   if (remaining <= 0) {
     if (interactiveRandomState && !interactiveRandomState.resolvedSide) {
       finalizeInteractiveRandom(true);
+    } else if (interactiveRandomState?.resolvedSide) {
+      continueAfterInteractiveRandom();
     } else if (banSelectorState?.open) {
       handleBanSelectionTimeout();
     } else if (sideSelectorState?.open) {
@@ -7692,37 +7886,25 @@ function handleBanSelectionTimeout(): void {
     return;
   }
 
-  if (!canConfirmBanSelection()) {
-    if (settingsState.banTimeoutPolicy === "warn_extend_30") {
-      extendBanChoiceTime(true);
-    } else if (settingsState.banTimeoutPolicy === "random_legal_ban") {
-      randomLegalBanChoice(true);
-    } else if (settingsState.banTimeoutPolicy === "forfeit_map") {
-      forfeitCurrentBanChoice(true);
-    } else {
-      banSelectorState.timedOut = true;
-      publishSharedRoomSnapshot(createRoomOperation("ban", "timed_out", {
-        mapIndex: banSelectorState.mapIndex,
-        step: banSelectorState.step,
-        side: banSelectorState.activeSide,
-      }));
-      renderCurrent();
-    }
-    return;
+  if (settingsState.banTimeoutPolicy === "warn_extend_30") {
+    extendBanChoiceTime(true);
+  } else if (settingsState.banTimeoutPolicy === "random_legal_ban") {
+    randomLegalBanChoice(true);
+  } else if (settingsState.banTimeoutPolicy === "forfeit_map") {
+    forfeitCurrentBanChoice(true);
+  } else {
+    banSelectorState.timedOut = true;
+    publishSharedRoomSnapshot(createRoomOperation("ban", "timed_out", {
+      mapIndex: banSelectorState.mapIndex,
+      step: banSelectorState.step,
+      side: banSelectorState.activeSide,
+    }));
+    renderCurrent();
   }
-
-  confirmBanSelection();
 }
 
 function handleMapSelectionTimeout(): void {
   if (!mapSelectorState || mapSelectorState.timedOut || isBroadcastPortal() || !canOperateMapSelection()) {
-    return;
-  }
-
-  const selectedChoice = findMapChoiceByKey(mapSelectorState.selectedMapKey);
-
-  if (selectedChoice && getMapAvailability(selectedChoice).available && canConfirmMapSelection()) {
-    confirmSelectedMap();
     return;
   }
 
@@ -7902,39 +8084,11 @@ function resumeGlobalPause(): void {
 }
 
 function createTeamAckNotice(message: string): void {
-  teamAckNotice = {
-    message,
-    acknowledged: {
-      left: false,
-      right: false,
-    },
-  };
-}
-
-function isObsoleteRandomResultNotice(notice: TeamAckNotice | null | undefined): boolean {
-  return Boolean(
-    notice?.message.startsWith("当前随机结果为：")
-    || isObsoleteBanConfirmationNotice(notice?.message),
-  );
+  void message;
 }
 
 function isObsoleteBanConfirmationNotice(message: string | null | undefined): boolean {
   return Boolean(message?.includes("确认禁用："));
-}
-
-function acknowledgeTeamNotice(): void {
-  if (!teamAckNotice || !portalConfig.side) {
-    return;
-  }
-
-  teamAckNotice.acknowledged[portalConfig.side] = true;
-
-  if (teamAckNotice.acknowledged.left && teamAckNotice.acknowledged.right) {
-    teamAckNotice = null;
-  }
-
-  publishSharedRoomSnapshot(createRoomOperation("notice", "acknowledged", { side: portalConfig.side }));
-  renderCurrent();
 }
 
 function formatElapsedPause(): string {
@@ -7967,6 +8121,7 @@ function mergeSettings(base: SettingsState, override: unknown): SettingsState {
   const stageCount = getStageCountForMatchFormat(matchFormat);
   const checkpointOverrides = Array.isArray(partial.checkpoints) ? partial.checkpoints : [];
   const legacyFirstBanPolicy = (partial as { firstBanPolicy?: string }).firstBanPolicy;
+  const legacySideChoicePolicy = (partial as { sideChoicePickerPolicy?: string }).sideChoicePickerPolicy;
   const normalizePolicy = (value: unknown, fallback: SidePolicy): SidePolicy => {
     if (value === "red") return "right";
     if (value === "blue") return "left";
@@ -7981,15 +8136,21 @@ function mergeSettings(base: SettingsState, override: unknown): SettingsState {
     modeOrder: Array.isArray(partial.modeOrder) && partial.modeOrder.length > 0 ? partial.modeOrder : merged.modeOrder,
     banEnabled: legacyFirstBanPolicy === "no_ban" ? false : partial.banEnabled ?? merged.banEnabled,
     firstBanPolicy: legacyFirstBanPolicy === "loser_must_first" ? "loser_must_first" : "allow_loser_choose",
-    openingSidePolicy: normalizePolicy(partial.openingSidePolicy, merged.openingSidePolicy),
+    openingSidePolicy: partial.openingSidePolicy === "follow_map_picker"
+      ? "follow_map_picker"
+      : normalizePolicy(partial.openingSidePolicy, merged.openingSidePolicy === "follow_map_picker" ? "random" : merged.openingSidePolicy),
     firstMapPickerPolicy: normalizePolicy(partial.firstMapPickerPolicy, merged.firstMapPickerPolicy),
     symmetricSideChoiceEnabled: typeof partial.symmetricSideChoiceEnabled === "boolean"
       ? partial.symmetricSideChoiceEnabled
       : merged.symmetricSideChoiceEnabled,
-    sideChoicePickerPolicy: (["previous_winner", "previous_loser", "opening_winner", "interactive_random", "random"] as unknown[])
-      .includes(partial.sideChoicePickerPolicy)
-      ? partial.sideChoicePickerPolicy as SideChoicePickerPolicy
-      : merged.sideChoicePickerPolicy,
+    firstSideChoicePolicy: (["none", "map_picker", "left", "right", "left_attack", "left_defense"] as unknown[])
+      .includes(partial.firstSideChoicePolicy)
+      ? partial.firstSideChoicePolicy as FirstSideChoicePolicy
+      : merged.firstSideChoicePolicy,
+    subsequentSideChoicePolicy: (["previous_winner", "previous_loser"] as unknown[])
+      .includes(partial.subsequentSideChoicePolicy)
+      ? partial.subsequentSideChoicePolicy as SubsequentSideChoicePolicy
+      : legacySideChoicePolicy === "previous_winner" ? "previous_winner" : merged.subsequentSideChoicePolicy,
     checkpoints: resizeCheckpoints(
       merged.checkpoints.map((checkpoint, index) => ({
         ...checkpoint,

@@ -16,17 +16,13 @@ MAP_SELECTION_MODES = {
 ROSTER_MODES = {"free_input", "preset_only", "skip"}
 FIRST_BAN_POLICIES = {"allow_loser_choose", "loser_must_first"}
 SIDE_POLICIES = {"random", "interactive_random", "left", "right"}
+OPENING_SIDE_POLICIES = SIDE_POLICIES | {"follow_map_picker"}
 SCORE_REPORT_MODES = {"admin_only", "team_submit_opponent_confirm"}
 MAP_TIMEOUT_POLICIES = {"warn_extend_30", "random_legal_map", "forfeit_map", "admin_decision"}
 LINEUP_TIMEOUT_POLICIES = {"warn_extend_30", "forfeit_map", "admin_decision"}
 BAN_TIMEOUT_POLICIES = {"warn_extend_30", "random_legal_ban", "forfeit_map", "admin_decision"}
-SIDE_CHOICE_PICKER_POLICIES = {
-    "previous_winner",
-    "previous_loser",
-    "opening_winner",
-    "interactive_random",
-    "random",
-}
+FIRST_SIDE_CHOICE_POLICIES = {"none", "map_picker", "left", "right", "left_attack", "left_defense"}
+SUBSEQUENT_SIDE_CHOICE_POLICIES = {"previous_winner", "previous_loser"}
 CHECKPOINT_KEYS = (
     "preCountdown",
     "mapPick",
@@ -66,6 +62,8 @@ MATCH_CONFIG_KEYS = {
     "mapPickerPolicy",
     "mapTimeoutPolicy",
     "symmetricSideChoiceEnabled",
+    "firstSideChoicePolicy",
+    "subsequentSideChoicePolicy",
     "sideChoicePickerPolicy",
     "rosterMode",
     "presetRosterText",
@@ -122,7 +120,8 @@ def default_match_config() -> dict[str, Any]:
         "mapPickerPolicy": "loser_choose",
         "mapTimeoutPolicy": "warn_extend_30",
         "symmetricSideChoiceEnabled": False,
-        "sideChoicePickerPolicy": "previous_loser",
+        "firstSideChoicePolicy": "map_picker",
+        "subsequentSideChoicePolicy": "previous_loser",
         "rosterMode": "free_input",
         "presetRosterText": "蓝色方: A1,A2,A3,A4,A5\n红色方: B1,B2,B3,B4,B5",
         "banEnabled": True,
@@ -256,7 +255,9 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
         result["firstBanPolicy"] = _enum_value(
             source, "firstBanPolicy", FIRST_BAN_POLICIES, result, errors
         )
-    result["openingSidePolicy"] = _side_policy_value(source, "openingSidePolicy", result, errors)
+    result["openingSidePolicy"] = _enum_value(
+        source, "openingSidePolicy", OPENING_SIDE_POLICIES, result, errors
+    )
     result["firstMapPickerPolicy"] = _side_policy_value(source, "firstMapPickerPolicy", result, errors)
     result["mapPickerPolicy"] = _enum_value(
         source, "mapPickerPolicy", {"loser_choose"}, result, errors
@@ -270,13 +271,23 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
         result["symmetricSideChoiceEnabled"],
         errors,
     )
-    result["sideChoicePickerPolicy"] = _enum_value(
+    legacy_side_policy = source.get("sideChoicePickerPolicy")
+    result["firstSideChoicePolicy"] = _enum_value(
         source,
-        "sideChoicePickerPolicy",
-        SIDE_CHOICE_PICKER_POLICIES,
+        "firstSideChoicePolicy",
+        FIRST_SIDE_CHOICE_POLICIES,
         result,
         errors,
     )
+    result["subsequentSideChoicePolicy"] = _enum_value(
+        source,
+        "subsequentSideChoicePolicy",
+        SUBSEQUENT_SIDE_CHOICE_POLICIES,
+        result,
+        errors,
+    )
+    if "subsequentSideChoicePolicy" not in source and legacy_side_policy in SUBSEQUENT_SIDE_CHOICE_POLICIES:
+        result["subsequentSideChoicePolicy"] = legacy_side_policy
     result["lineupTimeoutPolicy"] = _enum_value(
         source, "lineupTimeoutPolicy", LINEUP_TIMEOUT_POLICIES, result, errors
     )
@@ -309,6 +320,18 @@ def normalize_match_config(value: Any, maps: dict[str, Any] | None = None) -> di
     result["fixedFirstMapEnabled"] = _bool_value(
         source, "fixedFirstMapEnabled", result["fixedFirstMapEnabled"], errors
     )
+    if result["fixedFirstMapEnabled"] and "firstSideChoicePolicy" not in source:
+        result["firstSideChoicePolicy"] = "left"
+    if result["fixedFirstMapEnabled"] and result["firstSideChoicePolicy"] == "map_picker":
+        errors.append({
+            "path": "firstSideChoicePolicy",
+            "message": "启用固定首图时不能选择第一张地图选择方",
+        })
+    if result["fixedFirstMapEnabled"] and result["openingSidePolicy"] == "follow_map_picker":
+        errors.append({
+            "path": "openingSidePolicy",
+            "message": "启用固定首图时禁用首次先手方不能跟随地图选图权",
+        })
     fixed_first_map_name = source.get("fixedFirstMapName", result["fixedFirstMapName"])
     if not isinstance(fixed_first_map_name, str):
         errors.append({"path": "fixedFirstMapName", "message": "必须是字符串"})

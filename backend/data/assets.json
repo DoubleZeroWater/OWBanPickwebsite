@@ -49,19 +49,19 @@
     "Tank": {
       "role": "Tank",
       "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/6/69/TankIcon.png/revision/latest/scale-to-width-down/96?cb=20151109212047",
-      "imageUrl": "/static/roles/tank-3bafe60c3c79.png",
+      "imageUrl": "/static/role-icons/tank-3bafe60c3c79.png",
       "fileName": "tank-3bafe60c3c79.png"
     },
     "Damage": {
       "role": "Damage",
       "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/1/14/OffenseIcon.png/revision/latest/scale-to-width-down/96?cb=20151109211953",
-      "imageUrl": "/static/roles/damage-3ce6307df3d7.png",
+      "imageUrl": "/static/role-icons/damage-3ce6307df3d7.png",
       "fileName": "damage-3ce6307df3d7.png"
     },
     "Support": {
       "role": "Support",
       "sourceImageUrl": "https://static.wikia.nocookie.net/overwatch_gamepedia/images/5/5f/SupportIcon.png/revision/latest/scale-to-width-down/96?cb=20151109212032",
-      "imageUrl": "/static/roles/support-02e199a6fb82.png",
+      "imageUrl": "/static/role-icons/support-02e199a6fb82.png",
       "fileName": "support-02e199a6fb82.png"
     }
   },
