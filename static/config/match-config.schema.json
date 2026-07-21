@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://owbanpick.local/schema/match-config.schema.json",
+  "title": "OW Ban Pick 比赛配置模板",
+  "description": "全局管理员导入、导出配置模板以及房间管理员高级导入使用的格式。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "name", "config"],
+  "properties": {
+    "$schema": { "type": "string", "description": "可选的 JSON Schema 地址，不参与比赛逻辑。" },
+    "schemaVersion": { "const": 1, "description": "配置文件格式版本。" },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$", "description": "兼容旧模板的可选内部标识；新建时由服务器自动生成。" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "用户界面显示的模板名称，例如杯赛 A。" },
+    "description": { "type": "string", "maxLength": 500, "description": "模板用途和主要规则摘要。" },
+    "config": { "$ref": "#/$defs/config" }
+  },
+  "$defs": {
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "label"],
+      "properties": {
+        "enabled": { "type": "boolean", "description": "是否在回退检查点列表中启用。" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 40, "description": "检查点显示名称。" }
+      }
+    },
+    "checkpointStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preCountdown", "mapPick", "lineupPick", "firstSecondBanChoice", "firstBan", "secondBan", "scorePick"],
+      "properties": {
+        "preCountdown": { "$ref": "#/$defs/checkpoint", "description": "本张地图开始前倒计时检查点。" },
+        "mapPick": { "$ref": "#/$defs/checkpoint", "description": "选择地图检查点。" },
+        "lineupPick": { "$ref": "#/$defs/checkpoint", "description": "选择上场成员检查点。" },
+        "firstSecondBanChoice": { "$ref": "#/$defs/checkpoint", "description": "选择先后 Ban 检查点。" },
+        "firstBan": { "$ref": "#/$defs/checkpoint", "description": "先手 Ban 检查点。" },
+        "secondBan": { "$ref": "#/$defs/checkpoint", "description": "后手 Ban 检查点。" },
+        "scorePick": { "$ref": "#/$defs/checkpoint", "description": "比分录入检查点。" }
+      }
+    },
+    "seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+    "optionalSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["matchName", "teams", "matchFormat", "startWithDefaultConfig", "teamsCanEditOwnName", "stageCount", "checkpoints", "stageLimits", "mapPool", "mapSelectionMode", "firstMapMode", "modeOrder", "fixedMapOrderText", "fixedFirstMapEnabled", "fixedFirstMapName", "firstMapPickerPolicy", "mapPickerPolicy", "mapTimeoutPolicy", "symmetricSideChoiceEnabled", "firstSideChoicePolicy", "subsequentSideChoicePolicy", "rosterMode", "presetRosterText", "lineupTimeoutPolicy", "banEnabled", "firstBanPolicy", "openingSidePolicy", "banTimeoutPolicy", "scoreReportMode"],
+      "properties": {
+        "matchName": { "type": "string", "minLength": 1, "maxLength": 120, "description": "房间主页面显示的比赛名称。" },
+        "teams": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["left", "right"],
+          "properties": {
+            "left": { "type": "string", "minLength": 1, "maxLength": 60, "description": "队伍1名称。" },
+            "right": { "type": "string", "minLength": 1, "maxLength": 60, "description": "队伍2名称。" }
+          }
+        },
+        "matchFormat": { "enum": ["ft2", "ft3", "ft4"], "description": "先赢 2、3 或 4 张地图的比赛赛制。" },
+        "startWithDefaultConfig": { "type": "boolean", "description": "两支队伍均准备后，是否自动使用当前房间配置开始比赛。" },
+        "teamsCanEditOwnName": { "type": "boolean", "description": "是否允许队伍在赛前准备时修改并确认自己的队伍名称。" },
+        "stageCount": { "enum": [5, 7, 9], "description": "最大地图槽位数量；FT2、FT3、FT4 分别为 5、7、9，以支持最多 2 场平局。" },
+        "checkpoints": { "type": "array", "minItems": 5, "maxItems": 9, "items": { "$ref": "#/$defs/checkpointStage" }, "description": "每张地图可回退的检查点。数组长度必须等于 stageCount。" },
+        "stageLimits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["preStartRestSeconds", "mapSelectSeconds", "playerSelectSeconds", "firstBanChoiceSeconds", "firstBanActionSeconds", "secondBanActionSeconds", "scoreConfirmSeconds", "postMatchRestSeconds"],
+          "properties": {
+            "preStartRestSeconds": { "$ref": "#/$defs/optionalSeconds", "description": "比赛开始前准备秒数；0 表示禁用。" },
+            "mapSelectSeconds": { "$ref": "#/$defs/seconds", "description": "选择地图秒数。" },
+            "playerSelectSeconds": { "$ref": "#/$defs/seconds", "description": "选择上场成员秒数。" },
+            "firstBanChoiceSeconds": { "$ref": "#/$defs/seconds", "description": "选择先后 Ban 秒数。" },
+            "firstBanActionSeconds": { "$ref": "#/$defs/seconds", "description": "先手 Ban 秒数。" },
+            "secondBanActionSeconds": { "$ref": "#/$defs/seconds", "description": "后手 Ban 秒数。" },
+            "scoreConfirmSeconds": { "$ref": "#/$defs/seconds", "description": "比分确认秒数。" },
+            "postMatchRestSeconds": { "$ref": "#/$defs/optionalSeconds", "description": "每张地图结束后的场间秒数；0 表示禁用。" }
+          }
+        },
+        "mapPool": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }, "description": "以地图类别为键、英文地图名数组为值的地图池。" },
+        "mapSelectionMode": { "enum": ["unique_map", "unique_mode_until_cycle", "first_mode_then_unique_mode", "strict_mode_order", "fixed_map_order"], "description": "地图不重复、类别轮换、首图限定类别、严格类别顺序或固定地图顺序。" },
+        "firstMapMode": { "type": "string", "minLength": 1, "description": "首图限定类别模式使用的地图类别。" },
+        "modeOrder": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "指定模式顺序，可重复；strict_mode_order 下至少包含 stageCount 项。" },
+        "fixedMapOrderText": { "type": "string", "maxLength": 20000, "description": "固定地图顺序，每行一个英文地图名。" },
+        "fixedFirstMapEnabled": { "type": "boolean", "description": "是否固定第一张地图。" },
+        "fixedFirstMapName": { "type": "string", "description": "固定首图的英文地图名。" },
+        "firstMapPickerPolicy": { "enum": ["random", "interactive_random", "left", "right"], "description": "首次选图方：系统随机、交互随机、队伍1或队伍2。" },
+        "mapPickerPolicy": { "const": "loser_choose", "description": "后续地图由上一张非平局地图的败者选择。" },
+        "mapTimeoutPolicy": { "enum": ["warn_extend_30", "random_legal_map", "forfeit_map", "admin_decision"], "description": "地图选择超时后的处理方式。" },
+        "symmetricSideChoiceEnabled": { "type": "boolean", "description": "是否在对称地图中增加蓝色方/红色方选择；攻击/护送和运载目标始终需要选择攻防。" },
+        "firstSideChoicePolicy": { "enum": ["none", "map_picker", "left", "right", "left_attack", "left_defense"], "description": "首图攻防或阵营选择权；none 表示跳过首图攻防/阵营选择；固定首图启用时不可使用 map_picker。" },
+        "subsequentSideChoicePolicy": { "enum": ["previous_winner", "previous_loser"], "description": "后续地图由上一张地图胜者或败者选择攻防/阵营。" },
+        "sideChoicePickerPolicy": { "enum": ["previous_winner", "previous_loser", "opening_winner", "interactive_random", "random"], "description": "旧版兼容字段；新配置请使用 firstSideChoicePolicy 和 subsequentSideChoicePolicy。" },
+        "rosterMode": { "enum": ["free_input", "preset_only", "skip"], "description": "双方自由输入、只使用预设成员或跳过阵容选择。" },
+        "presetRosterText": { "type": "string", "maxLength": 20000, "description": "预设成员；格式为蓝色方和红色方各一行，成员用逗号分隔。" },
+        "lineupTimeoutPolicy": { "enum": ["warn_extend_30", "forfeit_map", "admin_decision"], "description": "选择上场成员超时后的处理方式。" },
+        "banEnabled": { "type": "boolean", "description": "是否启用英雄禁用规则。" },
+        "firstBanPolicy": { "enum": ["allow_loser_choose", "loser_must_first"], "description": "败者选择禁用先后，或败者先手禁用。" },
+        "openingSidePolicy": { "enum": ["follow_map_picker", "random", "interactive_random", "left", "right"], "description": "第一张地图的禁用首次先手方；固定第一张地图时不可使用 follow_map_picker。" },
+        "banTimeoutPolicy": { "enum": ["warn_extend_30", "random_legal_ban", "forfeit_map", "admin_decision"], "description": "英雄禁用超时后的处理方式，不适用于先后手选择。" },
+        "scoreReportMode": { "enum": ["admin_only", "team_submit_opponent_confirm"], "description": "管理员录入比分，或一方提交后由另一方确认。" }
+      }
+    }
+  }
+}

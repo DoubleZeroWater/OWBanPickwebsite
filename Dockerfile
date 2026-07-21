@@ -6,6 +6,10 @@ WORKDIR /app
 
 COPY package.json package-lock.json tsconfig.json vite.config.ts ./
 COPY frontend ./frontend
+COPY backend ./backend
+COPY scripts ./scripts
+COPY static ./static
+COPY .openai ./.openai
 
 RUN npm ci && npm run build
 

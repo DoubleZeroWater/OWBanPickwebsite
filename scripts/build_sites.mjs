@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = resolve(root, "dist");
 const assets = JSON.parse(await readFile(resolve(root, "backend/data/assets.json"), "utf8"));
+const translation = JSON.parse(await readFile(resolve(root, "backend/data/catalog_translation.zh-CN.json"), "utf8"));
 
 const normalizeKey = (value) =>
   value
@@ -27,11 +28,34 @@ const heroBan = (nameEn, hero, role) => ({
   imageUrl: findHero(nameEn)?.imageUrl ?? "/static/placeholders/hero-blank.svg",
 });
 
+const catalogKeys = {
+  modes: assets.modes ?? [],
+  maps: [...new Set(Object.values(assets.maps ?? {}).flat().map((map) => map.nameEn))].sort((a, b) => a.localeCompare(b, "en")),
+  heroes: [...new Set((assets.heroes ?? []).map((hero) => hero.nameEn))].sort((a, b) => a.localeCompare(b, "en")),
+};
+const translationActive = translation.schemaVersion === 1
+  && translation.catalogHash === assets.catalogHash
+  && ["modes", "maps", "heroes"].every((category) => {
+    const expected = catalogKeys[category];
+    const values = translation[category];
+    return values && Object.keys(values).length === expected.length
+      && expected.every((key) => typeof values[key] === "string" && values[key].trim());
+  });
+
 const mapCatalog = {
   modes: assets.modes ?? Object.keys(assets.maps ?? {}),
   modeIcons: assets.modeIcons ?? {},
+  roleIcons: assets.roleIcons ?? {},
   maps: assets.maps ?? {},
   heroes: assets.heroes ?? [],
+  catalogHash: assets.catalogHash ?? "",
+  locale: translationActive ? "zh-CN" : "en",
+  translation: {
+    active: translationActive,
+    modes: translationActive ? translation.modes : {},
+    maps: translationActive ? translation.maps : {},
+    heroes: translationActive ? translation.heroes : {},
+  },
 };
 
 const matchState = {

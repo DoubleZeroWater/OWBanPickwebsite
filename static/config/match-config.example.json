@@ -1,0 +1,100 @@
+{
+  "$schema": "./match-config.schema.json",
+  "schemaVersion": 1,
+  "name": "杯赛 A",
+  "config": {
+    "matchName": "杯赛 A",
+    "teams": {
+      "left": "蓝色方",
+      "right": "红色方"
+    },
+    "matchFormat": "ft3",
+    "startWithDefaultConfig": false,
+    "teamsCanEditOwnName": false,
+    "stageCount": 7,
+    "checkpoints": [
+      {
+        "preCountdown": { "enabled": false, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      },
+      {
+        "preCountdown": { "enabled": true, "label": "开始前倒计时" },
+        "mapPick": { "enabled": true, "label": "选择地图" },
+        "lineupPick": { "enabled": true, "label": "选择上场成员" },
+        "firstSecondBanChoice": { "enabled": true, "label": "选择先后Ban" },
+        "firstBan": { "enabled": true, "label": "先手Ban" },
+        "secondBan": { "enabled": true, "label": "后手Ban" },
+        "scorePick": { "enabled": true, "label": "比分录入" }
+      }
+    ],
+    "stageLimits": {
+      "preStartRestSeconds": 30,
+      "mapSelectSeconds": 45,
+      "playerSelectSeconds": 60,
+      "firstBanChoiceSeconds": 25,
+      "firstBanActionSeconds": 25,
+      "secondBanActionSeconds": 25,
+      "scoreConfirmSeconds": 30,
+      "postMatchRestSeconds": 120
+    },
+    "mapPool": {
+      "Control": ["Lijiang Tower", "Ilios", "Oasis", "Antarctic Peninsula"],
+      "Escort": ["Circuit Royal", "Dorado", "Rialto"],
+      "Hybrid": ["Hollywood", "King's Row", "Numbani"],
+      "Push": ["Colosseo", "New Queen Street", "Runasapi"],
+      "Flashpoint": ["Suravasa", "New Junk City"]
+    },
+    "mapSelectionMode": "first_mode_then_unique_mode",
+    "firstMapMode": "Control",
+    "modeOrder": ["Control", "Push", "Hybrid", "Escort", "Flashpoint", "Control", "Push"],
+    "fixedMapOrderText": "Lijiang Tower\nKing's Row\nDorado\nColosseo\nSuravasa\nIlios\nRunasapi",
+    "fixedFirstMapEnabled": false,
+    "fixedFirstMapName": "",
+    "firstMapPickerPolicy": "interactive_random",
+    "mapPickerPolicy": "loser_choose",
+    "mapTimeoutPolicy": "warn_extend_30",
+    "symmetricSideChoiceEnabled": false,
+    "firstSideChoicePolicy": "map_picker",
+    "subsequentSideChoicePolicy": "previous_loser",
+    "rosterMode": "free_input",
+    "lineupTimeoutPolicy": "warn_extend_30",
+    "presetRosterText": "蓝色方: Blue1,Blue2,Blue3,Blue4,Blue5\n红色方: Red1,Red2,Red3,Red4,Red5",
+    "banEnabled": true,
+    "firstBanPolicy": "allow_loser_choose",
+    "openingSidePolicy": "random",
+    "banTimeoutPolicy": "warn_extend_30",
+    "scoreReportMode": "team_submit_opponent_confirm"
+  }
+}
