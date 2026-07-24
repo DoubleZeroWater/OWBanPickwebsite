@@ -1,0 +1,583 @@
+schemaVersion: 1
+kind: ui-scenarios
+domain: random-map-side
+
+scenarios:
+  - id: INTERACTIVE_RANDOM_PENDING
+    title: 双方分别提交交互随机值
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#地图设置
+      - frontend/src/main.ts:3474
+    given:
+      fixture: interactive-random
+      runtime:
+        interactiveRandom:
+          left: null
+          right: null
+    expect:
+      baseboard: running-current-map-pending
+      views:
+        team_left:
+          foreground: interactive-random
+          mode: interactive
+          headline: 双方分别选择 0 或 1
+          visibleData:
+            - 本队选择
+            - 对方等待提交状态
+            - XOR 结果归属规则
+          hiddenData:
+            - 对方尚未汇合的具体选择
+          controls:
+            select-random-bit:
+              state: enabled
+        team_right:
+          foreground: interactive-random
+          mode: interactive
+          headline: 双方分别选择 0 或 1
+          visibleData:
+            - 本队选择
+            - 对方等待提交状态
+            - XOR 结果归属规则
+          hiddenData:
+            - 对方尚未汇合的具体选择
+          controls:
+            select-random-bit:
+              state: enabled
+        admin:
+          foreground: interactive-random
+          mode: readonly
+          headline: 双方分别选择 0 或 1
+          controls:
+            select-random-bit:
+              state: disabled
+              reason: 只有对应队伍入口可以提交本队数值
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+
+  - id: INTERACTIVE_RANDOM_ONE_SUBMITTED
+    title: 队伍1已提交交互随机值，等待队伍2
+    reviewStatus: confirmed
+    sources:
+      - frontend/src/main.ts:3516
+    given:
+      fixture: interactive-random
+      runtime:
+        interactiveRandom:
+          left: 1
+          right: null
+    expect:
+      baseboard: running-current-map-pending
+      views:
+        team_left:
+          foreground: interactive-random
+          mode: readonly
+          headline: 等待队伍2提交
+          visibleData:
+            - 本队已提交
+          hiddenData:
+            - 结果产生前的对方具体选择
+          controls:
+            select-random-bit:
+              state: disabled
+              reason: 本队已经提交
+        team_right:
+          foreground: interactive-random
+          mode: interactive
+          headline: 请选择 0 或 1
+          visibleData:
+            - 队伍1已提交
+          hiddenData:
+            - 队伍1具体选择
+          controls:
+            select-random-bit:
+              state: enabled
+        admin:
+          foreground: interactive-random
+          mode: readonly
+          headline: 等待队伍2提交
+          hiddenData:
+            - 汇合前双方具体选择
+          controls: {}
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+
+  - id: INTERACTIVE_RANDOM_RESOLVED
+    title: 交互随机结果已公布
+    reviewStatus: confirmed
+    sources:
+      - frontend/src/main.ts:3474
+      - frontend/src/main.ts:4278
+    given:
+      fixture: interactive-random
+      runtime:
+        remainingTimeMs: 3000
+        interactiveRandom:
+          left: 1
+          right: 0
+        interactiveRandomResult:
+          left: 1
+          right: 0
+          resultSide: right
+    expect:
+      baseboard: running-current-map-pending
+      views:
+        team_left:
+          foreground: interactive-random
+          mode: readonly
+          headline: 计算结果已公布
+          visibleData:
+            - 1 XOR 0 = 1
+            - 队伍2获得对应权利
+            - 结果展示倒计时
+          controls: {}
+        team_right:
+          foreground: interactive-random
+          mode: readonly
+          headline: 计算结果已公布
+          visibleData:
+            - 1 XOR 0 = 1
+            - 队伍2获得对应权利
+            - 结果展示倒计时
+          controls: {}
+        admin:
+          foreground: interactive-random
+          mode: readonly
+          headline: 计算结果已公布
+          visibleData:
+            - 结果展示倒计时
+          controls: {}
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          visibleData:
+            - 交互随机结果
+            - 结果展示倒计时
+          controls: {}
+      notifications:
+        team_left:
+          - INTERACTIVE_RANDOM_RESULT
+        team_right:
+          - INTERACTIVE_RANDOM_RESULT
+        admin:
+          - INTERACTIVE_RANDOM_RESULT
+        broadcast:
+          - INTERACTIVE_RANDOM_RESULT
+      transition:
+        trigger: result-display-timer-expired
+        automaticByServer: true
+        nextPhase: map_pick-or-ban-first-or-side-pick
+    notes:
+      - 所有入口均不显示继续按钮，结果展示倒计时结束后由服务器自动推进
+
+  - id: MAP_PICK_WAITING_SELECTION
+    title: 队伍1拥有选图权，尚未选择地图
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#地图选择模式
+      - frontend/src/main.ts:2664
+    given:
+      fixture: map-pick-left
+    expect:
+      baseboard: running-current-map-pending
+      views:
+        team_left:
+          foreground: map-selector
+          mode: interactive
+          actingAs: left
+          headline: MAP 1 地图选择
+          visibleData:
+            - 合法地图池
+            - 地图模式
+            - 中文地图名
+            - 彩色倒计时
+          controls:
+            select-map:
+              state: enabled
+            confirm-map:
+              state: disabled
+              reason: 尚未选择合法地图
+            minimize-foreground:
+              state: enabled
+        team_right:
+          foreground: map-selector
+          mode: readonly
+          headline: 等待队伍1选择
+          visibleData:
+            - 地图池
+            - 灰色倒计时
+          controls:
+            select-map:
+              state: disabled
+              reason: 当前操作权属于队伍1
+            confirm-map:
+              state: disabled
+              label: 等待队伍1选择
+            minimize-foreground:
+              state: enabled
+        admin:
+          foreground: map-selector
+          mode: acting-for-team
+          actingAs: left
+          headline: MAP 1 地图选择
+          controls:
+            select-map:
+              state: enabled
+            confirm-map:
+              state: disabled
+              reason: 尚未选择合法地图
+            minimize-foreground:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          visibleData:
+            - 底板上的当前地图待定状态
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+    notes:
+      - 已选择过的地图灰色并带橙色边框，不可再次选择
+      - 不在地图池、模式不符或违反轮换规则的地图必须禁用并说明原因
+
+  - id: MAP_PICK_CONFIRMATION
+    title: 选择地图后的二次确认
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#二次确认规则
+      - frontend/src/main.ts:4072
+    given:
+      fixture: map-pick-left
+      localUI:
+        selectedMapId: lijang-tower
+        selectionConfirmation: map
+    expect:
+      baseboard: running-current-map-pending
+      views:
+        team_left:
+          foreground: map-selector
+          overlays:
+            - selection-confirmation
+          mode: interactive
+          headline: 确认选择地图
+          visibleData:
+            - 地图模式
+            - 中文地图名
+          controls:
+            cancel-confirmation:
+              state: enabled
+              label: 返回修改
+            accept-confirmation:
+              state: enabled
+              label: 确认
+        team_right:
+          foreground: map-selector
+          mode: readonly
+          headline: 等待队伍1选择
+          controls:
+            select-map:
+              state: disabled
+              reason: 当前操作权属于队伍1
+        admin:
+          foreground: map-selector
+          mode: acting-for-team
+          actingAs: left
+          headline: MAP 1 地图选择
+          controls:
+            select-map:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+    notes:
+      - selection-confirmation 是发起入口的 localUI，不应同步到其他入口
+
+  - id: MAP_PICK_CONFIRMED
+    title: 队伍1确认地图并进入下一阶段
+    reviewStatus: confirmed
+    sources:
+      - frontend/src/main.ts:922
+    given:
+      fixture: map-pick-left
+      localUI:
+        selectedMapId: lijang-tower
+        selectionConfirmation: map
+    when:
+      actor: team_left
+      action: map_select
+      payload:
+        mapId: lijang-tower
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: side-selector
+          mode: readonly
+          headline: 等待队伍2选择攻防
+          controls:
+            select-side:
+              state: disabled
+              reason: 当前选择权属于队伍2
+        team_right:
+          foreground: side-selector
+          mode: interactive
+          actingAs: right
+          headline: 选择攻防
+          controls:
+            select-side:
+              state: enabled
+            confirm-side:
+              state: disabled
+              reason: 尚未作出选择
+        admin:
+          foreground: side-selector
+          mode: acting-for-team
+          actingAs: right
+          headline: 选择攻防
+          controls:
+            select-side:
+              state: enabled
+            confirm-side:
+              state: disabled
+              reason: 尚未作出选择
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left:
+          - MAP_CONFIRMED
+          - RIGHT_ASSIGNED
+        team_right:
+          - MAP_CONFIRMED
+          - RIGHT_ASSIGNED
+        admin:
+          - MAP_CONFIRMED
+          - RIGHT_ASSIGNED
+        broadcast:
+          - MAP_CONFIRMED
+          - RIGHT_ASSIGNED
+      transition:
+        nextPhase: side_pick
+        alternatives:
+          - lineup_pick
+          - ban_order
+          - ban_first
+          - score_entry
+        alternativeReason: 根据选边、阵容与禁用配置跳过不适用阶段
+
+  - id: MAP_PICK_TIMEOUT_ADMIN_DECISION
+    title: 选图超时并等待管理员裁定
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#地图选择超时
+      - frontend/src/main.ts:2757
+      - frontend/src/main.ts:4257
+    given:
+      fixture: map-pick-left
+      runtime:
+        remainingTimeMs: 0
+        timedOut: true
+        awaitingAdminDecision: true
+      config:
+        mapTimeoutPolicy: admin_decision
+    expect:
+      baseboard: running-current-map-pending
+      persistentIndicators:
+        - 确认选择按钮禁用并显示“等待管理员裁定”
+      views:
+        team_left:
+          foreground: map-selector
+          mode: readonly
+          headline: 等待管理员裁定
+          controls:
+            select-map:
+              state: disabled
+              reason: 已超时
+            confirm-map:
+              state: disabled
+              label: 等待管理员裁定
+        team_right:
+          foreground: map-selector
+          mode: readonly
+          headline: 等待管理员裁定
+          controls:
+            select-map:
+              state: disabled
+              reason: 当前操作权属于队伍1且阶段已超时
+        admin:
+          foreground: map-selector
+          mode: acting-for-team
+          actingAs: left
+          headline: 选图超时裁定
+          controls:
+            select-map:
+              state: enabled
+              reason: 管理员仍可代选合法地图
+            confirm-map:
+              state: disabled
+              reason: 尚未选择合法地图
+            timeout-extend:
+              state: enabled
+            timeout-random:
+              state: enabled
+            timeout-forfeit:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          headline: 等待管理员裁定
+          controls: {}
+      notifications:
+        team_left:
+          - SELECTION_AWAITING_ADMIN
+        team_right:
+          - SELECTION_AWAITING_ADMIN
+        admin:
+          - SELECTION_AWAITING_ADMIN
+        broadcast:
+          - SELECTION_AWAITING_ADMIN
+    notes:
+      - 进入待裁定状态时发送一次 SELECTION_AWAITING_ADMIN；按钮文案负责持续表达当前状态
+      - 管理员完成裁定后由服务器发送一次 ADMIN_DECISION_RESOLVED，随后立即按权威状态继续
+
+  - id: SIDE_PICK_WAITING_SELECTION
+    title: 队伍2选择攻防或阵营
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#攻防与阵营选择
+      - frontend/src/main.ts:2840
+    given:
+      fixture: side-pick-right
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: side-selector
+          mode: readonly
+          headline: 等待队伍2选择
+          visibleData:
+            - 灰色倒计时
+          controls:
+            select-side:
+              state: disabled
+              reason: 当前选择权属于队伍2
+            confirm-side:
+              state: disabled
+        team_right:
+          foreground: side-selector
+          mode: interactive
+          actingAs: right
+          headline: 选择先进攻或先防守
+          visibleData:
+            - 彩色倒计时
+          controls:
+            select-side:
+              state: enabled
+            confirm-side:
+              state: disabled
+              reason: 尚未选择
+        admin:
+          foreground: side-selector
+          mode: acting-for-team
+          actingAs: right
+          headline: 选择先进攻或先防守
+          controls:
+            select-side:
+              state: enabled
+            confirm-side:
+              state: disabled
+              reason: 尚未选择
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+    notes:
+      - 攻防或阵营选择不使用 selection-confirmation；选择后由同一面板的确认按钮直接生效
+      - 对称地图选择文案改为蓝色方和红色方
+
+  - id: FIXED_MAP_SKIPS_MAP_PICK
+    title: 固定地图直接跳过选图阶段
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#地图选择模式
+      - frontend/src/main.ts:6547
+    given:
+      fixture: pre-start-rest
+      config:
+        fixedFirstMapEnabled: true
+    when:
+      actor: server
+      action: finish_pre_start_rest
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: side-selector
+          mode: readonly
+          controls:
+            select-side:
+              state: disabled
+              reason: 示例中选择权属于队伍2
+        team_right:
+          foreground: side-selector
+          mode: interactive
+          actingAs: right
+          controls:
+            select-side:
+              state: enabled
+        admin:
+          foreground: side-selector
+          mode: acting-for-team
+          actingAs: right
+          controls:
+            select-side:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left:
+          - FIXED_MAP_ANNOUNCED
+          - RIGHT_ASSIGNED
+        team_right:
+          - FIXED_MAP_ANNOUNCED
+          - RIGHT_ASSIGNED
+        admin:
+          - FIXED_MAP_ANNOUNCED
+          - RIGHT_ASSIGNED
+        broadcast:
+          - FIXED_MAP_ANNOUNCED
+          - RIGHT_ASSIGNED
+      transition:
+        skippedPhase: map_pick
+        nextPhase: side_pick-or-next-enabled-phase

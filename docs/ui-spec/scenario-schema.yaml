@@ -1,0 +1,197 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: owbanpick-ui-scenario-document
+title: OW Ban Pick UI scenario document
+type: object
+required:
+  - schemaVersion
+  - kind
+  - domain
+  - scenarios
+properties:
+  schemaVersion:
+    const: 1
+  kind:
+    const: ui-scenarios
+  domain:
+    type: string
+    minLength: 1
+  scenarios:
+    type: array
+    minItems: 1
+    items:
+      $ref: "#/$defs/scenario"
+additionalProperties: false
+
+$defs:
+  scenario:
+    type: object
+    required:
+      - id
+      - title
+      - reviewStatus
+      - given
+      - expect
+    properties:
+      id:
+        type: string
+        pattern: "^[A-Z][A-Z0-9_]+$"
+      title:
+        type: string
+        minLength: 1
+      reviewStatus:
+        enum:
+          - confirmed
+          - current-only
+          - needs-review
+          - proposed
+      sources:
+        type: array
+        items:
+          type: string
+      given:
+        type: object
+        required:
+          - fixture
+        properties:
+          fixture:
+            type: string
+          status:
+            type: object
+          runtime:
+            type: object
+          config:
+            type: object
+          localUI:
+            type: object
+        additionalProperties: false
+      when:
+        type: object
+        properties:
+          actor:
+            enum:
+              - team_left
+              - team_right
+              - admin
+              - broadcast
+              - server
+              - system
+          action:
+            type: string
+          payload:
+            type: object
+        additionalProperties: false
+      expect:
+        type: object
+        required:
+          - baseboard
+          - views
+          - notifications
+        properties:
+          baseboard:
+            type: string
+          views:
+            type: object
+            required:
+              - team_left
+              - team_right
+              - admin
+              - broadcast
+            properties:
+              team_left:
+                $ref: "#/$defs/view"
+              team_right:
+                $ref: "#/$defs/view"
+              admin:
+                $ref: "#/$defs/view"
+              broadcast:
+                $ref: "#/$defs/view"
+            additionalProperties: false
+          notifications:
+            type: object
+            required:
+              - team_left
+              - team_right
+              - admin
+              - broadcast
+            properties:
+              team_left:
+                $ref: "#/$defs/notificationList"
+              team_right:
+                $ref: "#/$defs/notificationList"
+              admin:
+                $ref: "#/$defs/notificationList"
+              broadcast:
+                $ref: "#/$defs/notificationList"
+            additionalProperties: false
+          transition:
+            type: object
+          persistentIndicators:
+            type: array
+            items:
+              type: string
+        additionalProperties: false
+      notes:
+        type: array
+        items:
+          type: string
+    additionalProperties: false
+
+  view:
+    type: object
+    required:
+      - foreground
+      - mode
+      - controls
+    properties:
+      foreground:
+        type: string
+      overlays:
+        type: array
+        items:
+          type: string
+      mode:
+        enum:
+          - interactive
+          - acting-for-team
+          - readonly
+          - hidden
+      actingAs:
+        enum:
+          - left
+          - right
+          - both
+          - null
+      headline:
+        type: string
+      visibleData:
+        type: array
+        items:
+          type: string
+      hiddenData:
+        type: array
+        items:
+          type: string
+      controls:
+        type: object
+        additionalProperties:
+          type: object
+          required:
+            - state
+          properties:
+            state:
+              enum:
+                - enabled
+                - disabled
+                - hidden
+            reason:
+              type: string
+            label:
+              type: string
+          additionalProperties: false
+    additionalProperties: false
+
+  notificationList:
+    type: array
+    items:
+      type: string
+

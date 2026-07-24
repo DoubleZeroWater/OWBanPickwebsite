@@ -1,394 +1,273 @@
-import { expect, test, type Page } from "@playwright/test";
-import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 
 test.describe.configure({ mode: "serial" });
 
-const runtimeStorePath = resolve(process.env.OW_RUNTIME_DIR ?? "backend/data/runtime", "rooms.json");
-
-interface RoomLink {
-  hash: string;
-  url: string;
-}
-
-interface CreatedRoom {
+type PortalCode = "A" | "B" | "C" | "D";
+type CreatedRoom = {
   roomId: string;
-  archiveKey: string;
-  links: Record<string, RoomLink>;
+  links: Record<PortalCode, { hash: string; url: string }>;
+};
+type FullSync = { kind: "full"; status: any; runtime: any };
+
+async function createRoom(request: APIRequestContext): Promise<CreatedRoom> {
+  const response = await request.post("/api/rooms");
+  expect(response.ok()).toBeTruthy();
+  return await response.json() as CreatedRoom;
 }
 
-test("landing page joins rooms, creates role entrances, copies hashes, and stays responsive", async ({ page, baseURL }) => {
-  await page.goto("/");
-  await expect(page.getByRole("heading", { name: "守望先锋赛事BP房间" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "已有房间" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "创建房间" })).toBeVisible();
-  const initialPanelHeights = await page.locator(".landing-panel").evaluateAll((elements) => (
-    elements.map((element) => element.getBoundingClientRect().height)
-  ));
-  expect(initialPanelHeights[0]).toBe(initialPanelHeights[1]);
+async function full(request: APIRequestContext, token: string): Promise<FullSync> {
+  const response = await request.post(`/api/rooms/token/${token}/sync`, { data: { status: null } });
+  expect(response.ok()).toBeTruthy();
+  return await response.json() as FullSync;
+}
 
-  await page.setViewportSize({ width: 320, height: 900 });
-  await expect(page.locator(".landing-layout")).toHaveCSS("grid-template-columns", "300px");
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-  await page.setViewportSize({ width: 1280, height: 720 });
-
-  const hashInput = page.locator("#joinRoomHash");
-  await hashInput.fill("A-7@K2");
-  await expect(hashInput).toHaveValue("a7k2");
-  await hashInput.fill("a7");
-  await page.getByRole("button", { name: "进入房间" }).click();
-  await expect(page.getByText("请输入完整的 4 位数字或小写字母哈希。")).toBeVisible();
-  await expect(page).toHaveURL(/\/$/);
-
-  await page.route("**/api/rooms/token/miss", (route) => route.fulfill({
-    status: 404,
-    contentType: "application/json",
-    body: JSON.stringify({ error: "not_found" }),
-  }));
-  await hashInput.fill("MISS");
-  await page.getByRole("button", { name: "进入房间" }).click();
-  await expect(page.getByText("房间入口不存在，请检查哈希。")).toBeVisible();
-  await page.unroute("**/api/rooms/token/miss");
-
-  await page.route("**/api/rooms/token/netw", (route) => route.abort());
-  await hashInput.fill("netw");
-  await page.getByRole("button", { name: "进入房间" }).click();
-  await expect(page.getByText("网络连接失败，请稍后重试。")).toBeVisible();
-  await page.unroute("**/api/rooms/token/netw");
-
-  let releaseCreateResponse: (() => void) | null = null;
-  const createResponseGate = new Promise<void>((resolvePromise) => {
-    releaseCreateResponse = resolvePromise;
-  });
-  await page.route("**/api/rooms", async (route) => {
-    if (route.request().method() !== "POST") {
-      await route.continue();
-      return;
-    }
-
-    await createResponseGate;
-    await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "failed" }) });
-  });
-  const createButton = page.locator("#createRoomButton");
-  const createClick = createButton.click();
-  await expect(createButton).toBeDisabled();
-  releaseCreateResponse?.();
-  await createClick;
-  await expect(page.getByText("创建房间失败，请稍后重试。")).toBeVisible();
-  await expect(page.getByRole("button", { name: "创建房间" })).toBeEnabled();
-  await page.unroute("**/api/rooms");
-
-  const room = await createRoom(page);
-  await expect(page.getByRole("button", { name: "创建房间" })).toHaveCount(0);
-  const createdPanelHeights = await page.locator(".landing-panel").evaluateAll((elements) => (
-    elements.map((element) => element.getBoundingClientRect().height)
-  ));
-  expect(createdPanelHeights[1]).toBeGreaterThan(createdPanelHeights[0]);
-  await expect(page.locator(".room-link-role span:last-child")).toHaveText([
-    "队伍1入口",
-    "队伍2入口",
-    "管理员入口",
-    "直播入口",
-  ]);
-
-  const origin = new URL(baseURL ?? "http://127.0.0.1:5175").origin;
-  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin });
-  const redCard = page.locator(".room-link-card", { hasText: "队伍1入口" });
-  await redCard.locator(".copy-room-hash-button").click();
-  await expect(page.getByText(`队伍1入口 ${room.links.A.hash} 已复制。`)).toBeVisible();
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(room.links.A.hash);
-
-  await Promise.all([
-    page.waitForURL(`**/r/${room.links.A.hash}`),
-    redCard.getByRole("link", { name: "进入" }).click(),
-  ]);
-  await expect(page.locator(".portal-badge")).toHaveText("队伍1入口");
-
-  await page.goto("/");
-  await page.locator("#joinRoomHash").fill(room.links.A.hash.toUpperCase());
-  await Promise.all([
-    page.waitForURL(`**/r/${room.links.A.hash}`),
-    page.getByRole("button", { name: "进入房间" }).click(),
-  ]);
-  await expect(page.locator(".portal-badge")).toHaveText("队伍1入口");
-});
-
-test("room hashes, admin dashboard, sync, expiration, and rate limit", async ({ page, baseURL }) => {
-  const firstRoom = await createRoom(page);
-  expect(Object.keys(firstRoom.links)).toEqual(["A", "B", "C", "D"]);
-  expect(firstRoom.roomId).toMatch(/^[0-9a-z]{4}$/);
-  Object.values(firstRoom.links).forEach((link) => expect(link.hash).toMatch(/^[0-9a-z]{4}$/));
-  expect(new Set(Object.values(firstRoom.links).map((link) => link.hash)).size).toBe(4);
-  expect(new Set([firstRoom.roomId, ...Object.values(firstRoom.links).map((link) => link.hash)]).size).toBe(5);
-
-  await page.goto(firstRoom.links.C.url);
-  await expect(page.locator(".portal-badge")).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "比赛配置" })).toBeVisible();
-
-  const team1Page = await page.context().newPage();
-  await team1Page.goto(firstRoom.links.A.url);
-  await expect(team1Page.locator(".portal-badge")).toHaveText("队伍1入口");
-  const team2Page = await page.context().newPage();
-  await team2Page.goto(firstRoom.links.B.url);
-  await expect(team2Page.locator(".portal-badge")).toHaveText("队伍2入口");
-  await team1Page.keyboard.press("i");
-  await expect(team1Page.getByRole("heading", { name: "比赛配置" })).toHaveCount(0);
-
-  await page.locator("details", { hasText: "地图设置" }).locator("summary").click();
-  await page.locator("#fixedFirstMapEnabled").uncheck();
-  await expect(page.locator("#firstMapPickerPolicy")).toBeEnabled();
-  await page.locator("#firstMapPickerPolicy").selectOption("interactive_random");
-  await page.locator("#confirmRoomConfigFromGate").click();
-  await expect(page.locator(".match-phase-label")).toHaveText("确认配置阶段");
-  await expect(page.locator("fieldset.config-editor-fields")).toBeVisible();
-  await expect(page.locator("fieldset.config-editor-fields")).toBeDisabled();
-  await expect(team1Page.getByRole("button", { name: "是" })).toBeVisible();
-  await expect(team2Page.getByRole("button", { name: "是" })).toBeVisible();
-  await team1Page.getByRole("button", { name: "是" }).click();
-  await team2Page.getByRole("button", { name: "是" }).click();
-  await page.locator("#startMatchFromGate").click();
-  await expect(page.locator("fieldset.config-editor-fields")).toBeVisible();
-  await expect(page.locator("fieldset.config-editor-fields")).toBeDisabled();
-  await expect(team1Page.locator(".match-phase-label")).toHaveText("比赛进行阶段", { timeout: 10_000 });
-  await page.locator("#skipRestPeriod").click();
-  await expect(team1Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "1" })).toBeVisible();
-  await team1Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "1" }).click();
-  await expect(team2Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "0" })).toBeVisible({ timeout: 10_000 });
-  await team2Page.locator('.interactive-random-choice:not(:disabled)', { hasText: "0" }).click();
-  await expect(page.getByText("1 XOR 0 = 1", { exact: true })).toBeVisible({ timeout: 10_000 });
-  await page.getByRole("button", { name: "继续" }).click();
-  await team1Page.close();
-  await team2Page.close();
-
-  const autoStartRoom = await createRoom(page);
-  await page.goto(autoStartRoom.links.C.url);
-  await page.locator("#teamsCanEditOwnName").check();
-  await page.locator("#startWithDefaultConfig").check();
-  const autoTeam1Page = await page.context().newPage();
-  const autoTeam2Page = await page.context().newPage();
-  await autoTeam1Page.goto(autoStartRoom.links.A.url);
-  await autoTeam2Page.goto(autoStartRoom.links.B.url);
-  await expect(autoTeam1Page.getByRole("dialog", { name: "赛前准备" })).toBeVisible();
-  await expect(autoTeam1Page.getByRole("button", { name: "确认队伍名称" })).toHaveCount(0);
-  const modalPosition = await autoTeam1Page.locator(".start-gate-team-modal").evaluate((element) => (
-    getComputedStyle(element).position
-  ));
-  expect(modalPosition).toBe("fixed");
-  await autoTeam1Page.getByRole("textbox", { name: "队伍名称" }).fill("A队");
-  await autoTeam2Page.getByRole("textbox", { name: "队伍名称" }).fill("B队");
-  await autoTeam1Page.getByRole("button", { name: "是" }).click();
-  await expect(autoTeam2Page.getByRole("textbox", { name: "队伍名称" })).toHaveValue("B队");
-  await autoTeam2Page.getByRole("button", { name: "是" }).click();
-  await expect(autoTeam1Page.locator(".match-phase-label")).toHaveText("比赛进行阶段", { timeout: 10_000 });
-  await expect(autoTeam2Page.locator(".room-presence-left strong")).toHaveText("A队");
-  await expect(autoTeam2Page.locator(".room-presence-right strong")).toHaveText("B队");
-  await autoTeam1Page.close();
-  await autoTeam2Page.close();
-
-  const adminHash = readAdminHash();
-  await page.goto(`${baseURL}/admin/${adminHash}`);
-  await expect(page.getByText("全局管理")).toBeVisible();
-  const activeRoomCard = page.locator(".active-admin-room-card", { hasText: firstRoom.roomId });
-  await expect(activeRoomCard.getByText(`房间 ${firstRoom.roomId}`, { exact: true })).toBeVisible();
-  await expect(activeRoomCard.getByText("队伍1入口", { exact: true })).toBeVisible();
-  await expect(activeRoomCard.getByText("队伍2入口", { exact: true })).toBeVisible();
-  await expect(activeRoomCard).toContainText(/创建：\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2}:\d{2}/);
-
-  await page.locator("#adminRoomsPerHour").fill("5");
-  await page.locator("#adminInactiveTimeout").fill("1");
-  await page.getByRole("button", { name: "新建模板" }).click();
-  await page.locator("#globalPresetName").fill("E2E FT2 杯赛");
-  await page.locator("#matchFormat").selectOption("ft2");
-  await page.getByRole("button", { name: "保存模板" }).click();
-  await expect(page.getByText("模板“E2E FT2 杯赛”已保存。")).toBeVisible();
-  await page.locator("#adminDefaultPreset").selectOption({ label: "E2E FT2 杯赛" });
-  await page.getByRole("button", { name: "保存全局设置" }).click();
-  await expect(page.getByText("全局设置已保存。")).toBeVisible();
-
-  const defaultRoom = await createRoom(page);
-  await page.goto(defaultRoom.links.C.url);
-  await expect(page.locator(".match-title").getByText("FT2", { exact: true })).toBeVisible();
-
-  await page.goto(`${baseURL}/admin/${adminHash}`);
-  await page.locator(".admin-room-card", { hasText: firstRoom.roomId }).getByRole("button", { name: "关闭房间" }).click();
-  await expect(page.getByText("房间已关闭。")).toBeVisible();
-  const historyCard = page.locator(".history-room-row", { hasText: firstRoom.archiveKey });
-  await expect(historyCard.getByText("手动关闭")).toBeVisible();
-  await historyCard.getByRole("button", { name: "查看" }).click();
-  const historyDialog = page.locator("#roomHistoryDialog");
-  await expect(historyDialog).toBeVisible();
-  await expect(historyDialog.locator("pre")).toContainText('"status": "closed"');
-  await expect(historyDialog.locator("pre")).toContainText('"action": "closed"');
-
-  const download = await page.request.get(
-    `${baseURL}/api/admin/${adminHash}/room-history/${firstRoom.archiveKey}/download`,
-  );
-  expect(download.status()).toBe(200);
-  expect(download.headers()["content-disposition"]).toContain(`${firstRoom.archiveKey}.json`);
-  await historyDialog.getByRole("button", { name: "关闭历史详情" }).click();
-
-  await page.goto("/");
-  await page.locator("#joinRoomHash").fill(firstRoom.links.C.hash);
-  await page.getByRole("button", { name: "进入房间" }).click();
-  await expect(page.getByText("房间已经关闭或因不活跃而过期。")).toBeVisible();
-  await expect(page).toHaveURL(/\/$/);
-
-  await page.goto(firstRoom.links.C.url);
-  await expect(page.getByText("房间已经关闭或因不活跃而过期。")).toBeVisible();
-
-  const staleRoom = await createRoom(page);
-  markRoomInactive(staleRoom.roomId);
-  await page.goto(staleRoom.links.A.url);
-  await expect(page.getByText("房间已经关闭或因不活跃而过期。")).toBeVisible();
-
-  await expectEventuallyRateLimited(page);
-});
-
-test("global admin refreshes the English catalog and edits the Chinese mapping", async ({ page, baseURL }) => {
-  const adminHash = readAdminHash();
-  const template = {
-    schemaVersion: 1,
-    catalogHash: "sha256:new",
-    modes: { Escort: "" },
-    maps: { "Circuit Royal": "" },
-    heroes: { Ana: "" },
-  };
-  const diagnostics = {
-    valid: true,
-    versionMismatch: false,
-    hashMismatch: false,
-    missing: { modes: [], maps: [], heroes: [] },
-    extra: { modes: [], maps: [], heroes: [] },
-    blank: { modes: [], maps: [], heroes: [] },
-    typeErrors: [],
-  };
-  const maintenance = {
-    catalogHash: "sha256:current",
-    catalogSource: "bundled",
-    sources: { heroes: "https://overwatch.fandom.com/wiki/Heroes", maps: "https://overwatch.fandom.com/wiki/Overwatch_Wiki" },
-    updatedAt: Math.floor(Date.now() / 1000),
-    counts: { modes: 5, maps: 30, heroes: 52 },
-    translation: { source: "bundled", active: true, diagnostics, document: template },
-    translationTemplate: template,
-    job: null,
-  };
-
-  await page.route("**/api/admin/*/catalog-maintenance", (route) => route.fulfill({
-    status: 200,
-    contentType: "application/json",
-    body: JSON.stringify(maintenance),
-  }));
-  await page.route("**/api/admin/*/catalog-refresh", (route) => route.fulfill({
-    status: 202,
-    contentType: "application/json",
-    body: JSON.stringify({ id: "job-1", status: "running", stage: "fetch", progress: 10, message: "正在读取", error: null }),
-  }));
-  await page.route("**/api/admin/*/catalog-refresh/job-1", (route) => route.fulfill({
-    status: 200,
-    contentType: "application/json",
-    body: JSON.stringify({
-      id: "job-1",
-      status: "completed",
-      stage: "completed",
-      progress: 100,
-      message: "完成",
-      error: null,
-      result: { counts: { modes: 5, maps: 30, heroes: 52 }, catalogHash: "sha256:new", translationTemplate: template },
-    }),
-  }));
-  await page.route("**/api/admin/*/catalog-translation", (route) => route.fulfill({
-    status: 200,
-    contentType: "application/json",
-    body: JSON.stringify({ active: false, diagnostics: { ...diagnostics, valid: false, hashMismatch: true } }),
-  }));
-
-  const origin = new URL(baseURL ?? "http://127.0.0.1:5175").origin;
-  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin });
-  await page.goto(`${baseURL}/admin/${adminHash}`);
-  await expect(page.getByRole("heading", { name: "英雄与地图数据" })).toBeVisible();
-  await expect(page.getByText("52 英雄 · 30 地图")).toBeVisible();
-
-  await page.getByRole("button", { name: "爬取英文更新" }).click();
-  const templateDialog = page.getByRole("dialog", { name: "英文到中文映射模板" });
-  await expect(templateDialog).toBeVisible({ timeout: 5_000 });
-  await expect(templateDialog.locator("textarea")).toContainText('"Circuit Royal"');
-  await expect(templateDialog.locator("footer span")).toContainText(/已自动复制|请按 Ctrl\+C/);
-  await templateDialog.getByRole("button", { name: "关闭映射模板" }).click();
-
-  await page.getByRole("button", { name: "更新中文映射" }).click();
-  const translationDialog = page.getByRole("dialog", { name: "更新中文映射" });
-  await translationDialog.locator("textarea").fill("{not-json");
-  await translationDialog.getByRole("button", { name: "保存映射" }).click();
-  await expect(translationDialog.getByText("JSON 格式错误，旧映射未被覆盖。")).toBeVisible();
-  await translationDialog.locator("textarea").fill(JSON.stringify({ schemaVersion: 1 }));
-  await translationDialog.getByRole("button", { name: "保存映射" }).click();
-  await expect(page.getByText("中文映射已保存，但与当前目录不匹配；网站现统一显示英文。")).toBeVisible();
-});
-
-async function createRoom(page: Page): Promise<CreatedRoom> {
-  await page.goto("/");
-  await page.getByRole("button", { name: "创建房间" }).click();
-  await expect(page.getByText("房间已创建")).toBeVisible();
-
-  const links: Record<string, RoomLink> = {};
-
-  for (const code of ["A", "B", "C", "D"]) {
-    const card = page.locator(`.room-link-card-${code.toLowerCase()}`);
-    const url = await card.locator(".enter-room-link").getAttribute("href");
-    const hash = await card.locator(".copy-room-hash-button").innerText();
-
-    if (!url) {
-      throw new Error(`Missing ${code} room URL`);
-    }
-
-    links[code] = { hash, url };
-  }
-
-  const store = readStore();
-  const matchedRoom = store.rooms.find((room: any) => room.tokens.C === links.C.hash);
-
+function ref(status: any) {
   return {
-    roomId: matchedRoom.id,
-    archiveKey: ["A", "B", "C", "D"].map((code) => links[code].hash).join("-"),
-    links,
+    epoch: status.epoch,
+    revision: status.revision,
+    hash: status.hash,
+    phaseId: status.phase.phaseId,
   };
 }
 
-async function expectEventuallyRateLimited(page: Page): Promise<void> {
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    await page.goto("/");
-    await page.getByRole("button", { name: "创建房间" }).click();
-
-    const rateLimited = page.getByText("创建过于频繁，请稍后再试。");
-
-    try {
-      await expect(rateLimited).toBeVisible({ timeout: 1500 });
-      return;
-    } catch {
-      await expect(page.getByText("房间已创建")).toBeVisible();
-    }
-  }
-
-  throw new Error("Expected room creation to become rate limited");
+async function action(
+  request: APIRequestContext,
+  token: string,
+  type: string,
+  payload: Record<string, unknown> = {},
+  requestId = crypto.randomUUID(),
+) {
+  const state = await full(request, token);
+  return await request.post(`/api/rooms/token/${token}/actions`, {
+    data: { requestId, expected: ref(state.status), type, payload },
+  });
 }
 
-function readAdminHash(): string {
-  return readStore().adminHash;
+async function configureFastRoom(request: APIRequestContext, room: CreatedRoom): Promise<void> {
+  const admin = room.links.C.hash;
+  const configResponse = await request.get(`/api/rooms/token/${admin}/config`);
+  const configEnvelope = await configResponse.json();
+  const config = configEnvelope.value;
+  config.stageLimits.preStartRestSeconds = 0;
+  config.stageLimits.postMatchRestSeconds = 0;
+  config.firstMapPickerPolicy = "left";
+  config.firstSideChoicePolicy = "none";
+  config.openingSidePolicy = "left";
+  config.rosterMode = "skip";
+  config.banEnabled = false;
+  config.scoreReportMode = "admin_only";
+  const saved = await request.put(`/api/rooms/token/${admin}/config`, { data: { config } });
+  expect(saved.ok(), await saved.text()).toBeTruthy();
+  expect((await action(request, admin, "config_confirm")).ok()).toBeTruthy();
 }
 
-function markRoomInactive(roomId: string): void {
-  const store = readStore();
-  const room = store.rooms.find((entry: any) => entry.id === roomId);
-
-  if (!room) {
-    throw new Error(`Missing room ${roomId}`);
-  }
-
-  room.lastActiveAt = Math.floor(Date.now() / 1000) - 3600;
-  room.closedAt = null;
-  writeFileSync(runtimeStorePath, JSON.stringify(store, null, 2), "utf-8");
+async function configureBanRoom(request: APIRequestContext, room: CreatedRoom): Promise<void> {
+  const admin = room.links.C.hash;
+  const configResponse = await request.get(`/api/rooms/token/${admin}/config`);
+  const configEnvelope = await configResponse.json();
+  const config = configEnvelope.value;
+  config.stageLimits.preStartRestSeconds = 0;
+  config.stageLimits.postMatchRestSeconds = 0;
+  config.firstMapPickerPolicy = "left";
+  config.firstSideChoicePolicy = "none";
+  config.openingSidePolicy = "left";
+  config.rosterMode = "skip";
+  config.banEnabled = true;
+  config.scoreReportMode = "admin_only";
+  const saved = await request.put(`/api/rooms/token/${admin}/config`, { data: { config } });
+  expect(saved.ok(), await saved.text()).toBeTruthy();
+  expect((await action(request, admin, "config_confirm")).ok()).toBeTruthy();
 }
 
-function readStore(): any {
-  return JSON.parse(readFileSync(runtimeStorePath, "utf-8"));
+async function expectPortalLoaded(page: Page, url: string): Promise<void> {
+  await page.goto(url);
+  await expect(page.locator("main")).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("status hash 校验失败");
 }
+
+test("four portals converge on one authoritative FT2 status and rollback together", async ({ page, request, context }) => {
+  const room = await createRoom(request);
+  await configureFastRoom(request, room);
+
+  const leftPage = page;
+  const rightPage = await context.newPage();
+  const adminPage = await context.newPage();
+  const broadcastPage = await context.newPage();
+  await expectPortalLoaded(leftPage, room.links.A.url);
+  await expectPortalLoaded(rightPage, room.links.B.url);
+  await expectPortalLoaded(adminPage, room.links.C.url);
+  await expectPortalLoaded(broadcastPage, room.links.D.url);
+  await expect(leftPage).toHaveURL(new RegExp(`/r/${room.links.A.hash}$`));
+  await expect(rightPage).toHaveURL(new RegExp(`/r/${room.links.B.hash}$`));
+  await expect(adminPage).toHaveURL(new RegExp(`/r/${room.links.C.hash}$`));
+  await expect(broadcastPage).toHaveURL(new RegExp(`/r/${room.links.D.hash}$`));
+
+  expect((await action(request, room.links.A.hash, "portal_ready_set", { ready: true })).ok()).toBeTruthy();
+  expect((await action(request, room.links.B.hash, "portal_ready_set", { ready: true })).ok()).toBeTruthy();
+  expect((await action(request, room.links.C.hash, "match_start")).ok()).toBeTruthy();
+
+  expect((await action(request, room.links.A.hash, "map_select", { mapId: "lijiang_tower" })).ok()).toBeTruthy();
+  const scorePhase = await full(request, room.links.C.hash);
+  expect(scorePhase.status.phase.type).toBe("score_entry");
+  expect((await action(request, room.links.C.hash, "score_submit", { score: { left: 2, right: 0 } })).ok()).toBeTruthy();
+
+  await full(request, room.links.A.hash); // settles the zero-length rest phase
+  expect((await action(request, room.links.B.hash, "map_select", { mapId: "dorado" })).ok()).toBeTruthy();
+  expect((await action(request, room.links.B.hash, "side_select", { selectedSide: "right" })).ok()).toBeTruthy();
+  expect((await action(request, room.links.C.hash, "score_submit", { score: { left: 1, right: 0 } })).ok()).toBeTruthy();
+
+  const completedStates = await Promise.all((Object.keys(room.links) as PortalCode[]).map((code) => full(request, room.links[code].hash)));
+  expect(new Set(completedStates.map((state) => state.status.hash)).size).toBe(1);
+  expect(completedStates[0].status.lifecycle).toBe("completed");
+  await broadcastPage.reload();
+  await expect(broadcastPage.locator(".room-presence-center.match-completed")).toContainText("比赛已结束");
+  await expect(broadcastPage.locator(".map-selector-overlay, .side-selector-overlay, .lineup-selector-overlay, .ban-selector-overlay, .score-selector-overlay")).toHaveCount(0);
+  await broadcastPage.setViewportSize({ width: 1440, height: 900 });
+  await expect(broadcastPage).toHaveScreenshot("match-completed.png", { animations: "disabled" });
+
+  const readOnly = await action(request, room.links.D.hash, "global_pause_set", { active: true });
+  expect(readOnly.status()).toBe(403);
+
+  const historyResponse = await request.get(`/api/rooms/token/${room.links.C.hash}/status-history`);
+  const history = (await historyResponse.json()).items as any[];
+  const target = history.find((item) => item.phase.type === "score_entry");
+  expect(target).toBeTruthy();
+  const rollbackResponse = await request.post(`/api/rooms/token/${room.links.C.hash}/rollback`, {
+    data: { revision: target.revision },
+  });
+  expect(rollbackResponse.ok()).toBeTruthy();
+  const rolled = await rollbackResponse.json();
+  expect(rolled.status.epoch).toBe(2);
+  expect(rolled.status.revision).toBeGreaterThan(completedStates[0].status.revision);
+
+  await expect.poll(async () => {
+    const states = await Promise.all((Object.keys(room.links) as PortalCode[]).map((code) => full(request, room.links[code].hash)));
+    return `${new Set(states.map((state) => state.status.hash)).size}:${states[0].status.epoch}`;
+  }).toBe("1:2");
+
+  await adminPage.reload();
+  await expect(adminPage.locator("#refreshAuthoritativeHistory")).toBeVisible();
+  await expect(adminPage.locator(".admin-checkpoint-panel")).not.toContainText("revision");
+  await expect(adminPage.locator("#authoritativeHistoryRevision")).toContainText("第 1 张地图 · 选图");
+  expect((await request.get(`/api/rooms/token/${room.links.C.hash}/snapshot`)).status()).toBe(404);
+});
+
+test("runtime-only updates keep revision while stale and duplicate actions are handled safely", async ({ request }) => {
+  const room = await createRoom(request);
+  await configureFastRoom(request, room);
+  const left = room.links.A.hash;
+  const before = await full(request, left);
+  const requestId = crypto.randomUUID();
+  const body = {
+    requestId,
+    expected: ref(before.status),
+    type: "portal_ready_set",
+    payload: { ready: true },
+  };
+  const first = await request.post(`/api/rooms/token/${left}/actions`, { data: body });
+  const repeated = await request.post(`/api/rooms/token/${left}/actions`, { data: body });
+  expect(first.ok()).toBeTruthy();
+  expect(repeated.ok()).toBeTruthy();
+  expect(await repeated.json()).toEqual(await first.json());
+
+  const afterReady = await full(request, left);
+  expect(afterReady.status.revision).toBe(before.status.revision);
+  expect(afterReady.runtime.presence.A.ready).toBe(true);
+
+  expect((await action(request, room.links.C.hash, "match_start", { force: true })).ok()).toBeTruthy();
+  const stale = await request.post(`/api/rooms/token/${left}/actions`, {
+    data: { ...body, requestId: crypto.randomUUID(), type: "map_select", payload: { mapId: "lijiang_tower" } },
+  });
+  expect(stale.status()).toBe(409);
+  const stalePayload = await stale.json();
+  expect(stalePayload.error).toBe("stale_status");
+  expect(stalePayload.kind).toBe("full");
+
+  const same = await request.post(`/api/rooms/token/${left}/sync`, {
+    data: { status: { epoch: stalePayload.status.epoch, revision: stalePayload.status.revision, hash: stalePayload.status.hash } },
+  });
+  expect((await same.json()).kind).toBe("runtime");
+});
+
+test("broadcast mirrors the score phase read-only and global pause locks room actions", async ({ page, request }) => {
+  const room = await createRoom(request);
+  await configureFastRoom(request, room);
+  expect((await action(request, room.links.C.hash, "match_start", { force: true })).ok()).toBeTruthy();
+  expect((await action(request, room.links.A.hash, "map_select", { mapId: "lijiang_tower" })).ok()).toBeTruthy();
+
+  await expectPortalLoaded(page, room.links.D.url);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(page.locator(".score-selector-overlay")).toBeVisible();
+  await expect(page.getByText("直播只读 · 等待比分确认")).toBeVisible();
+  await expect(page.locator("input.score-control")).toHaveCount(0);
+  await expect(page.locator(".score-selector-overlay button")).toHaveCount(0);
+  await expect(page).toHaveScreenshot("broadcast-score-readonly.png", {
+    animations: "disabled",
+    mask: [page.locator(".countdown-time")],
+  });
+
+  expect((await action(request, room.links.C.hash, "global_pause_set", { active: true })).ok()).toBeTruthy();
+  await page.reload();
+  await expect(page.locator(".pause-overlay")).toBeVisible();
+  await expect(page.locator(".return-home-button, #minimizeMapSelector")).toHaveCount(0);
+
+  await page.goto(room.links.C.url);
+  await expect(page.locator(".pause-overlay")).toBeVisible();
+  await expect(page.locator("#confirmScorePick")).toBeDisabled();
+  await expect(page.locator("[data-score-pause-side]")).toHaveCount(2);
+  expect(await page.locator("[data-score-pause-side]").evaluateAll((buttons) => (
+    buttons.every((button) => (button as HTMLButtonElement).disabled)
+  ))).toBe(true);
+  await expect(page.locator("#rollbackToConfig")).toBeDisabled();
+  await expect(page.locator("#resumeGlobalTimer")).toBeEnabled();
+  await expect(page).toHaveScreenshot("global-pause-admin.png", {
+    animations: "disabled",
+    mask: [page.locator(".pause-elapsed, .pause-total-elapsed, .countdown-time")],
+  });
+});
+
+test("ban order submits once while hero ban keeps the in-app confirmation", async ({ page, request }) => {
+  const room = await createRoom(request);
+  await configureBanRoom(request, room);
+  expect((await action(request, room.links.C.hash, "match_start", { force: true })).ok()).toBeTruthy();
+  expect((await action(request, room.links.A.hash, "map_select", { mapId: "lijiang_tower" })).ok()).toBeTruthy();
+  expect((await action(request, room.links.A.hash, "hero_ban_select", { heroId: "mauga" })).ok()).toBeTruthy();
+  expect((await action(request, room.links.B.hash, "hero_ban_select", { heroId: "orisa" })).ok()).toBeTruthy();
+  expect((await action(request, room.links.C.hash, "score_submit", { score: { left: 2, right: 0 } })).ok()).toBeTruthy();
+  await full(request, room.links.A.hash);
+  expect((await action(request, room.links.B.hash, "map_select", { mapId: "dorado" })).ok()).toBeTruthy();
+  expect((await action(request, room.links.B.hash, "side_select", { selectedSide: "right" })).ok()).toBeTruthy();
+
+  await expectPortalLoaded(page, room.links.B.url);
+  await page.locator('[data-ban-order="first"]').click();
+  await page.locator("#confirmBanPick").click();
+  await expect(page.locator(".selection-confirmation-overlay")).toHaveCount(0);
+  await expect.poll(async () => (await full(request, room.links.C.hash)).status.phase.type).toBe("ban_first");
+
+  await page.reload();
+  await page.locator(".hero-option:not(:disabled)").first().click();
+  await page.locator("#confirmBanPick").click();
+  await expect(page.locator(".selection-confirmation-overlay")).toBeVisible();
+});
+
+test("minimizing a phase keeps its name, remaining time, and live countdown", async ({ page, request }) => {
+  const room = await createRoom(request);
+  await configureFastRoom(request, room);
+  expect((await action(request, room.links.C.hash, "match_start", { force: true })).ok()).toBeTruthy();
+  await expectPortalLoaded(page, room.links.A.url);
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  const before = await page.locator(".map-selector-progress .countdown-time").textContent();
+  await expect(page).toHaveScreenshot("map-selection.png", {
+    animations: "disabled",
+    mask: [page.locator(".countdown-time")],
+  });
+  await page.locator("#minimizeMapSelector").click();
+  await expect(page.locator(".map-selector-minimized")).toContainText("MAP 1 选图中");
+  await expect(page.locator("#restoreMapSelector")).toBeVisible();
+  await page.waitForTimeout(1_100);
+  const after = await page.locator(".map-selector-progress-mini .countdown-time").textContent();
+  expect(before).not.toBe(after);
+  await page.locator("#restoreMapSelector").click();
+  await expect(page.locator(".map-selector-overlay")).toBeVisible();
+});

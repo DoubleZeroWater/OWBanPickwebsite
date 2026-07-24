@@ -1,0 +1,600 @@
+# OW Ban Pick 房间权威状态（前后端协议设计版）
+#
+# 这是一份“单个主要状态快照”的完整示例，也是前端和后端应共同遵守的字段标准。
+# 后端在内存中保存 statusHistory[]；数组中的每一项都采用本文件的结构。
+#
+# 边界：
+# - status：本文件定义的内容；保存已经成为比赛事实、能够恢复主页面的主要状态。
+# - runtime：倒计时、暂停、在线状态、单方提交、待确认比分等当前阶段瞬时内容。
+# - localUI：输入框草稿、焦点、弹窗、折叠状态等单个浏览器内容。
+# - notificationStream：服务器保存的最多 100 条权威通知事件，不进入 status 哈希。
+#
+# 当前旧快照到新协议的主要迁移关系：
+# - roomStarted -> lifecycle + phase.type
+# - currentState.teams -> match.teams
+# - currentState.maps -> match.maps
+# - confirmedLineups -> match.maps[].lineups
+# - firstMapPickerSide -> match.decisions.firstMapPickerSide
+# - openingSide -> match.decisions.openingBanSide
+# - mapSelectorState / sideSelectorState / lineupSelectorState / banSelectorState /
+#   scoreSelectorState / restState -> phase + runtime
+# - countdownStartedAt / countdownStartSeconds / pauseState / presence -> runtime
+# - notificationEvents -> notificationStream；adminNotice / teamAckNotice 不再作为独立房间弹窗
+
+# 状态数据结构版本。只有协议字段发生不兼容变化时才递增，不随比赛操作递增。
+schemaVersion: 2
+
+# 房间稳定 ID，只用于归属校验、路由和日志，不能当作鉴权令牌。
+roomId: abcd
+
+# 时间线代数。普通流程推进不改变；管理员回退、重开等破坏旧时间线的操作使其递增。
+epoch: 1
+
+# 主要状态的单调递增序号。即使回退到旧内容，也必须创建新的更大 revision。
+revision: 38
+
+# 当前状态的 SHA-256 摘要。
+# 计算时排除 hash 字段本身，并对其余 status 使用统一的规范化 JSON 序列化。
+# 该值只用于同步一致性检查，不能用于鉴权。
+hash: "sha256:0123456789abcdef..."
+
+# 当前状态引用的资源目录摘要，对应现有 /api/assets 返回的 catalogHash。
+# 客户端发现本地目录摘要不一致时，应先重新获取地图、模式、英雄和翻译目录。
+catalogHash: "sha256:catalog-example..."
+
+# 整场比赛的大生命周期。
+# 可选值：
+# - preparing：房间处于配置、配置确认或等待双方准备阶段。
+# - running：比赛已经开始，正在进行 BP、比分确认或场间休息。
+# - completed：系列赛已经产生最终胜方并正常结束。
+lifecycle: running
+
+# 完整且已经锁定生效的比赛规则。
+# config 是本文件中的唯一配置标准，不再另设第二份 YAML。
+# 实际 status 中不得使用空对象或只保存模板 ID，必须复制完整配置，
+# 保证历史 status 不依赖一个以后可能被修改或删除的外部预设。
+#
+# 生效条件表达式约定：
+# - 使用 ==、!=、>、>=、&&、||、in、null、true、false。
+# - currentMap 表示 match.maps[phase.mapIndex]；phase.mapIndex 为 null 时 currentMap 也为 null。
+# - runtime 表示与当前 status 绑定的瞬时状态，不是本 YAML 的子字段。
+# - 始终生效的字段省略“生效条件”注释。
+config:
+  # 配置数据结构版本。只有 config 内部字段发生不兼容变化时才递增。
+  schemaVersion: 1
+
+  # 显示在房间和直播页面上的比赛名称，1～120 个字符。
+  matchName: "OW Ban Pick Invitational"
+
+  teams:
+    left: "队伍 1"
+    right: "队伍 2"
+
+  # 可选值：
+  # - ft2：先取得 2 张地图胜利；通常最多打 3 张，允许平局时可继续使用预留槽位。
+  # - ft3：先取得 3 张地图胜利；通常最多打 5 张。
+  # - ft4：先取得 4 张地图胜利；通常最多打 7 张。
+  matchFormat: ft2
+
+  # 为可能出现的平局额外预留多少张地图。
+  # 当前旧实现固定为 2，因此 FT2/FT3/FT4 的最大槽位分别为 5/7/9。
+  # 生效条件：lifecycle == preparing
+  drawMapReserve: 2
+
+  # 双方均准备后，是否跳过管理员二次确认并直接使用本配置开始比赛。
+  # 生效条件：lifecycle == preparing && phase.type == waiting_ready
+  startWithDefaultConfig: false
+
+  # 是否允许队伍在比赛开始前修改自己的显示名称。
+  # 生效条件：lifecycle == preparing && phase.type == waiting_ready
+  teamsCanEditOwnName: false
+
+  stageLimits:
+    # 比赛开始前的准备时间；0 表示跳过。
+    # 生效条件：phase.type == pre_start_rest
+    preStartRestSeconds: 30
+
+    # 选图阶段时限；允许范围建议为 1～3600 秒。
+    # 当前实现的 side_pick 与 map_pick 共用该时限。
+    # 生效条件：phase.type == map_pick || phase.type == side_pick
+    mapSelectSeconds: 45
+
+    # 双方提交上场选手的时限。
+    # 生效条件：phase.type == lineup_pick
+    playerSelectSeconds: 60
+
+    # 败者选择先手/后手 Ban 的时限；仅 allow_loser_choose 使用。
+    # 生效条件：banEnabled == true && firstBanPolicy == allow_loser_choose && phase.type == ban_order
+    firstBanChoiceSeconds: 25
+
+    # 先手方选择 Ban 英雄的时限。
+    # 生效条件：banEnabled == true && phase.type == ban_first
+    firstBanActionSeconds: 25
+
+    # 后手方选择 Ban 英雄的时限。
+    # 生效条件：banEnabled == true && phase.type == ban_second
+    secondBanActionSeconds: 25
+
+    # 一方提交比分后，另一方确认或拒绝的时限。
+    # 生效条件：phase.type == score_entry && scoreReportMode == team_submit_opponent_confirm && runtime.score.submittedBy != null
+    scoreConfirmSeconds: 30
+
+    # 每张地图结束后的场间休息时间；0 表示跳过。
+    # 生效条件：phase.type == post_map_rest
+    postMatchRestSeconds: 120
+
+  # 地图模式枚举：
+  # - control：占领要点。
+  # - escort：运载目标。
+  # - hybrid：攻击/护送。
+  # - push：机动推进。
+  # - flashpoint：闪点作战。
+  # 地图 ID 这里只使用少量示例，正式值由 catalogHash 对应的服务器目录验证。
+  # 生效条件：mapSelectionMode != fixed_map_order
+  mapPool:
+    # 生效条件：mapSelectionMode != fixed_map_order
+    control: [lijiang_tower, ilios]
+    # 生效条件：mapSelectionMode != fixed_map_order
+    escort: [circuit_royal, dorado]
+    # 生效条件：mapSelectionMode != fixed_map_order
+    hybrid: [kings_row, hollywood]
+    # 生效条件：mapSelectionMode != fixed_map_order
+    push: [colosseo, new_queen_street]
+    # 生效条件：mapSelectionMode != fixed_map_order
+    flashpoint: [suravasa, new_junk_city]
+
+  # 可选值：
+  # - unique_map：任意选择模式，但整场不能重复已经选过的地图。
+  # - unique_mode_until_cycle：任意选择首图模式；所有可用模式至少出现一次前不能重复模式。
+  # - first_mode_then_unique_mode：首图必须使用 firstMapMode；此后模式完成一轮前不能重复。
+  # - strict_mode_order：每张地图严格使用 modeOrder 指定的模式，具体地图仍由有权方选择。
+  # - fixed_map_order：完全使用 fixedMapOrder，不再进入选图阶段。
+  mapSelectionMode: first_mode_then_unique_mode
+
+  # 第一张地图要求的模式。
+  # 可选值：control | escort | hybrid | push | flashpoint
+  # 生效条件：mapSelectionMode == first_mode_then_unique_mode
+  firstMapMode: control
+
+  # strict_mode_order 使用的模式顺序；允许同一模式在不同位置重复。
+  # 每一项可选值：control | escort | hybrid | push | flashpoint。
+  # 生效条件：mapSelectionMode == strict_mode_order
+  modeOrder: [control, push, hybrid, escort, flashpoint]
+
+  # fixed_map_order 使用的完整地图顺序，每一项必须是合法地图 ID。
+  # 生效条件：mapSelectionMode == fixed_map_order
+  fixedMapOrder:
+    - lijiang_tower
+    - kings_row
+    - dorado
+    - colosseo
+    - suravasa
+
+  # 是否在非 fixed_map_order 模式下固定第一张地图。
+  # 生效条件：mapSelectionMode != fixed_map_order
+  fixedFirstMapEnabled: false
+
+  # fixedFirstMapEnabled 为 true 时使用的地图 ID；必须存在于 mapPool。
+  # 生效条件：mapSelectionMode != fixed_map_order && fixedFirstMapEnabled == true
+  fixedFirstMapId: lijiang_tower
+
+  # 第一张地图选择方的确定方式。
+  # 可选值：
+  # - random：服务器直接随机决定。
+  # - interactive_random：双方提交随机输入，后端汇合后决定。
+  # - left
+  # - right
+  # 生效条件：phase.mapIndex == 0 && mapSelectionMode != fixed_map_order && fixedFirstMapEnabled == false
+  firstMapPickerPolicy: interactive_random
+  
+  # 第一张地图的选边规则。
+  # 可选值：
+  # - none：跳过首图选边。
+  # - map_picker：首图选图方同时拥有选边权；固定首图时不可使用。
+  # - left
+  # - right
+  # - left_attack：固定左队为进攻方；对称模式下等价为左队红色方。
+  # - left_defense：固定左队为防守方；对称模式下等价为左队蓝色方。
+  # 生效条件：lifecycle == running && phase.mapIndex == 0
+  firstSideChoicePolicy: map_picker
+
+  # 当前唯一可选值：
+  # - loser_choose：从第二张地图开始，由上一张非平局地图的败者选择下一张地图。
+  # 生效条件：phase.mapIndex > 0 && mapSelectionMode != fixed_map_order
+  mapPickerPolicy: loser_choose
+
+  # 选图超时后的处理方式。
+  # 可选值：
+  # - warn_extend_30：记录警告并重新给予 30 秒。
+  # - random_legal_map：服务器随机选择当前合法地图。
+  # - forfeit_map：超时方本张地图判负。
+  # - admin_decision：暂停自动推进，等待管理员裁定。
+  # 生效条件：phase.type == map_pick
+  mapTimeoutPolicy: warn_extend_30
+
+  # false：仅 Escort/Hybrid 等非对称模式选择攻防。
+  # true：Control/Push/Flashpoint 等对称模式也选择红蓝阵营。
+  # 本示例为 true，因此 control 地图会产生 kind: color 的选边结果。
+  # 生效条件：currentMap.modeId in [control, push, flashpoint]
+  symmetricSideChoiceEnabled: true
+
+  # 后续地图的选边权归属。
+  # 可选值：
+  # - previous_winner：上一张非平局地图的胜者拥有选边权。
+  # - previous_loser：上一张非平局地图的败者拥有选边权。
+  # 生效条件：lifecycle == running && phase.mapIndex > 0
+  subsequentSideChoicePolicy: previous_loser
+
+  # 英雄角色枚举：tank | damage | support。
+  # 英雄 ID 由服务器爬取的英雄目录按职责生成，并在配置校验时去重。
+  # 生效条件：banEnabled == true
+  heroPool:
+    # 生效条件：banEnabled == true
+    tank: [mauga, orisa, roadhog, zarya, dva, doomfist, hazard, winston, wreckingball, domina, junkerqueen, ramattra, reinhardt, sigma]
+    # 生效条件：banEnabled == true
+    damage: [anran, genji, reaper, shion, tracer, vendetta, venture, echo, freja, pharah, sierra, sombra, ashe, cassidy, hanzo, sojourn, widowmaker, bastion, emre, junkrat, mei, soldier76, symmetra, torbjorn]
+    # 生效条件：banEnabled == true
+    support: [kiriko, lifeweaver, mercy, moira, brigitte, illari, juno, mizuki, wuyang, ana, baptiste, jetpackcat, lucio, zenyatta]
+
+  # 上场选手填写模式。
+  # 可选值：
+  # - free_input：队伍可以自由填写上场选手。
+  # - preset_only：只能从 presetRosters 选择成员。
+  # - skip：跳过阵容提交阶段，地图 lineups 保持为 null。
+  rosterMode: free_input
+
+  # 阵容槽位 ID 是稳定字段；role 可选值：tank | damage | support
+  # 生效条件：rosterMode != skip
+  lineupSlots:
+    # 这里沿用当前前端 lineupSlots 的实际 ID 和顺序，便于迁移 confirmedLineups。
+    - { id: damage-1, role: damage }
+    - { id: damage-2, role: damage }
+    - { id: tank-1, role: tank }
+    - { id: support-1, role: support }
+    - { id: support-2, role: support }
+
+  # rosterMode 为 preset_only 时允许选择的成员 ID 或显示名称。
+  # 生效条件：rosterMode == preset_only
+  presetRosters:
+    # 生效条件：rosterMode == preset_only
+    left: [left_player_1, left_player_2, left_player_3, left_player_4, left_player_5, left_player_6]
+    # 生效条件：rosterMode == preset_only
+    right: [right_player_1, right_player_2, right_player_3, right_player_4, right_player_5, right_player_6]
+
+  # 阵容提交超时后的处理方式。
+  # 可选值：
+  # - warn_extend_30：记录警告并重新给予 30 秒。
+  # - forfeit_map：未按时完成的一方本张地图判负。
+  # - admin_decision：停止自动推进，等待管理员裁定。
+  # 生效条件：phase.type == lineup_pick
+  lineupTimeoutPolicy: warn_extend_30
+
+  # 是否启用英雄 Ban；false 时跳过 ban_order、ban_first 和 ban_second。
+  banEnabled: true
+
+  # 当前前端完整支持每方 1 个 Ban。
+  # 生效条件：banEnabled == true
+  bansPerSide: 1
+
+  # 后续地图如何确定 Ban 先后手。
+  # 可选值：
+  # - allow_loser_choose：上一张非平局地图的败者选择自己先 Ban 或后 Ban。
+  # - loser_must_first：上一张非平局地图的败者固定先 Ban。
+  # 生效条件：banEnabled == true
+  firstBanPolicy: allow_loser_choose
+
+  # 第一张地图的 Ban 先手如何确定。
+  # 可选值：
+  # - follow_map_picker：首图选图方先 Ban；固定首图时不可使用。
+  # - random：服务器直接随机决定。
+  # - interactive_random：双方提交随机输入，后端汇合后决定。
+  # - left
+  # - right
+  # 生效条件：banEnabled == true && phase.mapIndex == 0
+  openingSidePolicy: follow_map_picker
+
+  # 英雄 Ban 超时后的处理方式；不负责 ban_order 的顺序选择超时。
+  # 可选值：
+  # - warn_extend_30：记录警告并重新给予 30 秒。
+  # - random_legal_ban：服务器随机选择当前合法且尚未被 Ban 的英雄。
+  # - forfeit_map：超时方本张地图判负。
+  # - admin_decision：停止自动推进，等待管理员裁定。
+  # 生效条件：banEnabled == true && phase.type in [ban_first, ban_second]
+  banTimeoutPolicy: warn_extend_30
+
+  # 比分录入模式。
+  # 可选值：
+  # - admin_only：只有管理员能够提交最终比分。
+  # - team_submit_opponent_confirm：任一队伍提交比分提案，由另一队确认或拒绝。
+  # 生效条件：phase.type == score_entry
+  scoreReportMode: team_submit_opponent_confirm
+
+  # 当前唯一可选值：auto_confirm_submitted
+  # 对应当前实现：比分提案确认倒计时结束后直接确认已提交的比分。
+  # 生效条件：phase.type == score_entry && scoreReportMode == team_submit_opponent_confirm && runtime.score.submittedBy != null
+  scoreTimeoutPolicy: auto_confirm_submitted
+
+  history:
+    # 当前唯一可选值：
+    # - major_status_revision：只保存主要状态，不保存单方提交等 runtime 中间态。
+    recordPolicy: major_status_revision
+
+    # 当前唯一可选值：
+    # - any_recorded_revision：管理员可选择任意已保存的主要 revision 作为回退内容来源。
+    # 生效条件：history.recordPolicy == major_status_revision && statusHistory.length > 0
+    rollbackPolicy: any_recorded_revision
+
+# 已经成为事实的比赛内容。
+match:
+  teams:
+    left:
+      # 队伍稳定 ID；修改显示名称不会改变该 ID。
+      id: team-left
+      name: "Team 1"
+
+      # 种子序号。当前实现会在此前地图全部平局且无法找出败者时，用种子决定后续选图方。
+      # 数字越小代表种子越高；没有种子时可为 null，但后端必须另有确定性的兜底规则。
+      seed: 1
+
+      # 已赢得的地图数量。该值可由 maps[].winnerSide 推导，保留它用于快速渲染。
+      seriesScore: 1
+
+    right:
+      id: team-right
+      name: "Team 2"
+      seed: 2
+      seriesScore: 0
+
+  # 影响整场系列赛的最终决定，只保存结果，不保存实际点击者或随机输入过程。
+  decisions:
+    # 第一张地图最终由哪一方选择。
+    # 可选值：left | right | null；尚未完成随机或比赛尚未开始时为 null。
+    firstMapPickerSide: left
+
+    # 第一张地图最终由哪一方拥有“选择攻防/阵营”的权利。
+    # 可选值：left | right | null。
+    # firstSideChoicePolicy 为 none、left_attack 或 left_defense 时不存在选择者，因此为 null。
+    # 最终选择结果仍记录在 maps[0].sideChoice 中。
+    firstMapSidePickerSide: left
+
+    # 第一张地图最终的 Ban 先手方。
+    # 可选值：left | right | null；Ban 被关闭或尚未确定时为 null。
+    openingBanSide: left
+
+  # 系列赛最终胜方。
+  # 可选值：left | right | null；比赛尚未结束或被无结果取消时为 null。
+  winnerSide: null
+
+  # 地图数组按 index 升序保存。
+  # 当前实现会在开赛时创建全部地图槽位，因此数组长度应为：
+  # 2 * 获胜目标 - 1 + drawMapReserve，即当前 FT2/FT3/FT4 分别为 5/7/9。
+  maps:
+    - index: 0
+
+      # 地图自身生命周期。
+      # 可选值：
+      # - pending：地图槽位存在，但地图尚未选定；对应旧前端的 tbd。
+      # - selected：地图已经选定，正在进行选边、阵容、Ban 或比分流程；对应旧前端的 after。
+      # - completed：地图正常完成并确认比分。
+      # - forfeited：一方因超时、犯规或管理员裁定而被判本图负。
+      status: completed
+
+      # 稳定地图 ID。pending 时为 null；选图完成后必须存在于 config.mapPool 或固定地图顺序中。
+      mapId: lijiang_tower
+
+      # 地图模式 ID。pending 时为 null，并且必须与 catalog 中 mapId 对应的模式一致。
+      # 可选值：control | escort | hybrid | push | flashpoint | null
+      modeId: control
+
+      # 实际获得该地图选图权的一方。固定地图且没有实际选图者时为 null。
+      # 可选值：left | right | null
+      pickerSide: left
+
+      # 最终选边结果。不需要选边或尚未完成选边时，整个 sideChoice 为 null。
+      sideChoice:
+        # 可选值：
+        # - attack_defense：selectedSide 表示进攻方，另一方自动为防守方。
+        # - color：selectedSide 表示蓝色方，另一方自动为红色方。
+        kind: color
+
+        # 拥有本次选边权的一方；如果配置直接固定双方位置而没有选择者，则为 null。
+        # 可选值：left | right | null
+        chooserSide: left
+
+        # 被 chooserSide 最终选择的位置方。
+        # 为了与当前前端 selectedSide 对应，统一只保存 selectedSide，再由 kind 推导其含义。
+        selectedSide: right
+
+      # 双方最终确认的上场选手，而不是英雄选择。
+      # rosterMode 为 skip 或尚未完成双方阵容提交时，整个 lineups 为 null。
+      # 键必须来自 config.lineupSlots[].id，值为稳定选手 ID；如暂无选手系统，也可暂存显示名称。
+      lineups:
+        left:
+          damage-1: left_player_1
+          damage-2: left_player_2
+          tank-1: left_player_3
+          support-1: left_player_4
+          support-2: left_player_5
+        right:
+          damage-1: right_player_1
+          damage-2: right_player_2
+          tank-1: right_player_3
+          support-1: right_player_4
+          support-2: right_player_5
+
+      bans:
+        # 该地图最终的第一手 Ban 方。
+        # 可选值：left | right | null；Ban 关闭或尚未确定时为 null。
+        firstBanSide: left
+
+        # 各队最终 Ban 掉的英雄 ID；尚未完成或 Ban 关闭时为 null。
+        # 当前实现每方只有一个 Ban，因此保留两个单值字段。
+        leftHeroId: tracer
+        rightHeroId: ana
+
+      # 最终确认的地图比分；未完成时整个 score 为 null。
+      # 每侧必须是非负有限数字；允许整数或业务规则认可的小数。
+      # 当前输入框的草稿是字符串，但 finalizeScoreSelection 会先用 Number 转换，
+      # 因此字符串只属于 runtime/localUI，不能进入最终 status。
+      score:
+        left: 2
+        right: 0
+
+      # 地图最终胜方。
+      # 可选值：left | right | null；平局、未完成或取消时为 null。
+      winnerSide: left
+
+      # 被判负的一方。
+      # 可选值：left | right | null；正常完赛、平局或取消时为 null。
+      forfeitSide: null
+
+      # 判负原因。forfeitSide 为 null 时必须为 null。
+      # 可选值：
+      # - map_timeout：选图超时判负。
+      # - lineup_timeout：阵容提交超时判负。
+      # - ban_timeout：Ban 顺序或英雄 Ban 超时判负。
+      # - rule_violation：发生比赛规则违规，由管理员判负。
+      # - admin_ruling：无法由自动规则归类的管理员裁定。
+      # - null
+      forfeitReason: null
+
+    # 当前 phase.mapIndex 为 1，因此该槽位必须存在。
+    - index: 1
+      status: pending
+      mapId: null
+      modeId: null
+      pickerSide: right
+      sideChoice: null
+      lineups: null
+      bans:
+        firstBanSide: null
+        leftHeroId: null
+        rightHeroId: null
+      score: null
+      winnerSide: null
+      forfeitSide: null
+      forfeitReason: null
+
+    # 其余为 FT2 在允许最多两场平局时预留的地图槽位。
+    - index: 2
+      status: pending
+      mapId: null
+      modeId: null
+      pickerSide: null
+      sideChoice: null
+      lineups: null
+      bans: { firstBanSide: null, leftHeroId: null, rightHeroId: null }
+      score: null
+      winnerSide: null
+      forfeitSide: null
+      forfeitReason: null
+
+    - index: 3
+      status: pending
+      mapId: null
+      modeId: null
+      pickerSide: null
+      sideChoice: null
+      lineups: null
+      bans: { firstBanSide: null, leftHeroId: null, rightHeroId: null }
+      score: null
+      winnerSide: null
+      forfeitSide: null
+      forfeitReason: null
+
+    - index: 4
+      status: pending
+      mapId: null
+      modeId: null
+      pickerSide: null
+      sideChoice: null
+      lineups: null
+      bans: { firstBanSide: null, leftHeroId: null, rightHeroId: null }
+      score: null
+      winnerSide: null
+      forfeitSide: null
+      forfeitReason: null
+
+# 当前主要阶段。它决定四个前端应显示哪一个主页面，以及什么类型的操作可以提交。
+phase:
+  # 当前阶段实例的唯一 ID。每次进入一个新阶段都必须变化，回退后不得复用旧 ID。
+  phaseId: "1:38:map_pick"
+
+  # 阶段类型枚举：
+  # - configuring：管理员编辑比赛配置。
+  # - waiting_ready：配置已确认，等待队伍准备或管理员开始。
+  # - pre_start_rest：比赛开始前准备时间。
+  # - interactive_random：双方提交 0/1，由后端决定某项先手权。
+  # - map_pick：选择地图。
+  # - side_pick：选择攻防或红蓝阵营。
+  # - lineup_pick：双方提交上场选手。
+  # - ban_order：有权方选择自己先 Ban 或后 Ban。
+  # - ban_first：第一手英雄 Ban。
+  # - ban_second：第二手英雄 Ban。
+  # - score_entry：提交、确认或由管理员裁定地图比分。
+  # - post_map_rest：地图结束后的场间休息。
+  # - completed：系列赛结束。
+  type: map_pick
+
+  # 当前阶段作用的地图 index。
+  # configuring、waiting_ready、completed 等全局阶段通常为 null。
+  mapIndex: 1
+
+  # 按比赛规则拥有当前正式操作权的一方。
+  # 可选值：left | right | both | null。
+  # 管理员代操作是权限规则，不使用 admin 作为 actorSide；直播端始终只读。
+  actorSide: right
+
+  # 当前阶段所需的少量、已经确定的上下文。
+  # 不允许在这里保存倒计时、暂停、输入草稿、单方提交值或通知。
+  #
+  # 各 phase.type 允许的 data：
+  # - configuring：{}
+  # - waiting_ready：{}
+  # - pre_start_rest：{}
+  # - interactive_random：
+  #     purpose: map_picker | opening_ban | side_choice
+  # - map_pick：
+  #     allowedModeIds: 可选的模式 ID 数组；通常可以由 config + match 推导，能推导时应省略。
+  # - side_pick：
+  #     choiceKind: attack_defense | color
+  #     chooserSide: left | right
+  # - lineup_pick：{}
+  # - ban_order：
+  #     chooserSide: left | right
+  # - ban_first / ban_second：
+  #     firstBanSide: left | right
+  # - score_entry：{}
+  # - post_map_rest：{}
+  # - completed：
+  #     winnerSide: left | right
+  data: {}
+
+# -----------------------------------------------------------------------------
+# 明确不属于本文件的当前实现字段
+# -----------------------------------------------------------------------------
+#
+# 下列内容必须由另外的 runtime 协议同步：
+# - baseStatusRevision、baseStatusHash、phaseId；
+# - totalTimeMs、remainingTimeMs；
+# - 全局暂停及当前比分阶段的队伍暂停；
+# - 双方在线状态、准备状态及最近心跳；
+# - interactive_random 中双方尚未汇合的 0/1；
+# - lineup_pick 中一方已经提交但双方尚未全部完成的阵容；
+# - score_entry 中 submittedBy、待确认比分、rejectedBy；
+# - post_map_rest 中双方的 skipReady；
+# - 当前阶段 timedOut 以及等待管理员处理的状态。
+#
+# 下列内容只保留在 localUI：
+# - mapSelectorState.selectedMapKey、sideSelectorState.selectedSide；
+# - banSelectorState.selectedOrder、selectedHeroKey；
+# - 尚未提交的阵容和比分输入框；
+# - minimized、collapsed、hiddenOverlay、selectionConfirmationState；
+# - 纯本地错误通知的显示与关闭状态。
+#
+# 服务器权威通知使用独立 notificationStream：
+# - action、rollback、heartbeat 响应均返回 { cursor, events }；
+# - 请求携带 notificationCursor；首次进入传 null，只取得当前 cursor，不重放旧消息；
+# - 后续仅返回 cursor 之后的事件，前端按 eventId 去重；
+# - 事件字段为 eventId、sequence、eventType、actor、payload、occurredAt、statusVersion；
+# - 事件流最多保留 100 条，并且不参与 status hash。

@@ -1,0 +1,175 @@
+schemaVersion: 1
+kind: ui-notifications
+
+presentation:
+  position: top-right
+  dismissal:
+    automatic: true
+    manualClose: true
+  durationSeconds:
+    minimum: 1
+    maximum: 300
+    default: 20
+    source: 网站全局设置 notificationDurationSeconds
+  stacking: 按事件创建顺序展示
+  storageLimit: 100
+  deduplication: 通过事件 id 去重
+  visualStyle: uniform-neutral
+  colorTone: none
+  severityLevel: none
+  contentRule: 每条消息使用明确的主语、动作和对象，直接说明谁做了什么
+
+eventAuthority:
+  successfulMatchOperation:
+    producer: server
+    creationTime: 操作成功并写入权威状态之后
+    requiredFields:
+      - eventId
+      - eventType
+      - actor
+      - payload
+      - occurredAt
+      - statusVersion
+    clientBehavior:
+      - 按 eventId 去重
+      - 不在服务器确认成功前生成成功消息
+      - 根据 actor 和 payload 填充文案，不根据接收客户端身份猜测操作者
+  serverRejectedOperation:
+    producer: initiating-client-from-server-response
+    audience: local-request-result
+  networkFailure:
+    producer: initiating-client
+    audience: local-request-result
+
+deliveryProtocol:
+  responseField: notificationStream
+  responseShape:
+    cursor: integer
+    events: MatchNotificationEvent[]
+  requestField: notificationCursor
+  firstEntry:
+    requestValue: null
+    serverBehavior: 仅返回当前 cursor，不重放旧提示
+  subsequentSync:
+    serverBehavior: 只返回 cursor 之后的事件
+  includedResponses:
+    - action
+    - rollback
+    - heartbeat
+  eventStorage:
+    maximumPerRoom: 100
+    includedInStatusHash: false
+
+audienceRules:
+  shared-match-event:
+    recipients:
+      - team_left
+      - team_right
+      - admin
+      - broadcast
+  local-request-result:
+    recipients:
+      - initiating-portal
+
+notifications:
+  MATCH_STARTED_MANUAL:
+    audience: shared-match-event
+    text: 双方准备就绪，管理员开始了比赛
+  MATCH_STARTED_FORCE:
+    audience: shared-match-event
+    text: 管理员强制开始了比赛
+  MATCH_STARTED_AUTO:
+    audience: shared-match-event
+    text: 双方准备就绪，比赛自动开始
+  FIXED_MAP_ANNOUNCED:
+    audience: shared-match-event
+    textTemplate: 本张地图为固定地图{mapName}
+  RIGHT_ASSIGNED:
+    audience: shared-match-event
+    textTemplate: "{teamName}获得了本张地图的{rightLabel}"
+  RIGHT_ASSIGNED_RANDOM:
+    audience: shared-match-event
+    textTemplate: 系统随机结果为，{teamName}获得了本张地图的{rightLabel}
+  INTERACTIVE_RANDOM_RESULT:
+    audience: shared-match-event
+    textTemplate: 交互随机结果：{left} XOR {right} = {result}，{teamName}获得{rightLabel}
+  MAP_CONFIRMED:
+    audience: shared-match-event
+    textTemplate: "{teamName}选择了地图{mapName}"
+  MAP_CONFIRMED_BY_ADMIN:
+    audience: shared-match-event
+    textTemplate: 管理员为{teamName}选择了地图{mapName}
+  MAP_TIMEOUT_RANDOM:
+    audience: shared-match-event
+    textTemplate: "{teamName}进行地图选择超时，随机选择为{mapName}"
+  SIDE_CONFIRMED:
+    audience: shared-match-event
+    textTemplate: "{teamName}选择了{choice}"
+  SIDE_TIMEOUT_RANDOM:
+    audience: shared-match-event
+    textTemplate: "{teamName}进行{choiceKind}超时，随机选择为{choice}"
+  LINEUP_CONFIRMED_BY_ADMIN:
+    audience: shared-match-event
+    text: 管理员为双方设置了上场人员
+  BAN_ORDER_CONFIRMED:
+    audience: shared-match-event
+    textTemplate: "{teamName}选择了{firstOrSecond}"
+  BAN_ORDER_CONFIRMED_BY_ADMIN:
+    audience: shared-match-event
+    textTemplate: 管理员为{teamName}选择了{firstOrSecond}
+  HERO_BAN_CONFIRMED:
+    audience: shared-match-event
+    textTemplate: "{teamName}禁用了{heroName}"
+  HERO_BAN_CONFIRMED_BY_ADMIN:
+    audience: shared-match-event
+    textTemplate: 管理员为{teamName}禁用了{heroName}
+  HERO_BAN_RANDOM_BY_ADMIN:
+    audience: shared-match-event
+    textTemplate: 管理员为{teamName}随机禁用了{heroName}
+  HERO_BAN_TIMEOUT_RANDOM:
+    audience: shared-match-event
+    textTemplate: "{teamName}英雄禁用选择超时，随机禁用了{heroName}"
+  SELECTION_TIMEOUT_EXTENDED:
+    audience: shared-match-event
+    textTemplate: "{subject}进行{selectionType}超时，警告一次并且再给予{seconds}秒选择"
+  SELECTION_AWAITING_ADMIN:
+    audience: shared-match-event
+    textTemplate: "{subject}进行{selectionType}超时，等待管理员裁定"
+  ADMIN_DECISION_RESOLVED:
+    audience: shared-match-event
+    textTemplate: 管理员完成了{decisionType}裁定：{decisionSummary}
+  LINEUP_BOTH_RESTARTED:
+    audience: shared-match-event
+    textTemplate: 双方队伍进行上场人员选择超时，警告一次并且再给予{seconds}秒选择
+  MAP_FORFEITED:
+    audience: shared-match-event
+    textTemplate: "{loserTeam}进行{selectionType}超时，本张地图判负"
+  MAP_WON:
+    audience: shared-match-event
+    textTemplate: "{winnerTeam}本张地图获胜"
+  MATCH_WON:
+    audience: shared-match-event
+    textTemplate: "{winnerTeam}赢得本场比赛"
+  STAGE_RESTORED:
+    audience: shared-match-event
+    textTemplate: 管理员将比赛回退到了{stageLabel}
+  STALE_STATUS:
+    audience: local-request-result
+    text: 页面状态已更新，已切换到服务器当前阶段
+  FORBIDDEN_ACTION:
+    audience: local-request-result
+    text: 当前入口没有本阶段操作权
+  NETWORK_OR_ACTION_ERROR:
+    audience: local-request-result
+    textTemplate: "{serverMessage}"
+
+confirmedDecisions:
+  - id: NOTIFICATION_TONE_IS_NOT_SEMANTIC_LEVEL
+    reviewStatus: confirmed
+    decision: 通知不使用队伍色调或提醒等级，全部采用统一无色调样式
+  - id: ADMIN_NOTICE_NOT_RENDERED_IN_ROOM
+    reviewStatus: confirmed
+    decision: 待裁定状态通过禁用的确认按钮持续显示“等待管理员裁定”，并同时发送一次右上角消息
+  - id: SHARED_COPY_DEPENDS_ON_ACTION_CLIENT
+    reviewStatus: confirmed
+    decision: 成功通知由服务器在操作成功后生成，事件必须携带 actor，客户端不得按自身入口身份推断文案

@@ -5,32 +5,27 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import tracemalloc
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 
-TEST_RUNTIME = tempfile.TemporaryDirectory(prefix="owbanpick-tests-")
+TEST_RUNTIME = tempfile.TemporaryDirectory(prefix="owbanpick-authoritative-tests-")
 os.environ["OW_RUNTIME_DIR"] = TEST_RUNTIME.name
 
 from backend import app as room_app  # noqa: E402
+from backend.room_engine import RoomSession, RoomStateRegistry, StateActionError  # noqa: E402
+from backend.state_models import canonical_json, default_config, status_hash  # noqa: E402
 
 
-class RoomPersistenceTests(unittest.TestCase):
+class AuthoritativeRoomApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        runtime_dir = Path(TEST_RUNTIME.name)
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-
-        for child in runtime_dir.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-
+        runtime = Path(TEST_RUNTIME.name)
+        runtime.mkdir(parents=True, exist_ok=True)
+        for child in runtime.iterdir():
+            shutil.rmtree(child) if child.is_dir() else child.unlink()
         room_app.initialize_room_store()
-        with room_app.catalog_refresh_lock:
-            room_app.catalog_refresh_jobs.clear()
-            room_app.active_catalog_refresh_job_id = None
         room_app.app.config.update(TESTING=True)
         self.client = room_app.app.test_client()
 
@@ -39,1002 +34,408 @@ class RoomPersistenceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return response.get_json()
 
-    def read_store(self) -> dict:
-        return json.loads(room_app.ROOM_STORE_PATH.read_text(encoding="utf-8"))
+    @staticmethod
+    def token(room: dict, code: str) -> str:
+        return str(room["links"][code]["hash"])
 
-    def history_path(self, created_room: dict) -> Path:
-        archive_key = "-".join(created_room["links"][code]["hash"] for code in room_app.ROOM_ROLES)
-        return room_app.ROOM_HISTORY_DIR / f"{archive_key}.json"
+    def sync(self, token: str, client_status: dict | None = None):
+        return self.client.post(f"/api/rooms/token/{token}/sync", json={"status": client_status})
 
-    def read_history(self, created_room: dict) -> dict:
-        return json.loads(self.history_path(created_room).read_text(encoding="utf-8"))
+    def full(self, token: str) -> dict:
+        response = self.sync(token)
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        payload = response.get_json()
+        self.assertEqual(payload["kind"], "full")
+        return payload
 
-    def admin_hash(self) -> str:
-        return str(self.read_store()["adminHash"])
-
-    def close_room(self, created_room: dict):
+    def action(self, token: str, action_type: str, payload: dict | None = None, request_id: str | None = None):
+        current = self.full(token)["status"]
+        expected = {
+            "epoch": current["epoch"], "revision": current["revision"],
+            "hash": current["hash"], "phaseId": current["phase"]["phaseId"],
+        }
         return self.client.post(
-            f"/api/admin/{self.admin_hash()}/rooms/{created_room['roomId']}/close"
-        )
-
-    def test_new_room_uses_five_unique_short_codes_and_creates_history(self) -> None:
-        room = self.create_room()
-        codes = [room["roomId"], *(room["links"][code]["hash"] for code in room_app.ROOM_ROLES)]
-
-        self.assertEqual(len(set(codes)), 5)
-        self.assertTrue(all(re.fullmatch(r"[0-9a-z]{4}", code) for code in codes))
-        self.assertGreater(len(self.admin_hash()), 4)
-        self.assertEqual(self.read_store()["schemaVersion"], room_app.ROOM_STORE_SCHEMA_VERSION)
-
-        history = self.read_history(room)
-        self.assertEqual(history["archiveKey"], self.history_path(room).stem)
-        self.assertEqual(history["roomId"], room["roomId"])
-        self.assertEqual(history["status"], "active")
-        self.assertEqual(history["history"][0]["operation"]["action"], "created")
-
-    def test_team_readiness_tracks_presence_and_auto_starts_enabled_room(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        team_1_token = room["links"]["B"]["hash"]
-        team_2_token = room["links"]["A"]["hash"]
-        config = room_app.default_match_config()
-        config["startWithDefaultConfig"] = True
-
-        updated = self.client.put(
-            f"/api/rooms/token/{admin_token}/config",
-            json={"revision": 1, "config": config},
-        )
-        self.assertEqual(updated.status_code, 200, updated.get_data(as_text=True))
-
-        admin_presence = self.client.post(f"/api/rooms/token/{admin_token}/presence", json={})
-        self.assertTrue(admin_presence.get_json()["presence"]["C"]["connected"])
-
-        team_1_ready = self.client.post(
-            f"/api/rooms/token/{team_1_token}/presence", json={"ready": True}
-        )
-        self.assertFalse(team_1_ready.get_json()["autoStarted"])
-        self.assertTrue(team_1_ready.get_json()["presence"]["B"]["ready"])
-
-        team_2_ready = self.client.post(
-            f"/api/rooms/token/{team_2_token}/presence", json={"ready": True}
-        )
-        payload = team_2_ready.get_json()
-        self.assertTrue(payload["autoStarted"])
-        self.assertEqual(payload["config"]["status"], "locked")
-        self.assertTrue(payload["presence"]["A"]["connected"])
-        self.assertTrue(payload["presence"]["B"]["connected"])
-        self.assertTrue(payload["presence"]["C"]["connected"])
-
-        history = self.read_history(room)
-        self.assertEqual(history["history"][-1]["operation"]["action"], "auto_started_after_team_ready")
-
-    def test_manual_start_requires_both_teams_ready_but_admin_can_force_start(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        team_a_token = room["links"]["A"]["hash"]
-        team_b_token = room["links"]["B"]["hash"]
-
-        self.assertEqual(
-            self.client.post(f"/api/rooms/token/{admin_token}/config/confirm").status_code,
-            200,
-        )
-        not_ready = self.client.post(f"/api/rooms/token/{admin_token}/start", json={})
-        self.assertEqual(not_ready.status_code, 409)
-        self.assertEqual(not_ready.get_json()["error"], "teams_not_ready")
-
-        self.client.post(f"/api/rooms/token/{team_a_token}/presence", json={"ready": True})
-        still_not_ready = self.client.post(f"/api/rooms/token/{admin_token}/start", json={})
-        self.assertEqual(still_not_ready.status_code, 409)
-
-        self.client.post(f"/api/rooms/token/{team_b_token}/presence", json={"ready": True})
-        started = self.client.post(f"/api/rooms/token/{admin_token}/start", json={})
-        self.assertEqual(started.status_code, 200)
-
-        forced_room = self.create_room()
-        forced_admin = forced_room["links"]["C"]["hash"]
-        self.client.post(f"/api/rooms/token/{forced_admin}/config/confirm")
-        forced = self.client.post(
-            f"/api/rooms/token/{forced_admin}/start", json={"force": True}
-        )
-        self.assertEqual(forced.status_code, 200)
-        self.assertEqual(self.read_history(forced_room)["history"][-1]["operation"]["action"], "force_started")
-
-    def test_team_name_confirmation_is_required_before_ready_when_enabled(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        team_1_token = room["links"]["A"]["hash"]
-        config = room_app.default_match_config()
-        config["teamsCanEditOwnName"] = True
-
-        updated = self.client.put(
-            f"/api/rooms/token/{admin_token}/config",
-            json={"revision": 1, "config": config},
-        )
-        self.assertEqual(updated.status_code, 200, updated.get_data(as_text=True))
-
-        blocked_before_confirmation = self.client.post(
-            f"/api/rooms/token/{team_1_token}/presence", json={"ready": True}
-        )
-        self.assertEqual(blocked_before_confirmation.status_code, 409)
-        self.assertEqual(blocked_before_confirmation.get_json()["error"], "config_not_ready")
-
-        self.assertEqual(
-            self.client.post(f"/api/rooms/token/{admin_token}/config/confirm").status_code,
-            200,
-        )
-        blocked_before_name = self.client.post(
-            f"/api/rooms/token/{team_1_token}/presence", json={"ready": True}
-        )
-        self.assertEqual(blocked_before_name.status_code, 409)
-        self.assertEqual(blocked_before_name.get_json()["error"], "team_name_not_confirmed")
-
-        atomically_named_and_ready = self.client.post(
-            f"/api/rooms/token/{team_1_token}/presence",
-            json={"ready": True, "name": "Atomic Team"},
-        )
-        self.assertEqual(
-            atomically_named_and_ready.status_code,
-            200,
-            atomically_named_and_ready.get_data(as_text=True),
-        )
-        self.assertEqual(
-            atomically_named_and_ready.get_json()["config"]["value"]["teams"]["left"],
-            "Atomic Team",
-        )
-        self.assertTrue(atomically_named_and_ready.get_json()["presence"]["A"]["ready"])
-
-        cannot_revoke = self.client.post(
-            f"/api/rooms/token/{team_1_token}/presence", json={"ready": False}
-        )
-        self.assertEqual(cannot_revoke.status_code, 409)
-        self.assertEqual(cannot_revoke.get_json()["error"], "ready_cannot_be_revoked")
-
-        second_room = self.create_room()
-        second_admin = second_room["links"]["C"]["hash"]
-        second_team = second_room["links"]["A"]["hash"]
-        updated = self.client.put(
-            f"/api/rooms/token/{second_admin}/config",
-            json={"revision": 1, "config": config},
-        )
-        self.assertEqual(updated.status_code, 200, updated.get_data(as_text=True))
-        self.assertEqual(
-            self.client.post(f"/api/rooms/token/{second_admin}/config/confirm").status_code,
-            200,
-        )
-
-        renamed = self.client.put(
-            f"/api/rooms/token/{second_team}/team-name", json={"name": "A队"}
-        )
-        self.assertEqual(renamed.status_code, 200, renamed.get_data(as_text=True))
-        self.assertEqual(renamed.get_json()["config"]["value"]["teams"]["left"], "A队")
-        self.assertTrue(renamed.get_json()["presence"]["A"]["nameConfirmed"])
-
-        ready = self.client.post(
-            f"/api/rooms/token/{second_team}/presence", json={"ready": True}
-        )
-        self.assertEqual(ready.status_code, 200, ready.get_data(as_text=True))
-        self.assertTrue(ready.get_json()["presence"]["A"]["ready"])
-
-        cannot_revoke = self.client.post(
-            f"/api/rooms/token/{second_team}/presence", json={"ready": False}
-        )
-        self.assertEqual(cannot_revoke.status_code, 409)
-        self.assertEqual(cannot_revoke.get_json()["error"], "ready_cannot_be_revoked")
-
-    def test_team_lineup_updates_preserve_the_opponent_confirmed_lineup(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        left_token = room["links"]["A"]["hash"]
-        right_token = room["links"]["B"]["hash"]
-        self.client.post(f"/api/rooms/token/{admin_token}/config/confirm")
-        self.client.post(f"/api/rooms/token/{admin_token}/start", json={"force": True})
-
-        base_snapshot = {
-            "roomStarted": True,
-            "lineupSelectorState": {
-                "open": True,
-                "mapIndex": 0,
-                "values": {"left": {"damage-1": "L1"}, "right": {"damage-1": ""}},
-                "ready": {"left": True, "right": False},
-                "timedOut": False,
-            },
-        }
-        first = self.client.put(
-            f"/api/rooms/token/{left_token}/snapshot",
+            f"/api/rooms/token/{token}/actions",
             json={
-                "version": 0,
-                "snapshot": base_snapshot,
-                "operation": {"category": "lineup", "action": "ready", "details": {}},
-            },
-        )
-        self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
-
-        stale_opponent_snapshot = json.loads(json.dumps(base_snapshot))
-        stale_opponent_snapshot["lineupSelectorState"]["values"]["left"] = {"damage-1": ""}
-        stale_opponent_snapshot["lineupSelectorState"]["values"]["right"] = {"damage-1": "R1"}
-        stale_opponent_snapshot["lineupSelectorState"]["ready"] = {"left": False, "right": True}
-        second = self.client.put(
-            f"/api/rooms/token/{right_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": stale_opponent_snapshot,
-                "operation": {"category": "lineup", "action": "ready", "details": {}},
-            },
-        )
-        self.assertEqual(second.status_code, 200, second.get_data(as_text=True))
-        stored = self.client.get(f"/api/rooms/token/{admin_token}/snapshot").get_json()["snapshot"]
-        self.assertEqual(stored["lineupSelectorState"]["values"]["left"]["damage-1"], "L1")
-        self.assertTrue(stored["lineupSelectorState"]["ready"]["left"])
-        self.assertEqual(stored["lineupSelectorState"]["values"]["right"]["damage-1"], "R1")
-        self.assertTrue(stored["lineupSelectorState"]["ready"]["right"])
-
-    def test_score_pause_uses_server_clock_and_preserves_count(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        left_token = room["links"]["A"]["hash"]
-        self.client.post(f"/api/rooms/token/{admin_token}/config/confirm")
-        self.client.post(f"/api/rooms/token/{admin_token}/start", json={"force": True})
-
-        score_snapshot = {
-            "roomStarted": True,
-            "currentState": {"maps": [{"status": "selected"}]},
-            "scoreSelectorState": {
-                "open": True,
-                "mapIndex": 0,
-                "teamPauses": {
-                    "left": {"active": False, "startedAt": None, "totalMs": 0, "count": 0},
-                    "right": {"active": False, "startedAt": None, "totalMs": 0, "count": 0},
-                },
-                "countdownPauseStartedAt": None,
-            },
-        }
-        opened = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": score_snapshot,
-                "operation": {"category": "score", "action": "opened", "details": {}},
-            },
-        )
-        self.assertEqual(opened.status_code, 200, opened.get_data(as_text=True))
-
-        client_start = json.loads(json.dumps(score_snapshot))
-        client_start["scoreSelectorState"]["teamPauses"]["left"].update(
-            {"active": True, "startedAt": 1, "totalMs": 999_999, "count": 99}
-        )
-        with patch.object(room_app.time, "time", return_value=100.0):
-            started = self.client.put(
-                f"/api/rooms/token/{left_token}/snapshot",
-                json={
-                    "version": opened.get_json()["version"],
-                    "snapshot": client_start,
-                    "operation": {
-                        "category": "pause",
-                        "action": "score_team_started",
-                        "details": {"side": "left"},
-                    },
-                },
-            )
-        self.assertEqual(started.status_code, 200, started.get_data(as_text=True))
-        stored_start = started.get_json()["snapshot"]["scoreSelectorState"]["teamPauses"]["left"]
-        self.assertEqual(stored_start["startedAt"], 100_000)
-        self.assertEqual(stored_start["totalMs"], 0)
-        self.assertEqual(stored_start["count"], 1)
-
-        client_resume = started.get_json()["snapshot"]
-        client_resume["scoreSelectorState"]["teamPauses"]["left"].update(
-            {"active": False, "startedAt": None, "totalMs": 1, "count": 500}
-        )
-        with patch.object(room_app.time, "time", return_value=101.25):
-            resumed = self.client.put(
-                f"/api/rooms/token/{left_token}/snapshot",
-                json={
-                    "version": started.get_json()["version"],
-                    "snapshot": client_resume,
-                    "operation": {
-                        "category": "pause",
-                        "action": "score_team_resumed",
-                        "details": {"side": "left"},
-                    },
-                },
-            )
-        self.assertEqual(resumed.status_code, 200, resumed.get_data(as_text=True))
-        stored_resume = resumed.get_json()["snapshot"]["scoreSelectorState"]["teamPauses"]["left"]
-        self.assertFalse(stored_resume["active"])
-        self.assertIsNone(stored_resume["startedAt"])
-        self.assertEqual(stored_resume["totalMs"], 1_250)
-        self.assertEqual(stored_resume["count"], 1)
-
-    def test_score_submission_stops_and_locks_team_pauses(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        left_token = room["links"]["A"]["hash"]
-        self.client.post(f"/api/rooms/token/{admin_token}/config/confirm")
-        self.client.post(f"/api/rooms/token/{admin_token}/start", json={"force": True})
-
-        score_snapshot = {
-            "roomStarted": True,
-            "currentState": {"maps": [{"status": "selected"}]},
-            "scoreSelectorState": {
-                "open": True,
-                "mapIndex": 0,
-                "values": {"left": "1", "right": "0"},
-                "submittedBy": None,
-                "teamPauses": {
-                    "left": {"active": False, "startedAt": None, "totalMs": 0, "count": 0},
-                    "right": {"active": False, "startedAt": None, "totalMs": 0, "count": 0},
-                },
-                "countdownPauseStartedAt": None,
-            },
-        }
-        opened = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": score_snapshot,
-                "operation": {"category": "score", "action": "opened", "details": {}},
-            },
-        )
-        self.assertEqual(opened.status_code, 200, opened.get_data(as_text=True))
-
-        start_snapshot = opened.get_json()["snapshot"]
-        start_snapshot["scoreSelectorState"]["teamPauses"]["left"]["active"] = True
-        with patch.object(room_app.time, "time", return_value=100.0):
-            started = self.client.put(
-                f"/api/rooms/token/{left_token}/snapshot",
-                json={
-                    "version": opened.get_json()["version"],
-                    "snapshot": start_snapshot,
-                    "operation": {
-                        "category": "pause",
-                        "action": "score_team_started",
-                        "details": {"side": "left"},
-                    },
-                },
-            )
-        self.assertEqual(started.status_code, 200, started.get_data(as_text=True))
-
-        submit_snapshot = started.get_json()["snapshot"]
-        submit_snapshot["scoreSelectorState"]["submittedBy"] = "left"
-        with patch.object(room_app.time, "time", return_value=101.25):
-            submitted = self.client.put(
-                f"/api/rooms/token/{left_token}/snapshot",
-                json={
-                    "version": started.get_json()["version"],
-                    "snapshot": submit_snapshot,
-                    "operation": {
-                        "category": "score",
-                        "action": "submitted",
-                        "details": {"side": "left"},
-                    },
-                },
-            )
-        self.assertEqual(submitted.status_code, 200, submitted.get_data(as_text=True))
-        stopped_pause = submitted.get_json()["snapshot"]["scoreSelectorState"]["teamPauses"]["left"]
-        self.assertFalse(stopped_pause["active"])
-        self.assertIsNone(stopped_pause["startedAt"])
-        self.assertEqual(stopped_pause["totalMs"], 1_250)
-        self.assertEqual(stopped_pause["count"], 1)
-
-        blocked_snapshot = submitted.get_json()["snapshot"]
-        blocked_snapshot["scoreSelectorState"]["teamPauses"]["left"].update(
-            {"active": True, "startedAt": 1, "count": 99}
-        )
-        with patch.object(room_app.time, "time", return_value=102.0):
-            blocked = self.client.put(
-                f"/api/rooms/token/{left_token}/snapshot",
-                json={
-                    "version": submitted.get_json()["version"],
-                    "snapshot": blocked_snapshot,
-                    "operation": {
-                        "category": "pause",
-                        "action": "score_team_started",
-                        "details": {"side": "left"},
-                    },
-                },
-            )
-        self.assertEqual(blocked.status_code, 200, blocked.get_data(as_text=True))
-        locked_pause = blocked.get_json()["snapshot"]["scoreSelectorState"]["teamPauses"]["left"]
-        self.assertFalse(locked_pause["active"])
-        self.assertEqual(locked_pause["totalMs"], 1_250)
-        self.assertEqual(locked_pause["count"], 1)
-
-    def test_snapshot_from_an_older_stage_cannot_rewind_the_room(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        self.client.post(f"/api/rooms/token/{admin_token}/config/confirm")
-        self.client.post(f"/api/rooms/token/{admin_token}/start", json={"force": True})
-
-        lineup_snapshot = {
-            "roomStarted": True,
-            "currentState": {"maps": [{"status": "selected"}]},
-            "lineupSelectorState": {"open": True, "mapIndex": 0},
-            "banSelectorState": None,
-        }
-        lineup = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": lineup_snapshot,
-                "operation": {"category": "lineup", "action": "opened", "details": {}},
-            },
-        )
-        self.assertEqual(lineup.status_code, 200, lineup.get_data(as_text=True))
-
-        ban_snapshot = json.loads(json.dumps(lineup_snapshot))
-        ban_snapshot["lineupSelectorState"] = None
-        ban_snapshot["banSelectorState"] = {
-            "open": True,
-            "mapIndex": 0,
-            "step": "first-ban",
-        }
-        ban = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": lineup.get_json()["version"],
-                "snapshot": ban_snapshot,
-                "operation": {"category": "ban", "action": "opened", "details": {}},
-            },
-        )
-        self.assertEqual(ban.status_code, 200, ban.get_data(as_text=True))
-
-        stale = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": ban.get_json()["version"],
-                "snapshot": lineup_snapshot,
-                "operation": {"category": "lineup", "action": "edited", "details": {}},
-            },
-        )
-        self.assertEqual(stale.status_code, 409, stale.get_data(as_text=True))
-        self.assertEqual(stale.get_json()["error"], "stage_regression")
-        self.assertEqual(stale.get_json()["snapshot"]["banSelectorState"]["step"], "first-ban")
-
-    def test_admin_can_restore_a_completed_checkpoint_stage(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        self.client.post(f"/api/rooms/token/{admin_token}/config/confirm")
-        self.client.post(f"/api/rooms/token/{admin_token}/start", json={"force": True})
-
-        lineup_snapshot = {
-            "roomStarted": True,
-            "currentState": {"maps": [{"status": "selected"}]},
-            "lineupSelectorState": {"open": True, "mapIndex": 0},
-            "banSelectorState": None,
-        }
-        lineup = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": lineup_snapshot,
-                "operation": {"category": "lineup", "action": "opened", "details": {}},
-            },
-        )
-        self.assertEqual(lineup.status_code, 200, lineup.get_data(as_text=True))
-
-        ban_snapshot = json.loads(json.dumps(lineup_snapshot))
-        ban_snapshot["lineupSelectorState"] = None
-        ban_snapshot["banSelectorState"] = {"open": True, "mapIndex": 0, "step": "first-ban"}
-        ban = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": lineup.get_json()["version"],
-                "snapshot": ban_snapshot,
-                "operation": {"category": "ban", "action": "opened", "details": {}},
-            },
-        )
-        self.assertEqual(ban.status_code, 200, ban.get_data(as_text=True))
-
-        restored = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": ban.get_json()["version"],
-                "snapshot": lineup_snapshot,
-                "operation": {
-                    "category": "room",
-                    "action": "stage_restored",
-                    "details": {"mapIndex": 0, "checkpoint": "lineupPick"},
-                },
-            },
-        )
-        self.assertEqual(restored.status_code, 200, restored.get_data(as_text=True))
-        self.assertTrue(restored.get_json()["snapshot"]["lineupSelectorState"]["open"])
-        self.assertIsNone(restored.get_json()["snapshot"]["banSelectorState"])
-
-    def test_generator_retries_collisions_and_never_reuses_archive_tuple(self) -> None:
-        first_values = ["aaaa", "aaaa", "bbbb", "cccc", "dddd", "eeee"]
-
-        with patch.object(room_app, "generate_short_code", side_effect=first_values):
-            first_room = self.create_room()
-
-        self.assertEqual(first_room["roomId"], "aaaa")
-        self.assertEqual(
-            [first_room["links"][code]["hash"] for code in room_app.ROOM_ROLES],
-            ["bbbb", "cccc", "dddd", "eeee"],
-        )
-        self.assertEqual(self.close_room(first_room).status_code, 200)
-
-        second_values = [
-            "ffff", "bbbb", "cccc", "dddd", "eeee",
-            "gggg", "bbbb", "hhhh", "iiii", "jjjj",
-        ]
-
-        with patch.object(room_app, "generate_short_code", side_effect=second_values):
-            second_room = self.create_room()
-
-        self.assertEqual(second_room["links"]["A"]["hash"], "bbbb")
-        self.assertNotEqual(self.history_path(first_room).stem, self.history_path(second_room).stem)
-        self.assertTrue(self.history_path(first_room).is_file())
-        self.assertTrue(self.history_path(second_room).is_file())
-
-    def test_code_space_exhaustion_returns_503_without_partial_room(self) -> None:
-        with (
-            patch.object(room_app, "MAX_SHORT_CODE_ATTEMPTS", 3),
-            patch.object(room_app, "generate_short_code", return_value="aaaa"),
-        ):
-            response = self.client.post("/api/rooms")
-
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.get_json()["error"], "code_space_exhausted")
-        self.assertEqual(self.read_store()["rooms"], [])
-        self.assertEqual(list(room_app.ROOM_HISTORY_DIR.glob("*.json")), [])
-
-    def test_unlimited_create_link_bypasses_per_ip_limit(self) -> None:
-        store = self.read_store()
-        store["globalSettings"]["roomsPerHour"] = 1
-        room_app.save_json_atomic(room_app.ROOM_STORE_PATH, store)
-
-        first = self.client.post("/api/rooms", environ_overrides={"REMOTE_ADDR": "198.51.100.10"})
-        limited = self.client.post("/api/rooms", environ_overrides={"REMOTE_ADDR": "198.51.100.10"})
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(limited.status_code, 429)
-
-        special_path = f"/r/{room_app.DEFAULT_UNLIMITED_CREATE_HASH}"
-        special_page = self.client.get(special_path)
-        self.assertEqual(special_page.status_code, 200)
-        special_page.close()
-        self.assertEqual(len(self.read_store()["rooms"]), 1)
-
-        special_first = self.client.post(f"/api/rooms/unlimited/{room_app.DEFAULT_UNLIMITED_CREATE_HASH}")
-        special_second = self.client.post(f"/api/rooms/unlimited/{room_app.DEFAULT_UNLIMITED_CREATE_HASH}")
-
-        self.assertEqual(special_first.status_code, 200)
-        self.assertEqual(special_second.status_code, 200)
-        first_room_token = special_first.get_json()["links"]["A"]["hash"]
-        self.assertEqual(
-            self.client.get(f"/api/rooms/token/{first_room_token}").get_json()["portal"]["code"],
-            "A",
-        )
-        self.assertEqual(len(self.read_store()["rooms"]), 3)
-
-    def test_successful_snapshot_is_audited_and_conflict_is_not(self) -> None:
-        room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        self.assertEqual(
-            self.client.post(f"/api/rooms/token/{admin_token}/config/confirm").status_code,
-            200,
-        )
-        self.assertEqual(
-            self.client.post(f"/api/rooms/token/{admin_token}/start", json={"force": True}).status_code,
-            200,
-        )
-        snapshot = {"roomStarted": True, "marker": "accepted"}
-        accepted = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": snapshot,
-                "operation": {"category": "room", "action": "started", "details": {}},
-            },
-        )
-        conflicted = self.client.put(
-            f"/api/rooms/token/{admin_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": {"marker": "rejected"},
-                "operation": {"category": "room", "action": "reset", "details": {}},
+                "requestId": request_id or f"req-{action_type}-{current['revision']}",
+                "expected": expected,
+                "type": action_type,
+                "payload": payload or {},
             },
         )
 
-        self.assertEqual(accepted.status_code, 200)
-        self.assertEqual(conflicted.status_code, 409)
-        history = self.read_history(room)
-        self.assertEqual(len(history["history"]), 4)
-        event = history["history"][-1]
-        self.assertEqual(event["snapshot"]["marker"], "accepted")
-        self.assertEqual(event["snapshot"]["settingsState"], history["currentConfig"]["value"])
-        self.assertEqual(event["actor"], {"type": "portal", "portalCode": "C", "role": "admin"})
-        self.assertEqual(event["operation"]["action"], "started")
-
-        self.client.get(f"/api/rooms/token/{admin_token}/snapshot")
-        self.assertEqual(len(self.read_history(room)["history"]), 4)
-
-    def test_global_presets_are_validated_persisted_and_copied_into_rooms(self) -> None:
-        room = self.create_room()
-        admin_hash = self.admin_hash()
-        admin_token = room["links"]["C"]["hash"]
-        team_token = room["links"]["A"]["hash"]
-        config = room_app.default_match_config()
-        config["matchName"] = "杯赛 A 决赛"
-        config["stageLimits"]["mapSelectSeconds"] = 75
-        create = self.client.post(
-            f"/api/admin/{admin_hash}/config-presets",
-            json={
-                "schemaVersion": 1,
-                "id": "cup-a",
-                "name": "杯赛 A",
-                "description": "主赛事规则",
-                "config": config,
-            },
-        )
-        self.assertEqual(create.status_code, 201, create.get_data(as_text=True))
-        self.assertTrue((room_app.CONFIG_PRESETS_DIR / "cup-a.json").is_file())
-        self.assertEqual(self.client.get("/api/admin/bad/config-presets").status_code, 404)
-        self.assertEqual(
-            self.client.get(f"/api/rooms/token/{team_token}/config-presets").status_code,
-            403,
-        )
-
-        applied = self.client.post(
-            f"/api/rooms/token/{admin_token}/config/apply-preset",
-            json={"presetId": "cup-a"},
-        )
-        self.assertEqual(applied.status_code, 200, applied.get_data(as_text=True))
-        room_config = applied.get_json()
-        self.assertEqual(room_config["source"]["presetId"], "cup-a")
-        self.assertEqual(room_config["value"]["matchName"], "杯赛 A 决赛")
-        self.assertEqual(room_config["value"]["stageLimits"]["mapSelectSeconds"], 75)
-
-        changed_template = json.loads(json.dumps(config, ensure_ascii=False))
-        changed_template["stageLimits"]["mapSelectSeconds"] = 90
-        update = self.client.put(
-            f"/api/admin/{admin_hash}/config-presets/cup-a",
-            json={"id": "cup-a", "name": "杯赛 A", "description": "更新版", "config": changed_template},
-        )
-        self.assertEqual(update.status_code, 200)
-        unchanged_room = self.client.get(f"/api/rooms/token/{admin_token}/config").get_json()
-        self.assertEqual(unchanged_room["value"]["stageLimits"]["mapSelectSeconds"], 75)
-
-    def test_extended_config_supports_ties_zero_rest_and_internal_preset_ids(self) -> None:
-        config = room_app.default_match_config()
-        self.assertEqual(config["stageCount"], 7)
+    def configure_fast_room(self, room: dict, *, roster_mode: str = "skip", ban_enabled: bool = False) -> None:
+        config = default_config()
         config["stageLimits"]["preStartRestSeconds"] = 0
         config["stageLimits"]["postMatchRestSeconds"] = 0
-        normalized = room_app.normalize_match_config(config, room_app.load_assets().get("maps", {}))
-        self.assertEqual(normalized["stageLimits"]["preStartRestSeconds"], 0)
-        self.assertEqual(normalized["stageLimits"]["postMatchRestSeconds"], 0)
-        self.assertEqual(normalized["mapTimeoutPolicy"], "warn_extend_30")
-        self.assertEqual(normalized["lineupTimeoutPolicy"], "warn_extend_30")
-        self.assertEqual(normalized["banTimeoutPolicy"], "warn_extend_30")
+        config["firstMapPickerPolicy"] = "left"
+        config["firstSideChoicePolicy"] = "none"
+        config["openingSidePolicy"] = "left"
+        config["rosterMode"] = roster_mode
+        config["banEnabled"] = ban_enabled
+        admin = self.token(room, "C")
+        updated = self.client.put(f"/api/rooms/token/{admin}/config", json={"config": config})
+        self.assertEqual(updated.status_code, 200, updated.get_data(as_text=True))
+        self.assertEqual(self.action(admin, "config_confirm").status_code, 200)
+        self.assertEqual(self.action(admin, "match_start", {"force": True}).status_code, 200)
 
-        configured_timeouts = json.loads(json.dumps(config, ensure_ascii=False))
-        configured_timeouts["mapTimeoutPolicy"] = "random_legal_map"
-        configured_timeouts["lineupTimeoutPolicy"] = "forfeit_map"
-        configured_timeouts["banTimeoutPolicy"] = "random_legal_ban"
-        normalized_timeouts = room_app.normalize_match_config(
-            configured_timeouts, room_app.load_assets().get("maps", {})
-        )
-        self.assertEqual(normalized_timeouts["mapTimeoutPolicy"], "random_legal_map")
-        self.assertEqual(normalized_timeouts["lineupTimeoutPolicy"], "forfeit_map")
-        self.assertEqual(normalized_timeouts["banTimeoutPolicy"], "random_legal_ban")
-
-        auto_preset = self.client.post(
-            f"/api/admin/{self.admin_hash()}/config-presets",
-            json={"schemaVersion": 1, "name": "自动标识模板", "config": config},
-        )
-        self.assertEqual(auto_preset.status_code, 201, auto_preset.get_data(as_text=True))
-        preset_id = auto_preset.get_json()["id"]
-        self.assertRegex(preset_id, r"^[0-9a-f]{24}$")
-        self.assertTrue((room_app.CONFIG_PRESETS_DIR / f"{preset_id}.json").is_file())
-
-        invalid_order = json.loads(json.dumps(config, ensure_ascii=False))
-        invalid_order["mapSelectionMode"] = "strict_mode_order"
-        invalid_order["modeOrder"] = ["Control"]
-        with self.assertRaises(room_app.MatchConfigValidationError):
-            room_app.normalize_match_config(invalid_order, room_app.load_assets().get("maps", {}))
-
-    def test_side_choice_settings_split_first_and_subsequent_maps(self) -> None:
-        config = room_app.default_match_config()
-        config["firstSideChoicePolicy"] = "left_attack"
-        config["subsequentSideChoicePolicy"] = "previous_winner"
-        config["openingSidePolicy"] = "follow_map_picker"
-        normalized = room_app.normalize_match_config(config, room_app.load_assets().get("maps", {}))
-        self.assertEqual(normalized["firstSideChoicePolicy"], "left_attack")
-        self.assertEqual(normalized["subsequentSideChoicePolicy"], "previous_winner")
-        self.assertEqual(normalized["openingSidePolicy"], "follow_map_picker")
-
-        no_first_side_choice = room_app.default_match_config()
-        no_first_side_choice["firstSideChoicePolicy"] = "none"
-        normalized_none = room_app.normalize_match_config(
-            no_first_side_choice,
-            room_app.load_assets().get("maps", {}),
-        )
-        self.assertEqual(normalized_none["firstSideChoicePolicy"], "none")
-
-        legacy = room_app.default_match_config()
-        legacy.pop("firstSideChoicePolicy")
-        legacy.pop("subsequentSideChoicePolicy")
-        legacy["sideChoicePickerPolicy"] = "previous_winner"
-        migrated = room_app.normalize_match_config(legacy, room_app.load_assets().get("maps", {}))
-        self.assertEqual(migrated["firstSideChoicePolicy"], "map_picker")
-        self.assertEqual(migrated["subsequentSideChoicePolicy"], "previous_winner")
-
-        invalid_fixed = room_app.default_match_config()
-        invalid_fixed["fixedFirstMapEnabled"] = True
-        invalid_fixed["firstSideChoicePolicy"] = "map_picker"
-        with self.assertRaises(room_app.MatchConfigValidationError):
-            room_app.normalize_match_config(invalid_fixed, room_app.load_assets().get("maps", {}))
-
-        invalid_fixed_opening_ban = room_app.default_match_config()
-        invalid_fixed_opening_ban["fixedFirstMapEnabled"] = True
-        invalid_fixed_opening_ban["firstSideChoicePolicy"] = "left"
-        invalid_fixed_opening_ban["openingSidePolicy"] = "follow_map_picker"
-        with self.assertRaises(room_app.MatchConfigValidationError):
-            room_app.normalize_match_config(
-                invalid_fixed_opening_ban,
-                room_app.load_assets().get("maps", {}),
-            )
-
-    def test_room_config_requires_admin_and_locks_until_destructive_rollback(self) -> None:
+    def test_new_room_has_unique_tokens_and_initial_authoritative_state(self) -> None:
         room = self.create_room()
-        admin_token = room["links"]["C"]["hash"]
-        team_token = room["links"]["A"]["hash"]
-        current = self.client.get(f"/api/rooms/token/{admin_token}/config").get_json()
-        edited = json.loads(json.dumps(current["value"], ensure_ascii=False))
-        edited["matchName"] = "独立房间配置"
+        codes = [room["roomId"], *(self.token(room, code) for code in room_app.ROOM_ROLES)]
+        self.assertEqual(len(set(codes)), 5)
+        self.assertTrue(all(re.fullmatch(r"[0-9a-z]{4}", code) for code in codes))
+        boot = self.client.get(f"/api/rooms/token/{self.token(room, 'A')}").get_json()
+        self.assertEqual(boot["authoritativeState"]["status"]["phase"]["type"], "configuring")
+        self.assertNotIn("snapshot", boot)
 
-        forbidden = self.client.put(
-            f"/api/rooms/token/{team_token}/config",
-            json={"revision": current["revision"], "config": edited},
+    def test_snapshot_and_legacy_mutation_routes_are_removed(self) -> None:
+        room = self.create_room()
+        token = self.token(room, "C")
+        for method, suffix in (
+            (self.client.get, "snapshot"), (self.client.put, "snapshot"),
+            (self.client.post, "presence"), (self.client.post, "start"),
+            (self.client.post, "config/confirm"), (self.client.post, "rollback-to-config"),
+        ):
+            self.assertEqual(method(f"/api/rooms/token/{token}/{suffix}").status_code, 404)
+
+    def test_sync_returns_runtime_when_hash_matches_and_full_when_it_does_not(self) -> None:
+        room = self.create_room()
+        token = self.token(room, "A")
+        status = self.full(token)["status"]
+        same = self.sync(token, {key: status[key] for key in ("epoch", "revision", "hash")}).get_json()
+        self.assertEqual(same["kind"], "runtime")
+        self.assertNotIn("status", same)
+        wrong = self.sync(token, {"epoch": 1, "revision": 999, "hash": "sha256:bad"}).get_json()
+        self.assertEqual(wrong["kind"], "full")
+
+    def test_ready_and_single_side_lineup_are_runtime_only(self) -> None:
+        room = self.create_room()
+        admin, left = self.token(room, "C"), self.token(room, "A")
+        config = default_config()
+        config["firstMapPickerPolicy"] = "left"
+        config["firstSideChoicePolicy"] = "none"
+        config["openingSidePolicy"] = "left"
+        config["stageLimits"]["preStartRestSeconds"] = 0
+        self.client.put(f"/api/rooms/token/{admin}/config", json={"config": config})
+        confirmed = self.action(admin, "config_confirm").get_json()
+        revision = confirmed["status"]["revision"]
+        ready = self.action(left, "portal_ready_set").get_json()
+        self.assertEqual(ready["status"]["revision"], revision)
+        self.assertTrue(ready["runtime"]["presence"]["A"]["ready"])
+        self.action(admin, "match_start", {"force": True})
+        self.action(left, "map_select", {"mapId": "lijiang_tower"})
+        lineup = {slot["id"]: f"left-{slot['id']}" for slot in config["lineupSlots"]}
+        before = self.full(left)["status"]["revision"]
+        submitted = self.action(left, "lineup_submit", {"lineup": lineup}).get_json()
+        self.assertEqual(submitted["status"]["revision"], before)
+        self.assertEqual(submitted["runtime"]["lineupSubmissions"]["left"], lineup)
+
+    def test_stale_action_gets_409_with_latest_full_state(self) -> None:
+        room = self.create_room()
+        admin = self.token(room, "C")
+        current = self.full(admin)["status"]
+        stale = {"epoch": 1, "revision": 0, "hash": "sha256:old", "phaseId": "old"}
+        response = self.client.post(
+            f"/api/rooms/token/{admin}/actions",
+            json={"requestId": "stale-1", "expected": stale, "type": "config_confirm", "payload": {}},
         )
-        self.assertEqual(forbidden.status_code, 403)
-        saved = self.client.put(
-            f"/api/rooms/token/{admin_token}/config",
-            json={"revision": current["revision"], "config": edited, "source": {"type": "json"}},
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["kind"], "full")
+        self.assertEqual(response.get_json()["status"]["revision"], current["revision"])
+
+    def test_broadcast_is_read_only_and_team_cannot_confirm_config(self) -> None:
+        room = self.create_room()
+        broadcast, team = self.token(room, "D"), self.token(room, "A")
+        self.assertEqual(self.action(broadcast, "portal_ready_set").status_code, 403)
+        self.assertEqual(self.action(team, "config_confirm").status_code, 403)
+
+    def test_request_id_is_idempotent(self) -> None:
+        room = self.create_room()
+        admin = self.token(room, "C")
+        current = self.full(admin)["status"]
+        body = {
+            "requestId": "same-request",
+            "expected": {"epoch": current["epoch"], "revision": current["revision"], "hash": current["hash"], "phaseId": current["phase"]["phaseId"]},
+            "type": "config_confirm", "payload": {},
+        }
+        first = self.client.post(f"/api/rooms/token/{admin}/actions", json=body)
+        second = self.client.post(f"/api/rooms/token/{admin}/actions", json=body)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.get_json(), second.get_json())
+
+    def test_complete_ft2_flow_and_status_history_rollback(self) -> None:
+        room = self.create_room()
+        self.configure_fast_room(room)
+        admin, left, right = (self.token(room, code) for code in ("C", "A", "B"))
+
+        self.assertEqual(self.action(left, "map_select", {"mapId": "lijiang_tower"}).get_json()["status"]["phase"]["type"], "score_entry")
+        self.action(admin, "score_submit", {"score": {"left": 2, "right": 0}})
+        # Zero rest is advanced by the next sync.
+        self.full(left)
+        self.action(right, "map_select", {"mapId": "dorado"})
+        self.action(right, "side_select", {"selectedSide": "right"})
+        completed = self.action(admin, "score_submit", {"score": {"left": 1, "right": 0}}).get_json()
+        self.assertEqual(completed["status"]["lifecycle"], "completed")
+        self.assertEqual(completed["status"]["match"]["winnerSide"], "left")
+
+        history = self.client.get(f"/api/rooms/token/{admin}/status-history").get_json()["items"]
+        target = next(item for item in history if item["phase"]["type"] == "score_entry")
+        old_revision = completed["status"]["revision"]
+        rolled = self.client.post(f"/api/rooms/token/{admin}/rollback", json={"revision": target["revision"]}).get_json()
+        self.assertGreater(rolled["status"]["revision"], old_revision)
+        self.assertEqual(rolled["status"]["epoch"], 2)
+        self.assertNotEqual(rolled["status"]["phase"]["phaseId"], target["phase"]["phaseId"])
+        self.assertIsNone(rolled["runtime"]["scoreProposal"])
+
+    def test_score_rejection_keeps_proposal_for_admin_decision(self) -> None:
+        room = self.create_room()
+        self.configure_fast_room(room)
+        admin, left, right = (self.token(room, code) for code in ("C", "A", "B"))
+
+        self.assertEqual(self.action(left, "map_select", {"mapId": "lijiang_tower"}).get_json()["status"]["phase"]["type"], "score_entry")
+        self.action(left, "score_submit", {"score": {"left": 2, "right": 1}})
+        rejected = self.action(right, "score_reject").get_json()
+
+        proposal = rejected["runtime"]["scoreProposal"]
+        self.assertEqual(proposal["submittedBy"], "left")
+        self.assertEqual(proposal["score"], {"left": 2, "right": 1})
+        self.assertEqual(proposal["rejectedBy"], "right")
+
+        completed = self.action(
+            admin,
+            "score_submit",
+            {"score": {"left": 2, "right": 1}},
+            request_id="admin-score-submit-after-appeal",
+        ).get_json()
+        self.assertEqual(completed["status"]["match"]["maps"][0]["status"], "completed")
+        self.assertIsNone(completed["runtime"]["scoreProposal"])
+
+    def test_server_restart_closes_active_rooms_without_deleting_archive(self) -> None:
+        room = self.create_room()
+        token = self.token(room, "A")
+        archive = "-".join(self.token(room, code) for code in room_app.ROOM_ROLES)
+        history_path = room_app.ROOM_HISTORY_DIR / f"{archive}.json"
+        self.assertTrue(history_path.exists())
+        room_app.initialize_room_store()
+        self.assertEqual(self.sync(token).status_code, 410)
+        document = json.loads(history_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["status"], "closed")
+        self.assertEqual(document["closeReason"], "server_restart")
+        self.assertEqual(json.loads(room_app.ROOM_STORE_PATH.read_text(encoding="utf-8"))["rooms"], [])
+
+    def test_legacy_preset_is_backed_up_and_migrated(self) -> None:
+        room_app.CONFIG_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+        legacy = room_app.default_match_config()
+        path = room_app.CONFIG_PRESETS_DIR / "legacy.json"
+        path.write_text(json.dumps({
+            "schemaVersion": 1, "id": "legacy", "name": "Legacy", "description": "",
+            "revision": 1, "createdAt": 1, "updatedAt": 1, "config": legacy,
+        }), encoding="utf-8")
+        room_app.migrate_authoritative_config_presets_unlocked()
+        migrated = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["schemaVersion"], 2)
+        self.assertEqual(migrated["config"]["schemaVersion"], 1)
+        self.assertIn("drawMapReserve", migrated["config"])
+        self.assertTrue((room_app.CONFIG_PRESETS_DIR / "legacy.legacy-v0.json").exists())
+
+    def test_default_preset_cannot_be_deleted_until_default_changes(self) -> None:
+        store = json.loads(room_app.ROOM_STORE_PATH.read_text(encoding="utf-8"))
+        admin_hash = store["adminHash"]
+        created = self.client.post(
+            f"/api/admin/{admin_hash}/config-presets",
+            json={"id": "active-default", "name": "Active Default", "config": default_config()},
         )
-        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
-        self.assertEqual(saved.get_json()["source"]["type"], "json")
-        self.assertEqual(self.client.post(f"/api/rooms/token/{admin_token}/config/confirm").status_code, 200)
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        settings = self.client.put(
+            f"/api/admin/{admin_hash}/settings",
+            json={"defaultPresetId": "active-default"},
+        )
+        self.assertEqual(settings.status_code, 200, settings.get_data(as_text=True))
+
+        blocked = self.client.delete(f"/api/admin/{admin_hash}/config-presets/active-default")
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.get_json()["error"], "active_default_preset")
+        self.assertIsNotNone(room_app.load_config_preset("active-default"))
+
+        self.client.put(f"/api/admin/{admin_hash}/settings", json={"defaultPresetId": None})
         self.assertEqual(
-            self.client.post(f"/api/rooms/token/{admin_token}/start", json={"force": True}).status_code,
+            self.client.delete(f"/api/admin/{admin_hash}/config-presets/active-default").status_code,
             200,
         )
 
-        locked_edit = self.client.put(
-            f"/api/rooms/token/{admin_token}/config",
-            json={"config": room_app.default_match_config()},
+
+class RoomEngineTests(unittest.TestCase):
+    def test_hash_is_deterministic_and_excludes_hash_field(self) -> None:
+        left = {"b": 2, "a": {"值": True}, "hash": "old"}
+        right = {"hash": "new", "a": {"值": True}, "b": 2}
+        self.assertEqual(canonical_json({"a": 1, "b": 2}), '{"a":1,"b":2}')
+        self.assertEqual(status_hash(left), status_hash(right))
+
+    def test_timeout_is_server_driven_and_pause_freezes_remaining_time(self) -> None:
+        clock = [1_000_000]
+        config = default_config()
+        config["stageLimits"]["preStartRestSeconds"] = 10
+        session = RoomSession.create("room", config, now_ms=lambda: clock[0])
+
+        def action(kind: str, payload: dict | None = None) -> None:
+            session.apply_action("C", kind, payload or {}, session.status_ref(), f"{kind}-{clock[0]}")
+
+        action("config_confirm")
+        action("match_start", {"force": True})
+        clock[0] += 3_000
+        remaining = session.response()["runtime"]["remainingTimeMs"]
+        self.assertEqual(remaining, 7_000)
+        action("global_pause_set", {"active": True})
+        clock[0] += 20_000
+        self.assertEqual(session.response()["runtime"]["remainingTimeMs"], 7_000)
+        action("global_pause_set", {"active": False})
+        clock[0] += 7_001
+        self.assertNotEqual(session.response()["status"]["phase"]["type"], "pre_start_rest")
+
+    def test_illegal_actor_and_illegal_map_are_rejected(self) -> None:
+        config = default_config()
+        config["stageLimits"]["preStartRestSeconds"] = 0
+        config["firstMapPickerPolicy"] = "left"
+        session = RoomSession.create("room", config)
+        session.apply_action("C", "config_confirm", {}, session.status_ref(), "confirm")
+        session.apply_action("C", "match_start", {"force": True}, session.status_ref(), "start")
+        with self.assertRaises(StateActionError) as actor:
+            session.apply_action("B", "map_select", {"mapId": "lijiang_tower"}, session.status_ref(), "wrong-side")
+        self.assertEqual(actor.exception.code, "forbidden")
+        with self.assertRaises(StateActionError) as illegal:
+            session.apply_action("A", "map_select", {"mapId": "not_in_pool"}, session.status_ref(), "bad-map")
+        self.assertEqual(illegal.exception.code, "illegal_map")
+
+    def test_notification_cursor_first_entry_does_not_replay_and_events_are_idempotent(self) -> None:
+        session = RoomSession.create("room", default_config())
+        session.apply_action("C", "config_confirm", {}, session.status_ref(), "confirm", 0)
+        response = session.apply_action(
+            "C",
+            "match_start",
+            {"force": True},
+            session.status_ref(),
+            "start",
+            0,
         )
-        self.assertEqual(locked_edit.status_code, 409)
-        malicious_snapshot = {
-            "roomStarted": True,
-            "settingsState": {"matchName": "被篡改"},
-            "marker": "server-owned-config",
-        }
-        pushed = self.client.put(
-            f"/api/rooms/token/{team_token}/snapshot",
-            json={
-                "version": 0,
-                "snapshot": malicious_snapshot,
-                "operation": {"category": "lineup", "action": "ready", "details": {}},
+        self.assertTrue(response["notificationStream"]["events"])
+        cursor = response["notificationStream"]["cursor"]
+        first_entry = session.response(notification_cursor=None)
+        self.assertEqual(first_entry["notificationStream"], {"cursor": cursor, "events": []})
+
+        replay = session.response(notification_cursor=0)["notificationStream"]["events"]
+        self.assertEqual(len({event["eventId"] for event in replay}), len(replay))
+        self.assertEqual(session.response(notification_cursor=cursor)["notificationStream"]["events"], [])
+
+        duplicate = session.apply_action(
+            "C",
+            "match_start",
+            {"force": True},
+            response["status"] and {
+                "epoch": response["status"]["epoch"],
+                "revision": response["status"]["revision"],
+                "hash": response["status"]["hash"],
+                "phaseId": response["status"]["phase"]["phaseId"],
             },
+            "start",
+            0,
         )
-        self.assertEqual(pushed.status_code, 200, pushed.get_data(as_text=True))
-        stored_snapshot = self.client.get(f"/api/rooms/token/{admin_token}/snapshot").get_json()["snapshot"]
-        self.assertEqual(stored_snapshot["settingsState"]["matchName"], "独立房间配置")
+        self.assertEqual(duplicate["notificationStream"]["cursor"], cursor)
+        self.assertEqual(len(session.notification_events), len(replay))
 
-        rolled_back = self.client.post(f"/api/rooms/token/{admin_token}/rollback-to-config")
-        self.assertEqual(rolled_back.status_code, 200)
-        self.assertEqual(rolled_back.get_json()["config"]["status"], "draft")
-        self.assertIsNone(self.client.get(f"/api/rooms/token/{admin_token}/snapshot").get_json()["snapshot"])
+    def test_global_pause_rejects_writes_and_freezes_nested_team_pause(self) -> None:
+        clock = [2_000_000]
+        config = default_config()
+        config["stageLimits"]["preStartRestSeconds"] = 0
+        config["firstMapPickerPolicy"] = "left"
+        config["firstSideChoicePolicy"] = "none"
+        config["openingSidePolicy"] = "left"
+        config["rosterMode"] = "skip"
+        config["banEnabled"] = False
+        session = RoomSession.create("room", config, now_ms=lambda: clock[0])
 
-    def test_config_documentation_and_validation_errors_are_exposed(self) -> None:
-        example_response = self.client.get("/docs/config/match-config.example.json")
-        schema_response = self.client.get("/docs/config/match-config.schema.json")
-        self.assertEqual(example_response.status_code, 200)
-        self.assertEqual(schema_response.status_code, 200)
-        example_response.close()
-        schema_response.close()
-        invalid = room_app.default_match_config()
-        invalid["stageLimits"]["mapSelectSeconds"] = 0
-        response = self.client.post(
-            f"/api/admin/{self.admin_hash()}/config-presets",
-            json={"id": "invalid", "name": "无效", "config": invalid},
-        )
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["details"][0]["path"], "stageLimits.mapSelectSeconds")
+        def action(portal: str, kind: str, payload: dict | None = None) -> dict:
+            return session.apply_action(
+                portal,
+                kind,
+                payload or {},
+                session.status_ref(),
+                f"{kind}-{clock[0]}-{portal}",
+            )
 
-    def test_history_failure_does_not_commit_snapshot_or_release_room(self) -> None:
-        room = self.create_room()
-        token = room["links"]["C"]["hash"]
+        action("C", "config_confirm")
+        action("C", "match_start", {"force": True})
+        action("A", "map_select", {"mapId": "lijiang_tower"})
+        self.assertEqual(session.status.phase["type"], "score_entry")
+        action("A", "score_pause_set", {"active": True})
+        clock[0] += 1_000
+        action("C", "global_pause_set", {"active": True})
+        frozen = session.runtime.pause["scoreTeams"]["left"]["matchTotalMs"]
+        self.assertEqual(frozen, 1_000)
+        clock[0] += 10_000
+        session.response()
+        self.assertTrue(session.runtime.pause["scoreTeams"]["left"]["active"])
+        self.assertEqual(session.runtime.pause["scoreTeams"]["left"]["matchTotalMs"], frozen)
+        with self.assertRaises(StateActionError) as paused:
+            action("A", "score_pause_set", {"active": False})
+        self.assertEqual(paused.exception.code, "global_paused")
 
-        with patch.object(room_app, "append_room_history_unlocked", side_effect=OSError("disk full")):
-            with self.assertRaises(OSError):
-                self.client.put(
-                    f"/api/rooms/token/{token}/snapshot",
-                    json={
-                        "version": 0,
-                        "snapshot": {"marker": "must-not-commit"},
-                        "operation": {"category": "room", "action": "started", "details": {}},
-                    },
-                )
+        action("C", "global_pause_set", {"active": False})
+        clock[0] += 2_000
+        action("A", "score_pause_set", {"active": False})
+        self.assertEqual(session.runtime.pause["scoreTeams"]["left"]["matchTotalMs"], 3_000)
 
-            with self.assertRaises(OSError):
-                self.close_room(room)
+    def test_interactive_random_result_advances_on_first_heartbeat_after_deadline(self) -> None:
+        clock = [3_000_000]
+        config = default_config()
+        config["stageLimits"]["preStartRestSeconds"] = 0
+        config["firstMapPickerPolicy"] = "interactive_random"
+        session = RoomSession.create("room", config, now_ms=lambda: clock[0])
+        session.apply_action("C", "config_confirm", {}, session.status_ref(), "confirm")
+        session.apply_action("C", "match_start", {"force": True}, session.status_ref(), "start")
+        self.assertEqual(session.status.phase["type"], "interactive_random")
+        session.apply_action("A", "interactive_random_submit", {"value": 0}, session.status_ref(), "left")
+        session.apply_action("B", "interactive_random_submit", {"value": 1}, session.status_ref(), "right")
+        self.assertIsNotNone(session.runtime.interactiveRandomResult)
+        clock[0] += 5_001
+        response = session.heartbeat("A", None, 0)
+        self.assertEqual(response["status"]["phase"]["type"], "map_pick")
 
-        stored_room = self.read_store()["rooms"][0]
-        self.assertEqual(stored_room["version"], 0)
-        self.assertIsNone(stored_room["snapshot"])
-        self.assertEqual(self.read_history(room)["status"], "active")
+    def test_removed_match_actions_are_rejected(self) -> None:
+        session = RoomSession.create("room", default_config())
+        for action_type in ("match_cancel", "interactive_random_continue"):
+            with self.assertRaises(StateActionError) as rejected:
+                session.apply_action("C", action_type, {}, session.status_ref(), action_type)
+            self.assertEqual(rejected.exception.code, "invalid_action")
 
-    def test_close_archives_removes_active_room_and_exposes_protected_download(self) -> None:
-        room = self.create_room()
-        token = room["links"]["A"]["hash"]
-        archive_key = self.history_path(room).stem
-        admin_hash = self.admin_hash()
+    def test_twenty_rooms_eighty_clients_sync_within_single_worker_budget(self) -> None:
+        tracemalloc.start()
+        baseline, _ = tracemalloc.get_traced_memory()
+        registry = RoomStateRegistry()
+        sessions: list[tuple[RoomSession, dict[str, str]]] = []
+        for room_index in range(20):
+            tokens = {code: f"token-{room_index:02d}-{code}" for code in room_app.ROOM_ROLES}
+            session = registry.create(f"load-{room_index:02d}", tokens, default_config())
+            sessions.append((session, tokens))
 
-        self.assertEqual(self.close_room(room).status_code, 200)
-        self.assertEqual(self.read_store()["rooms"], [])
-        self.assertEqual(self.client.get(f"/api/rooms/token/{token}").status_code, 410)
+        durations: list[float] = []
+        for session, _ in sessions:
+            for code in room_app.ROOM_ROLES:
+                started = time.perf_counter()
+                response = session.heartbeat(code, {
+                    "epoch": session.status.epoch,
+                    "revision": session.status.revision,
+                    "hash": session.status.hash,
+                })
+                durations.append(time.perf_counter() - started)
+                self.assertEqual(response["kind"], "runtime")
 
-        history = self.read_history(room)
-        self.assertEqual(history["status"], "closed")
-        self.assertEqual(history["closeReason"], "manual")
-        self.assertEqual(history["history"][-1]["actor"]["type"], "global_admin")
-
-        listing = self.client.get(f"/api/admin/{admin_hash}/room-history?page=1&pageSize=1")
-        self.assertEqual(listing.status_code, 200)
-        self.assertEqual(listing.get_json()["items"][0]["status"], "closed")
-        self.assertEqual(self.client.get("/api/admin/bad/room-history").status_code, 404)
-        self.assertEqual(
-            self.client.get(f"/api/admin/{admin_hash}/room-history/not-a-key").status_code,
-            404,
-        )
-
-        download = self.client.get(
-            f"/api/admin/{admin_hash}/room-history/{archive_key}/download"
-        )
-        self.assertEqual(download.status_code, 200)
-        self.assertIn(f'filename={archive_key}.json', download.headers["Content-Disposition"])
-        download.close()
-
-    def test_inactive_room_is_archived_as_expired(self) -> None:
-        room = self.create_room()
-        token = room["links"]["B"]["hash"]
-        store = self.read_store()
-        store["globalSettings"]["inactiveTimeoutMinutes"] = 1
-        store["rooms"][0]["lastActiveAt"] = room_app.current_timestamp() - 120
-        room_app.save_json_atomic(room_app.ROOM_STORE_PATH, store)
-
-        response = self.client.get(f"/api/rooms/token/{token}")
-
-        self.assertEqual(response.status_code, 410)
-        self.assertEqual(self.read_store()["rooms"], [])
-        history = self.read_history(room)
-        self.assertEqual(history["status"], "expired")
-        self.assertEqual(history["closeReason"], "inactive_timeout")
-        self.assertEqual(history["history"][-1]["operation"]["action"], "expired")
-
-    def test_notification_duration_is_configurable_and_exposed_to_rooms(self) -> None:
-        admin_hash = self.admin_hash()
-        initial = self.client.get(f"/api/admin/{admin_hash}/settings")
-        self.assertEqual(initial.status_code, 200)
-        self.assertEqual(initial.get_json()["notificationDurationSeconds"], 20)
-
-        updated = self.client.put(
-            f"/api/admin/{admin_hash}/settings",
-            json={"notificationDurationSeconds": 37},
-        )
-        self.assertEqual(updated.status_code, 200)
-        self.assertEqual(updated.get_json()["notificationDurationSeconds"], 37)
-
-        room = self.create_room()
-        token = room["links"]["A"]["hash"]
-        room_payload = self.client.get(f"/api/rooms/token/{token}")
-        snapshot_payload = self.client.get(f"/api/rooms/token/{token}/snapshot")
-        self.assertEqual(room_payload.get_json()["notificationDurationSeconds"], 37)
-        self.assertEqual(snapshot_payload.get_json()["notificationDurationSeconds"], 37)
-
-    def test_catalog_admin_endpoints_require_global_admin_hash(self) -> None:
-        self.assertEqual(self.client.get("/api/admin/not-valid/catalog-maintenance").status_code, 404)
-        self.assertEqual(self.client.post("/api/admin/not-valid/catalog-refresh").status_code, 404)
-        self.assertEqual(
-            self.client.put("/api/admin/not-valid/catalog-translation", json={}).status_code,
-            404,
-        )
-
-    def test_catalog_translation_is_saved_and_invalid_mapping_forces_english(self) -> None:
-        admin_hash = self.admin_hash()
-        initial = self.client.get("/api/maps/catalog")
-        self.assertEqual(initial.status_code, 200)
-        self.assertEqual(initial.headers.get("Cache-Control"), "no-store")
-        self.assertEqual(initial.get_json()["locale"], "zh-CN")
-
-        invalid = {"schemaVersion": 1, "catalogHash": "sha256:outdated", "modes": {}, "maps": {}, "heroes": {}}
-        saved = self.client.put(f"/api/admin/{admin_hash}/catalog-translation", json=invalid)
-        self.assertEqual(saved.status_code, 200)
-        self.assertFalse(saved.get_json()["active"])
-        self.assertTrue((room_app.RUNTIME_CATALOG_DIR / "translation.json").is_file())
-
-        catalog_response = self.client.get("/api/maps/catalog").get_json()
-        self.assertEqual(catalog_response["locale"], "en")
-        self.assertFalse(catalog_response["translation"]["active"])
-        self.assertEqual(catalog_response["translation"]["maps"], {})
-
-    def test_catalog_translation_rejects_invalid_json_without_overwrite(self) -> None:
-        admin_hash = self.admin_hash()
-        translation_path = room_app.RUNTIME_CATALOG_DIR / "translation.json"
-        translation_path.parent.mkdir(parents=True, exist_ok=True)
-        translation_path.write_text('{"kept": true}', encoding="utf-8")
-
-        response = self.client.put(
-            f"/api/admin/{admin_hash}/catalog-translation",
-            data="{not-json",
-            content_type="application/json",
-        )
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(translation_path.read_text(encoding="utf-8"), '{"kept": true}')
-
-    def test_catalog_refresh_is_mutually_exclusive(self) -> None:
-        admin_hash = self.admin_hash()
-        running_job = {
-            "id": "existing-job",
-            "status": "running",
-            "stage": "download",
-            "progress": 50,
-            "message": "working",
-        }
-        with room_app.catalog_refresh_lock:
-            room_app.catalog_refresh_jobs.clear()
-            room_app.catalog_refresh_jobs["existing-job"] = running_job
-            room_app.active_catalog_refresh_job_id = "existing-job"
-
-        response = self.client.post(f"/api/admin/{admin_hash}/catalog-refresh")
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["id"], "existing-job")
-
-    def test_notification_event_merge_preserves_order_and_deduplicates(self) -> None:
-        current = {
-            "notificationEvents": [
-                {"id": "older", "createdAt": 10, "segments": [{"text": "旧事件"}]},
-            ]
-        }
-        incoming = {
-            "notificationEvents": [
-                {"id": "newer", "createdAt": 20, "segments": [{"text": "新事件"}]},
-                {"id": "older", "createdAt": 10, "segments": [{"text": "重复事件"}]},
-            ]
-        }
-
-        room_app.merge_notification_events_unlocked(current, incoming)
-
-        self.assertEqual(
-            [event["id"] for event in incoming["notificationEvents"]],
-            ["older", "newer"],
-        )
-
-    def test_legacy_store_is_cleared_without_creating_history(self) -> None:
-        legacy_admin_hash = "legacy-admin-hash-that-stays-long"
-        legacy_store = {
-            "adminHash": legacy_admin_hash,
-            "globalSettings": {"roomsPerHour": 12, "inactiveTimeoutMinutes": 45},
-            "createLog": {"127.0.0.1": [1, 2]},
-            "rooms": [
-                {
-                    "id": "legacy-room-id",
-                    "tokens": {code: f"legacy-token-{code}" for code in room_app.ROOM_ROLES},
-                }
-            ],
-        }
-        room_app.save_json_atomic(room_app.ROOM_STORE_PATH, legacy_store)
-
-        room_app.initialize_room_store()
-
-        migrated = self.read_store()
-        self.assertEqual(migrated["schemaVersion"], room_app.ROOM_STORE_SCHEMA_VERSION)
-        self.assertEqual(migrated["adminHash"], legacy_admin_hash)
-        self.assertEqual(migrated["globalSettings"]["roomsPerHour"], 12)
-        self.assertEqual(migrated["rooms"], [])
-        self.assertEqual(list(room_app.ROOM_HISTORY_DIR.glob("*.json")), [])
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        p95 = sorted(durations)[int(len(durations) * 0.95) - 1]
+        self.assertLess(p95, 0.2)
+        self.assertLess(peak - baseline, 512 * 1024 * 1024)
+        self.assertTrue(all(registry.get(f"load-{room_index:02d}") is not None for room_index in range(20)))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,761 @@
+schemaVersion: 1
+kind: ui-scenarios
+domain: lineup-ban
+
+scenarios:
+  - id: LINEUP_BOTH_EDITING
+    title: 双方分别填写本队阵容
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#上场成员设置
+      - frontend/src/main.ts:2895
+    given:
+      fixture: lineup-pick
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: lineup-selector
+          mode: interactive
+          actingAs: left
+          headline: MAP 1 上场成员
+          visibleData:
+            - 本队五个位置输入
+            - 对方填写状态
+            - 阵容倒计时
+          hiddenData:
+            - 对方未确认阵容草稿
+          controls:
+            edit-left-lineup:
+              state: enabled
+            edit-right-lineup:
+              state: disabled
+              reason: 队伍只能编辑本队
+            confirm-lineup:
+              state: disabled
+              reason: 本队五个位置未全部填写或存在重复成员
+            minimize-foreground:
+              state: enabled
+        team_right:
+          foreground: lineup-selector
+          mode: interactive
+          actingAs: right
+          headline: MAP 1 上场成员
+          visibleData:
+            - 本队五个位置输入
+            - 对方填写状态
+          hiddenData:
+            - 对方未确认阵容草稿
+          controls:
+            edit-left-lineup:
+              state: disabled
+              reason: 队伍只能编辑本队
+            edit-right-lineup:
+              state: enabled
+            confirm-lineup:
+              state: disabled
+              reason: 本队五个位置未全部填写或存在重复成员
+            minimize-foreground:
+              state: enabled
+        admin:
+          foreground: lineup-selector
+          mode: acting-for-team
+          actingAs: both
+          headline: MAP 1 上场成员
+          visibleData:
+            - 双方阵容草稿
+            - 双方确认状态
+          controls:
+            edit-left-lineup:
+              state: enabled
+            edit-right-lineup:
+              state: enabled
+            confirm-lineup:
+              state: disabled
+              reason: 双方十个位置未全部填写或存在同队重复成员
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+    notes:
+      - free_input 使用文本输入；preset_only 使用预设成员下拉框
+      - 同一队伍成员名规范化后不得重复
+
+  - id: LINEUP_LEFT_SUBMITTED
+    title: 队伍1已确认阵容，队伍2尚未确认
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#上场成员设置
+      - frontend/src/main.ts:2938
+    given:
+      fixture: lineup-pick
+      runtime:
+        lineupSubmissions:
+          left:
+            damage_1: 选手A
+            damage_2: 选手B
+            tank: 选手C
+            support_1: 选手D
+            support_2: 选手E
+          right: null
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: lineup-selector
+          mode: readonly
+          actingAs: left
+          headline: 等待对方确认
+          visibleData:
+            - 本队已确认阵容
+            - 对方尚未确认
+          hiddenData:
+            - 对方阵容草稿
+          controls:
+            edit-left-lineup:
+              state: disabled
+              reason: 本队已经确认
+            confirm-lineup:
+              state: disabled
+              label: 等待对方确认
+        team_right:
+          foreground: lineup-selector
+          mode: interactive
+          actingAs: right
+          headline: 队伍1已确认
+          visibleData:
+            - 对方已确认状态
+            - 本队阵容输入
+          hiddenData:
+            - 队伍1具体成员
+          controls:
+            edit-right-lineup:
+              state: enabled
+            confirm-lineup:
+              state: disabled
+              reason: 本队阵容尚未完整
+        admin:
+          foreground: lineup-selector
+          mode: acting-for-team
+          actingAs: both
+          headline: 队伍1已确认，等待队伍2
+          visibleData:
+            - 双方具体阵容数据
+          controls:
+            edit-left-lineup:
+              state: disabled
+              reason: 队伍1已经确认
+            edit-right-lineup:
+              state: enabled
+            confirm-lineup:
+              state: disabled
+              reason: 双方阵容尚未完整
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          hiddenData:
+            - 当前阶段双方具体阵容
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+
+  - id: LINEUP_CONFIRMATION_LOCAL
+    title: 本队确认上场成员的二次确认
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#二次确认规则
+      - frontend/src/main.ts:4072
+    given:
+      fixture: lineup-pick
+      localUI:
+        selectionConfirmation: lineup
+        lineupDraft:
+          left:
+            damage-1: 选手A
+            damage-2: 选手B
+            tank: 选手C
+            support-1: 选手D
+            support-2: 选手E
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: lineup-selector
+          overlays:
+            - selection-confirmation
+          mode: interactive
+          headline: 确认上场成员
+          visibleData:
+            - 本队名称
+            - 五个职责与成员
+          controls:
+            cancel-confirmation:
+              state: enabled
+              label: 返回修改
+            accept-confirmation:
+              state: enabled
+              label: 确认
+        team_right:
+          foreground: lineup-selector
+          mode: interactive
+          actingAs: right
+          hiddenData:
+            - 队伍1本地确认窗口
+          controls:
+            edit-right-lineup:
+              state: enabled
+        admin:
+          foreground: lineup-selector
+          mode: acting-for-team
+          actingAs: both
+          controls:
+            edit-left-lineup:
+              state: enabled
+            edit-right-lineup:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+
+  - id: LINEUP_TIMEOUT_BOTH_UNCONFIRMED
+    title: 双方阵容均未确认时超时并重开
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#上场成员超时
+    given:
+      fixture: lineup-pick
+      runtime:
+        remainingTimeMs: 0
+        timedOut: true
+        lineupSubmissions:
+          left: null
+          right: null
+    when:
+      actor: server
+      action: restart_both_lineups
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: lineup-selector
+          mode: interactive
+          actingAs: left
+          headline: 重新填写上场成员
+          controls:
+            edit-left-lineup:
+              state: enabled
+            confirm-lineup:
+              state: disabled
+              reason: 重开的阵容为空
+        team_right:
+          foreground: lineup-selector
+          mode: interactive
+          actingAs: right
+          headline: 重新填写上场成员
+          controls:
+            edit-right-lineup:
+              state: enabled
+            confirm-lineup:
+              state: disabled
+              reason: 重开的阵容为空
+        admin:
+          foreground: lineup-selector
+          mode: acting-for-team
+          actingAs: both
+          headline: 双方均未确认，已重新计时
+          controls:
+            edit-left-lineup:
+              state: enabled
+            edit-right-lineup:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left:
+          - LINEUP_BOTH_RESTARTED
+        team_right:
+          - LINEUP_BOTH_RESTARTED
+        admin:
+          - LINEUP_BOTH_RESTARTED
+        broadcast:
+          - LINEUP_BOTH_RESTARTED
+      transition:
+        nextPhase: lineup_pick
+        runtimeReset:
+          lineupSubmissions: both-null
+          remainingTimeMs: playerSelectSeconds
+
+  - id: LINEUP_TIMEOUT_ONE_AWAITING_ADMIN
+    title: 一方已确认、另一方超时并等待管理员裁定
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#上场成员超时
+      - frontend/src/main.ts:4058
+    given:
+      fixture: lineup-pick
+      runtime:
+        remainingTimeMs: 0
+        timedOut: true
+        awaitingAdminDecision: true
+        lineupSubmissions:
+          left:
+            damage_1: 选手A
+            damage_2: 选手B
+            tank: 选手C
+            support_1: 选手D
+            support_2: 选手E
+          right: null
+      config:
+        lineupTimeoutPolicy: admin_decision
+    expect:
+      baseboard: running-current-map-selected
+      persistentIndicators:
+        - 确认选择按钮禁用并显示“等待管理员裁定”
+      views:
+        team_left:
+          foreground: lineup-selector
+          mode: readonly
+          headline: 等待管理员裁定
+          controls:
+            confirm-lineup:
+              state: disabled
+              label: 等待管理员裁定
+        team_right:
+          foreground: lineup-selector
+          mode: readonly
+          headline: 等待管理员裁定
+          controls:
+            edit-right-lineup:
+              state: disabled
+              reason: 阶段已超时
+            confirm-lineup:
+              state: disabled
+              label: 等待管理员裁定
+        admin:
+          foreground: lineup-selector
+          mode: acting-for-team
+          actingAs: both
+          headline: 上场成员超时裁定
+          controls:
+            edit-right-lineup:
+              state: enabled
+            confirm-lineup:
+              state: disabled
+              reason: 双方阵容未完整
+            timeout-extend:
+              state: enabled
+            timeout-forfeit:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          headline: 等待管理员裁定
+          controls: {}
+      notifications:
+        team_left:
+          - SELECTION_AWAITING_ADMIN
+        team_right:
+          - SELECTION_AWAITING_ADMIN
+        admin:
+          - SELECTION_AWAITING_ADMIN
+        broadcast:
+          - SELECTION_AWAITING_ADMIN
+    notes:
+      - 进入待裁定状态时发送一次 SELECTION_AWAITING_ADMIN；按钮文案负责持续表达当前状态
+      - 管理员完成裁定后由服务器发送一次 ADMIN_DECISION_RESOLVED，随后立即按权威状态继续
+
+  - id: BAN_ORDER_SELECT
+    title: 队伍1选择禁用先后手
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#英雄禁用设置
+      - docs/FUNCTIONS_AND_SETTINGS.md#二次确认规则
+      - frontend/src/main.ts:3094
+      - frontend/src/main.ts:4774
+    given:
+      fixture: ban-order-left
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: ban-order-selector
+          mode: interactive
+          actingAs: left
+          headline: 选择先手或后手
+          visibleData:
+            - 双方已确认阵容
+            - 禁用顺序倒计时
+          controls:
+            select-ban-order:
+              state: enabled
+            confirm-ban-order:
+              state: disabled
+              reason: 尚未选择先手或后手
+        team_right:
+          foreground: ban-order-selector
+          mode: readonly
+          headline: 等待队伍1选择
+          controls:
+            select-ban-order:
+              state: disabled
+              reason: 当前选择权属于队伍1
+            confirm-ban-order:
+              state: disabled
+              label: 等待队伍1选择
+        admin:
+          foreground: ban-order-selector
+          mode: acting-for-team
+          actingAs: left
+          headline: 选择先手或后手
+          controls:
+            select-ban-order:
+              state: enabled
+            confirm-ban-order:
+              state: disabled
+              reason: 尚未选择先手或后手
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+    notes:
+      - 点击“先手”或“后手”只更新当前选择；选中后下方 confirm-ban-order 变为 enabled
+      - 点击下方提交按钮即完成唯一一次确认并提交，不打开 selection-confirmation
+
+  - id: BAN_FIRST_HERO_SELECT
+    title: 先手方选择禁用英雄
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#英雄禁用设置
+      - frontend/src/main.ts:3036
+    given:
+      fixture: ban-first-left
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: hero-ban-selector
+          mode: interactive
+          actingAs: left
+          headline: 先手禁用
+          visibleData:
+            - 双方已确认阵容
+            - 重装、输出、支援英雄列
+            - 本队历史禁用状态
+            - 对手本轮禁用状态
+          controls:
+            select-hero-ban:
+              state: enabled
+            confirm-hero-ban:
+              state: disabled
+              reason: 尚未选择合法英雄
+        team_right:
+          foreground: hero-ban-selector
+          mode: readonly
+          headline: 等待队伍1禁用英雄
+          controls:
+            select-hero-ban:
+              state: disabled
+              reason: 当前操作权属于队伍1
+            confirm-hero-ban:
+              state: disabled
+              label: 等待队伍1操作
+        admin:
+          foreground: hero-ban-selector
+          mode: acting-for-team
+          actingAs: left
+          headline: 先手禁用
+          controls:
+            select-hero-ban:
+              state: enabled
+            confirm-hero-ban:
+              state: disabled
+              reason: 尚未选择合法英雄
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+    notes:
+      - 本队此前地图禁用过的英雄灰色主体、橙色边框且不可选
+      - 对手本轮已禁用英雄灰色主体、红色边框且不可选
+
+  - id: HERO_BAN_CONFIRMATION
+    title: 禁用英雄二次确认
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#二次确认规则
+      - frontend/src/main.ts:4072
+    given:
+      fixture: ban-first-left
+      localUI:
+        selectedHeroId: ana
+        selectionConfirmation: ban
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: hero-ban-selector
+          overlays:
+            - selection-confirmation
+          mode: interactive
+          actingAs: left
+          headline: 确认禁用英雄
+          visibleData:
+            - 英雄中文显示名
+          controls:
+            cancel-confirmation:
+              state: enabled
+              label: 返回修改
+            accept-confirmation:
+              state: enabled
+              label: 确认
+        team_right:
+          foreground: hero-ban-selector
+          mode: readonly
+          controls:
+            select-hero-ban:
+              state: disabled
+              reason: 当前操作权属于队伍1
+        admin:
+          foreground: hero-ban-selector
+          mode: acting-for-team
+          actingAs: left
+          controls:
+            select-hero-ban:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left: []
+        team_right: []
+        admin: []
+        broadcast: []
+
+  - id: BAN_SECOND_AFTER_FIRST_CONFIRMED
+    title: 先手禁用确认后进入后手禁用
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#英雄禁用设置
+    given:
+      fixture: ban-second-right
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: hero-ban-selector
+          mode: readonly
+          headline: 等待队伍2禁用英雄
+          visibleData:
+            - 队伍1已经禁用的英雄
+          controls:
+            select-hero-ban:
+              state: disabled
+              reason: 当前操作权属于队伍2
+        team_right:
+          foreground: hero-ban-selector
+          mode: interactive
+          actingAs: right
+          headline: 后手禁用
+          visibleData:
+            - 队伍1已经禁用的英雄
+            - 当前合法英雄
+          controls:
+            select-hero-ban:
+              state: enabled
+            confirm-hero-ban:
+              state: disabled
+              reason: 尚未选择合法英雄
+        admin:
+          foreground: hero-ban-selector
+          mode: acting-for-team
+          actingAs: right
+          headline: 后手禁用
+          controls:
+            select-hero-ban:
+              state: enabled
+            confirm-hero-ban:
+              state: disabled
+              reason: 尚未选择合法英雄
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left:
+          - HERO_BAN_CONFIRMED
+        team_right:
+          - HERO_BAN_CONFIRMED
+        admin:
+          - HERO_BAN_CONFIRMED
+        broadcast:
+          - HERO_BAN_CONFIRMED
+      transition:
+        nextPhase: ban_second
+
+  - id: BAN_TIMEOUT_ADMIN_DECISION
+    title: 英雄禁用超时并等待管理员裁定
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#英雄禁用超时
+      - frontend/src/main.ts:2757
+    given:
+      fixture: ban-first-left
+      runtime:
+        remainingTimeMs: 0
+        timedOut: true
+        awaitingAdminDecision: true
+      config:
+        banTimeoutPolicy: admin_decision
+    expect:
+      baseboard: running-current-map-selected
+      persistentIndicators:
+        - 确认选择按钮禁用并显示“等待管理员裁定”
+      views:
+        team_left:
+          foreground: hero-ban-selector
+          mode: readonly
+          headline: 等待管理员裁定
+          controls:
+            select-hero-ban:
+              state: disabled
+              reason: 阶段已超时
+            confirm-hero-ban:
+              state: disabled
+              label: 等待管理员裁定
+        team_right:
+          foreground: hero-ban-selector
+          mode: readonly
+          headline: 等待管理员裁定
+          controls:
+            select-hero-ban:
+              state: disabled
+              reason: 当前无操作权且阶段已超时
+        admin:
+          foreground: hero-ban-selector
+          mode: acting-for-team
+          actingAs: left
+          headline: 英雄禁用超时裁定
+          controls:
+            select-hero-ban:
+              state: enabled
+              reason: 管理员仍可代选合法英雄
+            timeout-extend:
+              state: enabled
+            timeout-random:
+              state: enabled
+            timeout-forfeit:
+              state: enabled
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          headline: 等待管理员裁定
+          controls: {}
+      notifications:
+        team_left:
+          - SELECTION_AWAITING_ADMIN
+        team_right:
+          - SELECTION_AWAITING_ADMIN
+        admin:
+          - SELECTION_AWAITING_ADMIN
+        broadcast:
+          - SELECTION_AWAITING_ADMIN
+    notes:
+      - 进入待裁定状态时发送一次 SELECTION_AWAITING_ADMIN；按钮文案负责持续表达当前状态
+      - 管理员完成裁定后由服务器发送一次 ADMIN_DECISION_RESOLVED，随后立即按权威状态继续
+
+  - id: LINEUP_AND_BAN_SKIPPED
+    title: 阵容和禁用关闭时直接进入比分
+    reviewStatus: confirmed
+    sources:
+      - docs/FUNCTIONS_AND_SETTINGS.md#上场成员设置
+      - docs/FUNCTIONS_AND_SETTINGS.md#英雄禁用设置
+    given:
+      fixture: side-pick-right
+      config:
+        rosterMode: skip
+        banEnabled: false
+    when:
+      actor: team_right
+      action: side_select
+      payload:
+        selectedSide: right
+    expect:
+      baseboard: running-current-map-selected
+      views:
+        team_left:
+          foreground: score-selector
+          mode: interactive
+          actingAs: left
+          controls:
+            edit-score:
+              state: enabled
+            submit-score:
+              state: disabled
+              reason: 比分尚未完整
+        team_right:
+          foreground: score-selector
+          mode: interactive
+          actingAs: right
+          controls:
+            edit-score:
+              state: enabled
+            submit-score:
+              state: disabled
+              reason: 比分尚未完整
+        admin:
+          foreground: score-selector
+          mode: acting-for-team
+          actingAs: both
+          controls:
+            edit-score:
+              state: enabled
+            confirm-score:
+              state: disabled
+              reason: 比分尚未完整
+        broadcast:
+          foreground: phase-readonly-mirror
+          mode: readonly
+          controls: {}
+      notifications:
+        team_left:
+          - SIDE_CONFIRMED
+        team_right:
+          - SIDE_CONFIRMED
+        admin:
+          - SIDE_CONFIRMED
+        broadcast:
+          - SIDE_CONFIRMED
+      transition:
+        skippedPhases:
+          - lineup_pick
+          - ban_order
+          - ban_first
+          - ban_second
+        nextPhase: score_entry

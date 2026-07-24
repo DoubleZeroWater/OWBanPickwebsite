@@ -1,4 +1,17 @@
 import "./styles.css";
+import { RoomClient, RoomApiError } from "./api/room-client";
+import { AuthoritativeStore } from "./state/authoritative-store";
+import { CountdownPresentationClock } from "./state/countdown-clock";
+import { canonicalConfigToLegacy, legacyConfigToCanonical, stableId } from "./state/config-adapter";
+import type {
+  AuthoritativeRuntime,
+  AuthoritativeStatus,
+  MatchNotificationEvent as AuthoritativeNotificationEvent,
+  SyncResponse,
+} from "./state/protocol";
+import { HeartbeatController } from "./sync/heartbeat";
+import { mapOperationToActions } from "./features/action-mapper";
+import { deriveRoomViewPolicy, type RoomViewPolicy } from "./ui/room-view-policy";
 
 type Side = "left" | "right";
 type MapStatus = "completed" | "after" | "tbd";
@@ -105,6 +118,7 @@ interface SettingsState {
   }>;
   stageLimits: StageSetting;
   mapPool: Record<string, string[]>;
+  heroPool: Record<string, string[]>;
   mapSelectionMode: MapSelectionMode;
   firstMapMode: string;
   modeOrder: string[];
@@ -276,10 +290,11 @@ interface TeamPauseState {
   count: number;
 }
 
-type SelectionConfirmationKind = "map" | "lineup" | "ban";
+type SelectionConfirmationKind = "map" | "lineup" | "ban" | "room-config-rollback" | "room-preset-import";
 
 interface SelectionConfirmationState {
   kind: SelectionConfirmationKind;
+  presetId?: string;
 }
 
 interface RestState {
@@ -308,12 +323,9 @@ interface TeamAckNotice {
   acknowledged: Record<Side, boolean>;
 }
 
-type NotificationTone = "default" | "red" | "blue";
-
 interface NotificationSegment {
   text: string;
   strong?: boolean;
-  tone?: NotificationTone;
 }
 
 interface MatchNotificationEvent {
@@ -350,8 +362,6 @@ interface SharedRoomSnapshot {
   firstMapPickerSide: Side;
   interactiveRandomState: InteractiveRandomState | null;
   interactiveRandomResults: Partial<Record<string, Side>>;
-  countdownStartedAt: number;
-  countdownStartSeconds: number;
   notificationEvents?: MatchNotificationEvent[];
 }
 
@@ -359,11 +369,6 @@ interface RoomOperation {
   category: OperationCategory;
   action: string;
   details: Record<string, unknown>;
-}
-
-interface PendingSnapshotPush {
-  snapshot: SharedRoomSnapshot;
-  operation: RoomOperation;
 }
 
 interface RoomLinkInfo {
@@ -392,8 +397,7 @@ interface RoomTokenResponse {
     presence?: RoomPresenceState;
   };
   portal: PortalConfig;
-  version: number;
-  snapshot: SharedRoomSnapshot | null;
+  authoritativeState: SyncResponse;
   notificationDurationSeconds?: number;
 }
 
@@ -405,13 +409,6 @@ interface RoomPresenceEntry {
 }
 
 type RoomPresenceState = Record<"A" | "B" | "C", RoomPresenceEntry>;
-
-interface RoomPresenceResponse {
-  presence: RoomPresenceState;
-  config: RoomConfigState;
-  autoStarted: boolean;
-  version: number;
-}
 
 interface AdminSettings {
   roomsPerHour: number;
@@ -513,6 +510,11 @@ const defaultSettings: SettingsState = {
     Push: ["Colosseo", "New Queen Street", "Runasapi"],
     Flashpoint: ["Suravasa", "New Junk City"],
   },
+  heroPool: {
+    tank: [],
+    damage: [],
+    support: [],
+  },
   mapSelectionMode: "first_mode_then_unique_mode",
   firstMapMode: "Control",
   modeOrder: ["Control", "Push", "Hybrid", "Escort", "Flashpoint", "Control", "Push"],
@@ -552,6 +554,10 @@ const appMode = getAppMode();
 document.body.classList.toggle("landing-page-body", appMode === "landing");
 document.body.classList.toggle("global-admin-page-body", appMode === "global-admin");
 const roomToken = getRoomTokenFromPath();
+const authoritativeStore = new AuthoritativeStore();
+const countdownPresentationClock = new CountdownPresentationClock();
+const roomClient = roomToken ? new RoomClient(roomToken) : null;
+let heartbeatController: HeartbeatController | null = null;
 const unlimitedCreateHash = getUnlimitedCreateHashFromPath();
 const globalAdminHash = getGlobalAdminHashFromPath();
 let portalConfig = getPortalConfig();
@@ -584,21 +590,10 @@ let interactiveRandomResults: Partial<Record<string, Side>> = {};
 let confirmedLineups: ConfirmedLineups = {};
 let localLineupDrafts: Record<number, Partial<Record<Side, Record<string, string>>>> = {};
 let localScoreDraft: { mapIndex: number; values: Record<Side, string> } | null = null;
-const INTERACTIVE_RANDOM_RESULT_SECONDS = 3;
-let countdownStartedAt = Date.now();
-let countdownStartSeconds = defaultSettings.stageLimits.mapSelectSeconds;
-let countdownTimerId: number | null = null;
-let serverSnapshotVersion = 0;
-let serverSnapshotPollTimerId: number | null = null;
-let serverSnapshotPullInFlight = false;
-let presencePollTimerId: number | null = null;
-let presenceRequestInFlight = false;
-let pendingPresenceReady: boolean | null = null;
-let pendingPresenceTeamName: string | null = null;
+let countdownTextTimerId: number | null = null;
+let pauseDisplayTimerId: number | null = null;
 let ownTeamNameDraft: string | null = null;
 let roomPresence: RoomPresenceState = createDisconnectedPresence();
-let serverSnapshotPushInFlight = false;
-let pendingServerSnapshot: PendingSnapshotPush | null = null;
 let lastCreatedRoom: CreatedRoomResponse | null = null;
 let landingJoinValue = "";
 let adminSettings: AdminSettings | null = null;
@@ -616,10 +611,46 @@ let notificationDurationSeconds = 20;
 let notificationEvents: MatchNotificationEvent[] = [];
 const seenNotificationIds = new Set<string>();
 const activeNotificationIds = new Set<string>();
+let authoritativeActionQueue: Promise<void> = Promise.resolve();
+let lastRuntimeStructure = "";
+let authoritativeHistory: Awaited<ReturnType<RoomClient["history"]>> = [];
+let pendingAdminCloseRoomId: string | null = null;
+let globalPresetDirty = false;
+
+authoritativeStore.addEventListener("change", (event) => {
+  const kind = (event as CustomEvent<"full" | "runtime">).detail;
+  const status = authoritativeStore.status;
+  const runtime = authoritativeStore.runtime;
+  if (!status || !runtime) return;
+  if (kind === "full") {
+    countdownPresentationClock.reset(runtime);
+    applyAuthoritativeState(status, runtime, true);
+    return;
+  }
+  const structure = runtimeStructureSignature(runtime);
+  if (structure !== lastRuntimeStructure) {
+    countdownPresentationClock.reset(runtime);
+    applyAuthoritativeState(status, runtime, true);
+  } else {
+    const reconciliation = countdownPresentationClock.reconcile(runtime);
+    applyAuthoritativeRuntime(runtime);
+    updateCountdownDom(reconciliation);
+    updateScorePauseDom();
+  }
+});
+roomClient?.addEventListener("notifications", (event) => {
+  const authoritativeEvents = (event as CustomEvent<AuthoritativeNotificationEvent[]>).detail;
+  ingestAuthoritativeNotificationEvents(authoritativeEvents);
+});
 
 renderShell(app);
 void loadInitialData();
 window.addEventListener("keydown", handleGlobalKeydown);
+window.addEventListener("beforeunload", (event) => {
+  if (!globalPresetDirty) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 window.addEventListener("storage", handleStorageEvent);
 bindRoomChannel();
 
@@ -715,12 +746,37 @@ function isBroadcastPortal(): boolean {
   return portalConfig.role === "broadcast";
 }
 
+function getRoomViewPolicy(): RoomViewPolicy | null {
+  const status = authoritativeStore.status;
+  const runtime = authoritativeStore.runtime;
+  if (!status || !runtime) {
+    return null;
+  }
+  return deriveRoomViewPolicy(status, runtime, {
+    role: isBroadcastPortal() ? "broadcast" : isAdminPortal() ? "admin" : "team",
+    side: portalConfig.side,
+  });
+}
+
+function isRoomActionLocked(): boolean {
+  const policy = getRoomViewPolicy();
+  return Boolean(policy && !policy.canMutateMatch);
+}
+
+function isAwaitingAdminDecision(): boolean {
+  return Boolean(getRoomViewPolicy()?.awaitingAdminDecision);
+}
+
+function canMinimizeForeground(): boolean {
+  return getRoomViewPolicy()?.canMinimize ?? !isBroadcastPortal();
+}
+
 function canUseSettings(): boolean {
   return isAdminPortal();
 }
 
 function canOperateMapSelection(): boolean {
-  if (!mapSelectorState || interactiveRandomState) {
+  if (!mapSelectorState || interactiveRandomState || isRoomActionLocked() || isAwaitingAdminDecision()) {
     return false;
   }
 
@@ -743,7 +799,7 @@ function canConfirmMapSelection(): boolean {
 }
 
 function canEditLineupSide(side: Side): boolean {
-  if (!lineupSelectorState) {
+  if (!lineupSelectorState || isRoomActionLocked() || isAwaitingAdminDecision()) {
     return false;
   }
 
@@ -785,8 +841,8 @@ function textSegment(text: string): NotificationSegment {
   return { text };
 }
 
-function strongSegment(text: string, tone: NotificationTone = "default"): NotificationSegment {
-  return { text, strong: true, tone };
+function strongSegment(text: string): NotificationSegment {
+  return { text, strong: true };
 }
 
 function teamSegment(side: Side): NotificationSegment {
@@ -890,19 +946,6 @@ function createNotificationEventsForOperation(operation: RoomOperation): MatchNo
     add([textSegment("管理员将比赛回退到了"), strongSegment(stageLabel)]);
   }
 
-  if (category === "room" && action === "interactive_random_continued") {
-    const purpose = String(details.purpose ?? "");
-    if (purpose === "opening_ban" && banSelectorState) {
-      const event = createRightNotification(
-        banSelectorState.chooserSide,
-        banRightLabel(),
-        "direct",
-        events.length,
-      );
-      if (event) events.push(event);
-    }
-  }
-
   if (category === "map" && action === "confirmed") {
     const pickerSide = (details.pickerSide as Side | undefined) ?? firstMapPickerSide;
     const mapName = getMapNameZh(String(details.mapName ?? currentState.maps[mapIndex]?.nameEn ?? ""));
@@ -944,10 +987,7 @@ function createNotificationEventsForOperation(operation: RoomOperation): MatchNo
     const choice = choiceKind === "attack_defense"
       ? (selectedByPicker ? "先进攻" : "先防守")
       : (selectedByPicker ? "蓝色方" : "红色方");
-    const choiceSegment = strongSegment(
-      choice,
-      choice === "红色方" ? "red" : choice === "蓝色方" ? "blue" : "default",
-    );
+    const choiceSegment = strongSegment(choice);
     if (details.selectionSource === "timeout_random") {
       add([teamSegment(pickerSide), textSegment(`进行${sideChoiceRightLabel(mapIndex).replace("权", "")}超时，随机选择为`), choiceSegment]);
     } else {
@@ -1096,9 +1136,6 @@ function showNotification(event: MatchNotificationEvent): void {
   event.segments.forEach((segment) => {
     const element = document.createElement(segment.strong ? "strong" : "span");
     element.textContent = segment.text;
-    if (segment.tone && segment.tone !== "default") {
-      element.classList.add(`notification-tone-${segment.tone}`);
-    }
     content.append(element);
   });
 
@@ -1124,6 +1161,11 @@ function publishSharedRoomSnapshot(
     return;
   }
 
+  if (roomToken && roomClient) {
+    queueAuthoritativeOperation(operation);
+    return;
+  }
+
   const newEvents = createNotificationEventsForOperation(operation);
   if (newEvents.length > 0) {
     notificationEvents = [...notificationEvents, ...newEvents].slice(-100);
@@ -1134,13 +1176,12 @@ function publishSharedRoomSnapshot(
   }
 
   const snapshot = createSharedRoomSnapshot();
-
   window.localStorage.setItem(roomStorageKey, JSON.stringify(snapshot));
   roomChannel?.postMessage(snapshot);
+}
 
-  if (roomToken) {
-    queueServerSnapshotPush(snapshot, operation);
-  }
+function showLocalNotice(message: string): void {
+  showNotification(makeNotificationEvent([textSegment(message)]));
 }
 
 function createSharedRoomSnapshot(): SharedRoomSnapshot {
@@ -1169,78 +1210,8 @@ function createSharedRoomSnapshot(): SharedRoomSnapshot {
     firstMapPickerSide,
     interactiveRandomState,
     interactiveRandomResults,
-    countdownStartedAt,
-    countdownStartSeconds,
     notificationEvents,
   };
-}
-
-function queueServerSnapshotPush(snapshot: SharedRoomSnapshot, operation: RoomOperation): void {
-  if (serverSnapshotPushInFlight) {
-    pendingServerSnapshot = { snapshot, operation };
-    return;
-  }
-
-  void pushServerSnapshot(snapshot, operation);
-}
-
-async function pushServerSnapshot(snapshot: SharedRoomSnapshot, operation: RoomOperation): Promise<void> {
-  if (!roomToken) {
-    return;
-  }
-
-  serverSnapshotPushInFlight = true;
-
-  try {
-    const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/snapshot`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ version: serverSnapshotVersion, snapshot, operation }),
-    });
-
-    if (response.status === 409) {
-      const payload = await response.json();
-      serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
-
-      if (payload.snapshot) {
-        applySharedRoomSnapshot(payload.snapshot as SharedRoomSnapshot);
-      }
-
-      const conflictEvent = makeNotificationEvent([textSegment("比赛阶段已经更新，本次操作未生效。")]);
-      notificationEvents = [...notificationEvents, conflictEvent].slice(-100);
-      showNotification(conflictEvent);
-      renderCurrent();
-
-      return;
-    }
-
-    if (response.ok) {
-      const payload = await response.json() as { version?: number; snapshot?: SharedRoomSnapshot };
-      serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
-      if (payload.snapshot) {
-        applySharedRoomSnapshot(payload.snapshot);
-      }
-
-      // Only the client that submitted the final concurrent lineup confirmation
-      // may advance the match. Observers must treat the merged snapshot as read-only;
-      // otherwise every team/admin client races to publish the same stage change.
-      if (
-        operation.category === "lineup"
-        && operation.action === "ready"
-        && isLineupReadyToFinalize()
-      ) {
-        finalizeLineupSelection();
-      }
-    }
-  } finally {
-    serverSnapshotPushInFlight = false;
-
-    if (pendingServerSnapshot) {
-      const pending = pendingServerSnapshot;
-      pendingServerSnapshot = null;
-      queueServerSnapshotPush(pending.snapshot, pending.operation);
-    }
-  }
 }
 
 function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = true): void {
@@ -1290,8 +1261,6 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
   firstMapPickerSide = snapshot.firstMapPickerSide ?? resolveSidePolicy(settingsState.firstMapPickerPolicy);
   interactiveRandomState = snapshot.interactiveRandomState ?? null;
   interactiveRandomResults = snapshot.interactiveRandomResults ?? {};
-  countdownStartedAt = snapshot.countdownStartedAt;
-  countdownStartSeconds = snapshot.countdownStartSeconds;
   ingestNotificationEvents(snapshot.notificationEvents ?? [], shouldRender);
 
   if (
@@ -1396,55 +1365,6 @@ function applySharedRoomSnapshot(snapshot: SharedRoomSnapshot, shouldRender = tr
   }
 }
 
-function startServerSnapshotPolling(): void {
-  if (!roomToken || serverSnapshotPollTimerId !== null) {
-    return;
-  }
-
-  serverSnapshotPollTimerId = window.setInterval(() => {
-    void pullServerSnapshot();
-  }, 1000);
-}
-
-async function pullServerSnapshot(): Promise<void> {
-  if (!roomToken || serverSnapshotPullInFlight) {
-    return;
-  }
-  serverSnapshotPullInFlight = true;
-  try {
-    const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/snapshot`, {
-      cache: "no-store",
-      headers: { Accept: "application/json", "Cache-Control": "no-cache" },
-    });
-
-    if (response.status === 410) {
-      renderError("房间已经关闭或因不活跃而过期。");
-      return;
-    }
-
-    if (!response.ok) {
-      return;
-    }
-
-    const payload = await response.json() as {
-      version: number;
-      snapshot: SharedRoomSnapshot | null;
-      notificationDurationSeconds?: number;
-    };
-    notificationDurationSeconds = Math.max(1, Number(payload.notificationDurationSeconds ?? notificationDurationSeconds));
-    const nextVersion = Number(payload.version ?? 0);
-
-    if (nextVersion <= serverSnapshotVersion || !payload.snapshot) {
-      return;
-    }
-
-    serverSnapshotVersion = nextVersion;
-    applySharedRoomSnapshot(payload.snapshot);
-  } finally {
-    serverSnapshotPullInFlight = false;
-  }
-}
-
 function normalizeLineupSelectorState(state: LineupSelectorState | null | undefined): LineupSelectorState | null {
   if (!state) {
     return null;
@@ -1541,7 +1461,6 @@ async function loadInitialData(): Promise<void> {
       portalConfig = roomPayload.portal;
       notificationDurationSeconds = Math.max(1, Number(roomPayload.notificationDurationSeconds ?? 20));
       document.body.classList.toggle("room-admin-page-body", portalConfig.role === "admin");
-      serverSnapshotVersion = Number(roomPayload.version ?? 0);
       roomConfigState = roomPayload.room.config ?? null;
       roomPresence = roomPayload.room.presence ?? createDisconnectedPresence();
       if (portalConfig.role === "admin") {
@@ -1571,6 +1490,31 @@ async function loadInitialData(): Promise<void> {
 
     mapCatalogState = (await catalogResponse.json()) as MapCatalogState;
     applyCatalogLocale();
+    applyCatalogHeroPoolDefaults();
+
+    if (roomPayload?.authoritativeState) {
+      if (roomConfigState?.value || roomPayload.room.settings) {
+        settingsState = mergeSettings(defaultSettings, roomConfigState?.value ?? roomPayload.room.settings ?? {});
+      }
+      roomClient?.initializeNotificationStream(roomPayload.authoritativeState.notificationStream);
+      await authoritativeStore.apply(roomPayload.authoritativeState);
+      if (isAdminPortal() && roomClient) {
+        try {
+          authoritativeHistory = await roomClient.history();
+        } catch {
+          authoritativeHistory = [];
+        }
+      }
+      startCountdownTimer();
+      heartbeatController = roomClient ? new HeartbeatController(
+        roomClient,
+        authoritativeStore,
+        () => renderError("房间已经关闭或因不活跃而过期。"),
+      ) : null;
+      heartbeatController?.start();
+      renderCurrent();
+      return;
+    }
 
     if (roomConfigState?.value) {
       settingsState = mergeSettings(defaultSettings, roomConfigState.value);
@@ -1580,13 +1524,11 @@ async function loadInitialData(): Promise<void> {
       settingsState = mergeSettings(defaultSettings, getDefaultPresetFromPayload(await presetResponse.json()));
     }
 
-    const savedSnapshot = roomPayload?.snapshot ?? readSharedRoomSnapshot();
+    const savedSnapshot = readSharedRoomSnapshot();
 
     if (savedSnapshot) {
       applySharedRoomSnapshot(savedSnapshot, false);
       startCountdownTimer();
-      startServerSnapshotPolling();
-      startPresencePolling();
       renderCurrent();
       return;
     }
@@ -1610,11 +1552,8 @@ async function loadInitialData(): Promise<void> {
     confirmedLineups = {};
     localLineupDrafts = {};
     localScoreDraft = null;
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("room", "initialized"));
     startCountdownTimer();
-    startServerSnapshotPolling();
-    startPresencePolling();
     renderCurrent();
   } catch (error) {
     renderError(error instanceof Error ? error.message : "未知错误");
@@ -1636,6 +1575,7 @@ function renderCurrent(): void {
   if (!currentState) {
     return;
   }
+  const viewPolicy = getRoomViewPolicy();
 
   if (roomStarted) {
     syncMapSelectorTarget(true);
@@ -1648,7 +1588,7 @@ function renderCurrent(): void {
         <div class="match-title">
           <h1>${escapeHtml(currentState.matchName)}</h1>
           <span>${escapeHtml(getMatchFormatLabel(settingsState.matchFormat))}</span>
-          <em class="match-phase-label">${roomStarted ? "比赛进行阶段" : roomConfigState?.status === "ready" ? "确认配置阶段" : "待配置阶段"}</em>
+          <em class="match-phase-label">${viewPolicy?.completed ? "比赛已结束" : roomStarted ? "比赛进行阶段" : roomConfigState?.status === "ready" ? "确认配置阶段" : "待配置阶段"}</em>
           <b class="portal-badge portal-badge-${portalConfig.role}">${escapeHtml(portalConfig.label)}</b>
         </div>
         ${renderTeamHeader("right", currentState.teams.right)}
@@ -1659,13 +1599,7 @@ function renderCurrent(): void {
       ${renderPresenceBar()}
       ${roomStarted ? "" : renderStartGate()}
       ${canUseSettings() && (settingsPanelOpen || roomStarted) ? renderSettingsPanel() : ""}
-      ${renderMapSelector()}
-      ${renderSideSelector()}
-      ${renderLineupSelector()}
-      ${renderBanSelector()}
-      ${renderScoreSelector()}
-      ${renderRestOverlay()}
-      ${renderInteractiveRandomOverlay()}
+      ${renderPrimaryForeground(viewPolicy)}
       ${renderMinimizedOverlay()}
       ${renderPauseOverlay()}
       ${renderSelectionConfirmation()}
@@ -1997,6 +1931,7 @@ async function loadGlobalAdminData(page = adminRoomHistory.page): Promise<void> 
   mapCatalogState = await catalogResponse.json() as MapCatalogState;
   catalogMaintenance = await maintenanceResponse.json() as CatalogMaintenance;
   applyCatalogLocale();
+  applyCatalogHeroPoolDefaults();
   if (selectedGlobalPresetId && !configPresets.some((preset) => preset.id === selectedGlobalPresetId)) {
     selectedGlobalPresetId = null;
   }
@@ -2054,6 +1989,7 @@ function renderGlobalAdminPage(message = ""): void {
         </div>
         <footer class="admin-section-footer">
           <button id="saveGlobalSettings" class="admin-primary-button" type="button">保存全局设置</button>
+          <div id="globalSettingsSaveFeedback" class="admin-save-feedback" aria-live="polite"></div>
         </footer>
       </section>
       ${renderCatalogMaintenancePanel()}
@@ -2085,6 +2021,16 @@ function renderGlobalAdminPage(message = ""): void {
         </header>
         <pre id="roomHistoryJson">正在载入...</pre>
       </dialog>
+      <dialog id="closeAdminRoomDialog" class="history-dialog admin-confirm-dialog" aria-labelledby="closeAdminRoomDialogTitle">
+        <header>
+          <strong id="closeAdminRoomDialogTitle">关闭房间</strong>
+          <button id="cancelCloseAdminRoom" type="button">取消</button>
+        </header>
+        <p>关闭后房间会立即归档，所有比赛入口将停止使用。确认关闭房间 ${escapeHtml(pendingAdminCloseRoomId ?? "")}？</p>
+        <footer>
+          <button id="confirmCloseAdminRoom" class="danger-button" type="button">确认关闭</button>
+        </footer>
+      </dialog>
       <dialog id="catalogTemplateDialog" class="history-dialog catalog-json-dialog" aria-labelledby="catalogTemplateDialogTitle">
         <header>
           <strong id="catalogTemplateDialogTitle">英文到中文映射模板</strong>
@@ -2115,7 +2061,7 @@ function renderGlobalAdminPage(message = ""): void {
   document.getElementById("saveGlobalSettings")?.addEventListener("click", saveGlobalSettings);
   bindGlobalPresetManagerEvents();
   app.querySelectorAll<HTMLButtonElement>(".close-admin-room").forEach((button) => {
-    button.addEventListener("click", () => closeAdminRoom(button.dataset.roomId ?? ""));
+    button.addEventListener("click", () => requestCloseAdminRoom(button.dataset.roomId ?? ""));
   });
   app.querySelectorAll<HTMLButtonElement>(".view-room-history").forEach((button) => {
     button.addEventListener("click", () => viewRoomHistory(button.dataset.archiveKey ?? ""));
@@ -2127,6 +2073,14 @@ function renderGlobalAdminPage(message = ""): void {
   });
   bindCatalogMaintenanceEvents();
   bindCopyLinkButtons();
+  document.getElementById("cancelCloseAdminRoom")?.addEventListener("click", () => {
+    pendingAdminCloseRoomId = null;
+    (document.getElementById("closeAdminRoomDialog") as HTMLDialogElement | null)?.close();
+  });
+  document.getElementById("confirmCloseAdminRoom")?.addEventListener("click", () => void closeAdminRoom());
+  if (pendingAdminCloseRoomId) {
+    (document.getElementById("closeAdminRoomDialog") as HTMLDialogElement | null)?.showModal();
+  }
 }
 
 function renderCatalogMaintenancePanel(): string {
@@ -2442,23 +2396,45 @@ async function saveGlobalSettings(): Promise<void> {
   const notificationDurationSeconds = Number((document.getElementById("adminNotificationDuration") as HTMLInputElement | null)?.value || adminSettings.notificationDurationSeconds);
   const defaultPresetId = (document.getElementById("adminDefaultPreset") as HTMLSelectElement | null)?.value || null;
 
-  const response = await fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/settings`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ roomsPerHour, inactiveTimeoutMinutes, notificationDurationSeconds, defaultPresetId }),
-  });
+  try {
+    const response = await fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roomsPerHour, inactiveTimeoutMinutes, notificationDurationSeconds, defaultPresetId }),
+    });
 
-  if (response.ok) {
-    adminSettings = await response.json() as AdminSettings;
-    renderGlobalAdminPage("全局设置已保存。");
+    if (response.ok) {
+      adminSettings = await response.json() as AdminSettings;
+      renderGlobalAdminPage("全局设置已保存。");
+      return;
+    }
+    renderGlobalSettingsFailure(await getConfigErrorMessage(response));
+  } catch (error) {
+    renderGlobalSettingsFailure(error instanceof Error ? error.message : "网络请求失败");
   }
 }
 
-async function closeAdminRoom(roomId: string): Promise<void> {
+function renderGlobalSettingsFailure(message: string): void {
+  const feedback = document.getElementById("globalSettingsSaveFeedback");
+  if (feedback) {
+    feedback.innerHTML = `<span>${escapeHtml(message)}</span><button id="retryGlobalSettingsSave" type="button">重试</button>`;
+    document.getElementById("retryGlobalSettingsSave")?.addEventListener("click", () => void saveGlobalSettings());
+  }
+}
+
+function requestCloseAdminRoom(roomId: string): void {
+  if (!roomId) return;
+  pendingAdminCloseRoomId = roomId;
+  renderGlobalAdminPage();
+}
+
+async function closeAdminRoom(): Promise<void> {
+  const roomId = pendingAdminCloseRoomId;
   if (!globalAdminHash || !roomId) {
     return;
   }
 
+  pendingAdminCloseRoomId = null;
   const response = await fetch(`/api/admin/${encodeURIComponent(globalAdminHash)}/rooms/${encodeURIComponent(roomId)}/close`, {
     method: "POST",
   });
@@ -2581,9 +2557,10 @@ function areBothTeamsReady(): boolean {
 }
 
 function renderPresenceBar(): string {
+  const completed = getRoomViewPolicy()?.completed ?? false;
   const items: Array<{ code: "A" | "B" | "C"; label: string; side: "left" | "center" | "right" }> = [
     { code: "A", label: settingsState.teams.left, side: "left" },
-    { code: "C", label: "管理员", side: "center" },
+    { code: "C", label: completed ? "比赛已结束" : "管理员", side: "center" },
     { code: "B", label: settingsState.teams.right, side: "right" },
   ];
 
@@ -2593,11 +2570,11 @@ function renderPresenceBar(): string {
         const presence = roomPresence[code];
         const isTeam = code !== "C";
         return `
-          <article class="room-presence-item room-presence-${side} ${presence.connected ? "is-connected" : "is-disconnected"}" data-presence-code="${code}">
+          <article class="room-presence-item room-presence-${side} ${completed && code === "C" ? "match-completed" : ""} ${presence.connected ? "is-connected" : "is-disconnected"}" data-presence-code="${code}">
             <span class="room-presence-dot" aria-hidden="true"></span>
             <div>
               <strong>${escapeHtml(label)}</strong>
-              <small class="room-presence-status">${presence.connected ? "已连接" : "已断开"}</small>
+              <small class="room-presence-status">${completed && code === "C" ? `管理员${presence.connected ? "已连接" : "已断开"}` : presence.connected ? "已连接" : "已断开"}</small>
             </div>
             ${isTeam && !roomStarted ? `<em class="room-ready-status ${presence.ready ? "is-ready" : ""}">${presence.ready ? "已准备" : "未准备"}</em>` : ""}
           </article>
@@ -2607,111 +2584,22 @@ function renderPresenceBar(): string {
   `;
 }
 
-function startPresencePolling(): void {
-  if (!roomToken || presencePollTimerId !== null) {
-    return;
-  }
-  void updateRoomPresence();
-  presencePollTimerId = window.setInterval(() => void updateRoomPresence(), 1000);
-}
-
 async function updateRoomPresence(ready?: boolean, renderAfter = false, teamName?: string): Promise<void> {
-  if (!roomToken) {
-    return;
-  }
-  if (presenceRequestInFlight) {
-    if (ready !== undefined) {
-      pendingPresenceReady = ready;
-      pendingPresenceTeamName = teamName ?? null;
-    }
-    return;
-  }
-  presenceRequestInFlight = true;
+  if (!roomToken || !roomClient) return;
   try {
-    const requestPayload: { ready?: boolean; name?: string } = {};
-    if (ready !== undefined) requestPayload.ready = ready;
-    if (teamName !== undefined) requestPayload.name = teamName;
-    const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/presence`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(requestPayload),
-    });
-    if (!response.ok) {
-      if (ready !== undefined) {
-        alert(await getConfigErrorMessage(response));
-      }
-      return;
+    if (teamName !== undefined) {
+      const expected = authoritativeStore.ref;
+      if (expected) await authoritativeStore.apply(await roomClient.action(expected, "team_name_set", { name: teamName }));
     }
-    const payload = await response.json() as RoomPresenceResponse;
-    if (ready === true) {
-      ownTeamNameDraft = null;
+    if (ready !== undefined) {
+      const expected = authoritativeStore.ref;
+      if (expected) await authoritativeStore.apply(await roomClient.action(expected, "portal_ready_set", { ready }));
     }
-    const previousAutoStart = settingsState.startWithDefaultConfig;
-    const previousTeamReadiness = `${roomPresence.A.ready}:${roomPresence.B.ready}`;
-    const previousConfigMarker = `${roomConfigState?.status ?? "none"}:${roomConfigState?.revision ?? -1}`;
-    roomPresence = payload.presence;
-    roomConfigState = payload.config;
-    // Presence responses do not contain the canonical match snapshot. Do not
-    // advance the snapshot cursor here, otherwise the one-second poll can skip
-    // the exact version that moved another portal into the next BP stage.
-
-    if (!isAdminPortal() || !settingsPanelOpen || payload.config.status !== "draft") {
-      settingsState = mergeSettings(defaultSettings, payload.config.value);
-      syncPendingMatchIdentityFromSettings();
-    }
-
-    if (payload.config.status === "locked" && !roomStarted && currentState && payload.autoStarted) {
-      settingsPanelOpen = false;
-      resetRoomToBeginning(true, true, "auto");
-      return;
-    }
-    if (payload.config.status === "locked" && !roomStarted && currentState) {
-      void pullServerSnapshot();
-      return;
-    }
-
-    const teamReadinessChanged = previousTeamReadiness !== `${roomPresence.A.ready}:${roomPresence.B.ready}`;
-    const configChanged = previousConfigMarker !== `${payload.config.status}:${payload.config.revision}`;
-    if (renderAfter || previousAutoStart !== settingsState.startWithDefaultConfig || teamReadinessChanged || configChanged) {
-      renderCurrent();
-    } else {
-      updatePresenceDom();
-    }
-  } finally {
-    presenceRequestInFlight = false;
-    if (pendingPresenceReady !== null) {
-      const pendingReady = pendingPresenceReady;
-      const pendingTeamName = pendingPresenceTeamName ?? undefined;
-      pendingPresenceReady = null;
-      pendingPresenceTeamName = null;
-      void updateRoomPresence(pendingReady, true, pendingTeamName);
-    }
+    ownTeamNameDraft = null;
+    if (renderAfter) renderCurrent();
+  } catch (error) {
+    showLocalNotice(error instanceof Error ? error.message : "更新准备状态失败");
   }
-}
-
-function syncPendingMatchIdentityFromSettings(): void {
-  if (!currentState || roomStarted) {
-    return;
-  }
-  currentState.matchName = settingsState.matchName;
-  currentState.teams.left.name = settingsState.teams.left;
-  currentState.teams.right.name = settingsState.teams.right;
-}
-
-function updatePresenceDom(): void {
-  (["A", "B", "C"] as const).forEach((code) => {
-    const entry = roomPresence[code];
-    const item = app.querySelector<HTMLElement>(`[data-presence-code="${code}"]`);
-    item?.classList.toggle("is-connected", entry.connected);
-    item?.classList.toggle("is-disconnected", !entry.connected);
-    const status = item?.querySelector<HTMLElement>(".room-presence-status");
-    if (status) status.textContent = entry.connected ? "已连接" : "已断开";
-    const readyStatus = item?.querySelector<HTMLElement>(".room-ready-status");
-    if (readyStatus) {
-      readyStatus.textContent = entry.ready ? "已准备" : "未准备";
-      readyStatus.classList.toggle("is-ready", entry.ready);
-    }
-  });
 }
 
 function getVisibleMaps(state: MatchState): Array<{ map: MatchMap; index: number }> {
@@ -2840,7 +2728,6 @@ function renderMapSelector(): string {
   if (
     !currentState
     || !mapSelectorState?.open
-    || isBroadcastPortal()
     || hiddenOverlay === "map"
   ) {
     return "";
@@ -2870,7 +2757,7 @@ function renderExpandedMapSelector(): string {
             <span>${targetMapLabel}</span>
             <strong>${escapeHtml(getMapSelectionModeLabel(settingsState.mapSelectionMode))}</strong>
           </div>
-          <button class="selector-icon-button" id="minimizeMapSelector" type="button" title="返回主页" aria-label="返回主页">↖</button>
+          ${canMinimizeForeground() ? `<button class="selector-icon-button" id="minimizeMapSelector" type="button" title="返回主页" aria-label="返回主页">↖</button>` : ""}
         </header>
         ${renderCountdownProgress(`map-selector-progress${getInactiveProgressClass(mapSelectorState.pickerSide)}`)}
         <div class="mode-strip" aria-label="地图类型">
@@ -2884,10 +2771,12 @@ function renderExpandedMapSelector(): string {
             <span>当前选择</span>
             <strong>${selectedChoice ? escapeHtml(getDisplayMapName(selectedChoice.nameEn)) : "点击选择地图"}</strong>
           </div>
-          <button class="confirm-map-pick" id="confirmMapPick" type="button" ${canConfirm ? "" : "disabled"}>
-            ${getMapConfirmButtonLabel()}
-          </button>
-          ${renderAdminViolationControls("map")}
+          ${isBroadcastPortal()
+            ? `<span class="phase-readonly-label">直播只读 · 等待选图结果</span>`
+            : `<button class="confirm-map-pick" id="confirmMapPick" type="button" ${canConfirm ? "" : "disabled"}>
+                ${getMapConfirmButtonLabel()}
+              </button>
+              ${renderAdminViolationControls("map")}`}
         </footer>
       </div>
     </section>
@@ -2932,7 +2821,7 @@ function getInactiveProgressClass(activeSide: Side | null, alreadyCompleted = fa
 function renderAdminViolationControls(kind: "map" | "ban"): string {
   const timedOut = kind === "map" ? mapSelectorState?.timedOut : banSelectorState?.timedOut;
 
-  if (!isAdminPortal() || !timedOut) {
+  if (!isAdminPortal() || !timedOut || isRoomActionLocked()) {
     return "";
   }
 
@@ -2995,6 +2884,16 @@ function renderMapOption(choice: MapChoice): string {
   const title = disabled
     ? getMapDisabledReason(availability)
     : `${modeLabel} - ${getDisplayMapName(choice.nameEn)}`;
+  if (isBroadcastPortal()) {
+    return `
+      <div class="map-option map-option-readonly ${selected ? "map-option-selected" : ""}" title="${escapeHtml(title)}">
+        <img src="${choice.imageUrl}" alt="${escapeHtml(getDisplayMapName(choice.nameEn))}" />
+        <span class="map-option-shade"></span>
+        <span class="map-option-mode">${escapeHtml(modeLabel)}</span>
+        <span class="map-option-name">${escapeHtml(getDisplayMapName(choice.nameEn))}</span>
+      </div>
+    `;
+  }
 
   return `
     <button
@@ -3016,7 +2915,6 @@ function renderSideSelector(): string {
   if (
     !currentState
     || !sideSelectorState?.open
-    || isBroadcastPortal()
     || hiddenOverlay === "side"
   ) {
     return "";
@@ -3040,7 +2938,7 @@ function renderSideSelector(): string {
             <h2>MAP ${sideSelectorState.mapIndex + 1} ${escapeHtml(mapName)}</h2>
           </div>
           <div class="selector-header-actions">
-            <button class="selector-icon-button return-home-button" type="button" data-overlay-kind="side" title="返回主页" aria-label="返回主页">↖</button>
+            ${canMinimizeForeground() ? `<button class="selector-icon-button return-home-button" type="button" data-overlay-kind="side" title="返回主页" aria-label="返回主页">↖</button>` : ""}
           </div>
         </header>
         ${renderCountdownProgress(`side-selector-progress${getInactiveProgressClass(sideSelectorState.pickerSide)}`)}
@@ -3051,16 +2949,21 @@ function renderSideSelector(): string {
             : "该模式为对称地图，请确定双方使用的蓝色方与红色方。"}</p>
         </div>
         <div class="side-selector-options">
-          <button type="button" data-side-choice="picker" class="${firstSelected ? "is-selected" : ""}" ${canOperate ? "" : "disabled"}>
-            <span>${escapeHtml(pickerName)}</span><strong>${firstLabel}</strong>
-          </button>
-          <button type="button" data-side-choice="opponent" class="${secondSelected ? "is-selected" : ""}" ${canOperate ? "" : "disabled"}>
-            <span>${escapeHtml(pickerName)}</span><strong>${secondLabel}</strong>
-          </button>
+          ${isBroadcastPortal()
+            ? `<div class="${firstSelected ? "is-selected" : ""}"><span>${escapeHtml(pickerName)}</span><strong>${firstLabel}</strong></div>
+               <div class="${secondSelected ? "is-selected" : ""}"><span>${escapeHtml(pickerName)}</span><strong>${secondLabel}</strong></div>`
+            : `<button type="button" data-side-choice="picker" class="${firstSelected ? "is-selected" : ""}" ${canOperate ? "" : "disabled"}>
+                 <span>${escapeHtml(pickerName)}</span><strong>${firstLabel}</strong>
+               </button>
+               <button type="button" data-side-choice="opponent" class="${secondSelected ? "is-selected" : ""}" ${canOperate ? "" : "disabled"}>
+                 <span>${escapeHtml(pickerName)}</span><strong>${secondLabel}</strong>
+               </button>`}
         </div>
         <footer class="side-selector-footer">
           <div><span>当前选择</span><strong>${escapeHtml(getSideChoiceSummary())}</strong></div>
-          <button id="confirmSideChoice" type="button" ${sideSelectorState.selectedSide && canOperate ? "" : "disabled"}>确认选择</button>
+          ${isBroadcastPortal()
+            ? `<span class="phase-readonly-label">直播只读 · 等待选边结果</span>`
+            : `<button id="confirmSideChoice" type="button" ${sideSelectorState.selectedSide && canOperate ? "" : "disabled"}>确认选择</button>`}
         </footer>
       </div>
     </section>
@@ -3071,7 +2974,6 @@ function renderLineupSelector(): string {
   if (
     !currentState
     || !lineupSelectorState?.open
-    || isBroadcastPortal()
     || hiddenOverlay === "lineup"
   ) {
     return "";
@@ -3091,7 +2993,7 @@ function renderLineupSelector(): string {
           </div>
           <div class="selector-header-actions">
             <strong>${escapeHtml(getRosterModeLabel(settingsState.rosterMode))}</strong>
-            <button class="selector-icon-button return-home-button" type="button" data-overlay-kind="lineup" title="返回主页" aria-label="返回主页">↖</button>
+            ${canMinimizeForeground() ? `<button class="selector-icon-button return-home-button" type="button" data-overlay-kind="lineup" title="返回主页" aria-label="返回主页">↖</button>` : ""}
           </div>
         </header>
         ${renderCountdownProgress(`lineup-selector-progress${getInactiveProgressClass(portalConfig.side, Boolean(portalConfig.side && lineupSelectorState.ready[portalConfig.side]))}`)}
@@ -3100,10 +3002,12 @@ function renderLineupSelector(): string {
           ${renderLineupTeam("right")}
         </div>
         <footer class="lineup-selector-footer">
-          <button class="confirm-lineup-pick" id="confirmLineupPick" type="button" ${canConfirm ? "" : "disabled"}>
-            ${getLineupConfirmButtonLabel()}
-          </button>
-          ${renderAdminLineupTimeoutControls()}
+          ${isBroadcastPortal()
+            ? `<span class="phase-readonly-label">直播只读 · 等待双方确认上场成员</span>`
+            : `<button class="confirm-lineup-pick" id="confirmLineupPick" type="button" ${canConfirm ? "" : "disabled"}>
+                ${getLineupConfirmButtonLabel()}
+              </button>
+              ${renderAdminLineupTimeoutControls()}`}
         </footer>
       </div>
     </section>
@@ -3166,7 +3070,9 @@ function renderLineupSlot(
       data-lineup-slot="${slot.id}"
     >
       <img class="lineup-role-icon" src="${getRoleHeaderImageUrl(slot.role)}" alt="${escapeHtml(slot.label)}" />
-      ${renderLineupControl(side, slot, value, presetOptions, disabled)}
+      ${isBroadcastPortal()
+        ? `<span class="lineup-control lineup-control-readonly">${lineupSelectorState?.ready[side] ? "已确认" : "等待提交"}</span>`
+        : renderLineupControl(side, slot, value, presetOptions, disabled)}
     </label>
   `;
 }
@@ -3212,7 +3118,6 @@ function renderBanSelector(): string {
   if (
     !currentState
     || !banSelectorState?.open
-    || isBroadcastPortal()
     || hiddenOverlay === "ban"
   ) {
     return "";
@@ -3232,7 +3137,7 @@ function renderBanSelector(): string {
             <h2>MAP ${banSelectorState.mapIndex + 1} ${escapeHtml(mapName)}</h2>
           </div>
           <div class="selector-header-actions">
-            <button class="selector-icon-button return-home-button" type="button" data-overlay-kind="ban" title="返回主页" aria-label="返回主页">↖</button>
+            ${canMinimizeForeground() ? `<button class="selector-icon-button return-home-button" type="button" data-overlay-kind="ban" title="返回主页" aria-label="返回主页">↖</button>` : ""}
           </div>
         </header>
         ${renderCountdownProgress(`ban-selector-progress${getInactiveProgressClass(banSelectorState.step === "order-choice" ? banSelectorState.chooserSide : banSelectorState.activeSide)}`)}
@@ -3248,8 +3153,10 @@ function renderBanSelector(): string {
             <span>当前选择</span>
             <strong>${escapeHtml(getBanSelectionSummary())}</strong>
           </div>
-          <button class="confirm-ban-pick" id="confirmBanPick" type="button" ${canConfirm ? "" : "disabled"}>${escapeHtml(getBanConfirmButtonLabel())}</button>
-          ${renderAdminViolationControls("ban")}
+          ${isBroadcastPortal()
+            ? `<span class="phase-readonly-label">直播只读 · 等待 Ban 结果</span>`
+            : `<button class="confirm-ban-pick" id="confirmBanPick" type="button" ${canConfirm ? "" : "disabled"}>${escapeHtml(getBanConfirmButtonLabel())}</button>
+              ${renderAdminViolationControls("ban")}`}
         </footer>
       </div>
     </section>
@@ -3272,6 +3179,15 @@ function renderBanOrderChoice(): string {
   }
 
   const disabled = !canOperateBanOrderChoice();
+  if (isBroadcastPortal()) {
+    return `
+      <div class="ban-order-choice" aria-label="禁用顺序等待中">
+        <p>当前由<strong>${escapeHtml(getTeamName(banSelectorState.chooserSide))}</strong>选择先手或后手。</p>
+        <div class="${banSelectorState.selectedOrder === "first" ? "ban-order-active" : ""}">选择先手</div>
+        <div class="${banSelectorState.selectedOrder === "second" ? "ban-order-active" : ""}">选择后手</div>
+      </div>
+    `;
+  }
 
   return `
     <div class="ban-order-choice" aria-label="选择禁用顺序">
@@ -3361,6 +3277,14 @@ function renderHeroOption(hero: HeroCatalogItem): string {
     : bannedByOpponentThisRound
       ? "hero-option-opponent-current"
       : disabled ? "hero-option-unavailable" : "";
+  if (isBroadcastPortal()) {
+    return `
+      <div class="hero-option hero-option-readonly ${selected ? "hero-option-selected" : ""} ${disabledClass}">
+        <img src="${hero.imageUrl}" alt="${escapeHtml(getHeroDisplayName(hero.nameEn))}" />
+        <span>${escapeHtml(getHeroDisplayName(hero.nameEn))}</span>
+      </div>
+    `;
+  }
 
   return `
     <button
@@ -3380,7 +3304,6 @@ function renderScoreSelector(): string {
   if (
     !currentState
     || !scoreSelectorState?.open
-    || isBroadcastPortal()
     || hiddenOverlay === "score"
   ) {
     return "";
@@ -3400,7 +3323,7 @@ function renderScoreSelector(): string {
             <h2>MAP ${scoreSelectorState.mapIndex + 1} ${escapeHtml(mapName)}</h2>
           </div>
           <div class="selector-header-actions">
-            <button class="selector-icon-button return-home-button" type="button" data-overlay-kind="score" title="返回主页" aria-label="返回主页">↖</button>
+            ${canMinimizeForeground() ? `<button class="selector-icon-button return-home-button" type="button" data-overlay-kind="score" title="返回主页" aria-label="返回主页">↖</button>` : ""}
           </div>
         </header>
         ${renderScoreMapSummary(mapIndex, map)}
@@ -3421,10 +3344,12 @@ function renderScoreSelector(): string {
             <span>比分状态</span>
             <strong>${escapeHtml(getScoreStatusText())}</strong>
           </div>
-          <button class="confirm-score-pick" id="confirmScorePick" type="button" ${canConfirm ? "" : "disabled"}>
-            ${escapeHtml(getScoreConfirmButtonLabel())}
-          </button>
-          ${renderScoreRejectButton()}
+          ${isBroadcastPortal()
+            ? `<span class="phase-readonly-label">直播只读 · 等待比分确认</span>`
+            : `<button class="confirm-score-pick" id="confirmScorePick" type="button" ${canConfirm ? "" : "disabled"}>
+                ${escapeHtml(getScoreConfirmButtonLabel())}
+              </button>
+              ${renderScoreRejectButton()}`}
         </footer>
       </div>
     </section>
@@ -3483,6 +3408,14 @@ function renderScoreInput(side: Side): string {
   }
 
   const disabled = !canEditScore();
+  if (isBroadcastPortal()) {
+    return `
+      <div class="score-input-card score-input-${side} score-input-readonly">
+        <span>${escapeHtml(getTeamName(side))}</span>
+        <output class="score-control">${escapeHtml(scoreSelectorState.values[side] || "-")}</output>
+      </div>
+    `;
+  }
 
   return `
     <label class="score-input-card score-input-${side}">
@@ -3500,7 +3433,7 @@ function renderScoreInput(side: Side): string {
 }
 
 function renderRestOverlay(): string {
-  if (!currentState || !restState?.open || isBroadcastPortal() || hiddenOverlay === "rest") {
+  if (!currentState || !restState?.open || hiddenOverlay === "rest") {
     return "";
   }
 
@@ -3520,7 +3453,7 @@ function renderRestOverlay(): string {
           </div>
           <div class="selector-header-actions">
             <strong>${map.status === "completed" ? "等待下一张地图" : "等待比赛开始"}</strong>
-            <button class="selector-icon-button return-home-button" type="button" data-overlay-kind="rest" title="返回主页" aria-label="返回主页">↖</button>
+            ${canMinimizeForeground() ? `<button class="selector-icon-button return-home-button" type="button" data-overlay-kind="rest" title="返回主页" aria-label="返回主页">↖</button>` : ""}
           </div>
         </header>
         ${renderCountdownProgress("rest-progress")}
@@ -3529,9 +3462,11 @@ function renderRestOverlay(): string {
             <span>${map.status === "completed" ? "休息状态" : "准备状态"}</span>
             <strong>${map.status === "completed" ? "休息结束后自动进入下一轮选图" : "准备结束后开始首张地图"}</strong>
           </div>
-          <button class="confirm-score-pick" id="skipRestPeriod" type="button" ${canSkipRestPeriod() ? "" : "disabled"}>
-            ${getRestButtonLabel()}
-          </button>
+          ${isBroadcastPortal()
+            ? `<span class="phase-readonly-label">直播只读 · 倒计时结束后自动继续</span>`
+            : `<button class="confirm-score-pick" id="skipRestPeriod" type="button" ${canSkipRestPeriod() ? "" : "disabled"}>
+                ${getRestButtonLabel()}
+              </button>`}
         </footer>
       </div>
     </section>
@@ -3545,9 +3480,6 @@ function renderPauseOverlay(): string {
 
   return `
     <aside class="pause-overlay ${pauseState.collapsed ? "pause-overlay-collapsed" : ""}" aria-label="管理员暂停">
-      <button class="selector-icon-button" id="togglePausePanel" type="button" title="收起/展开" aria-label="收起或展开暂停提示">
-        ${pauseState.collapsed ? "↙" : "↖"}
-      </button>
       <div class="pause-copy">
         <span>管理员已暂停</span>
         <strong class="pause-elapsed">${formatElapsedPause()}</strong>
@@ -3560,8 +3492,9 @@ function renderPauseOverlay(): string {
 
 function renderMinimizedOverlay(): string {
   const kind = getActiveOverlayKind();
+  const policy = getRoomViewPolicy();
 
-  if (!kind || hiddenOverlay !== kind) {
+  if (!kind || hiddenOverlay !== kind || !policy?.canMinimize) {
     return "";
   }
 
@@ -3581,6 +3514,7 @@ function renderSettingsPanel(): string {
   const status = roomConfigState?.status ?? "draft";
   const locked = roomConfigState?.status === "locked";
   const readOnly = status !== "draft";
+  const globallyPaused = getRoomViewPolicy()?.globalPaused ?? false;
   const source = roomConfigState?.source.type === "preset"
     ? `来自模板：${roomConfigState.source.presetName ?? roomConfigState.source.presetId ?? "未知模板"}`
     : roomConfigState?.source.type === "json"
@@ -3595,11 +3529,11 @@ function renderSettingsPanel(): string {
         <div class="settings-actions settings-actions-top">
           <span class="global-pause-total">全局累计暂停 ${formatGlobalPause()}</span>
           <button id="toggleGlobalPause" type="button">${pauseState.active ? "恢复全局时间" : "全局暂停"}</button>
-          <button id="rollbackToConfig" class="danger-button" type="button">回退到赛前配置</button>
+          <button id="rollbackToConfig" class="danger-button" type="button" ${globallyPaused ? "disabled" : ""}>回退到赛前配置</button>
         </div>
         <div class="checkpoint-table admin-checkpoint-panel">
           <h3>回退到比赛阶段</h3>
-          ${renderCheckpointRows()}
+          ${roomClient ? renderAuthoritativeHistoryPanel() : renderCheckpointRows()}
         </div>
       </section>
     `
@@ -3618,7 +3552,7 @@ function renderSettingsPanel(): string {
           <span class="global-pause-total">全局累计暂停 ${formatGlobalPause()}</span>
           <button id="toggleGlobalPause" type="button">${pauseState.active ? "恢复全局时间" : "全局暂停"}</button>
         </div>
-        <div class="checkpoint-table">${renderCheckpointRows()}</div>
+        <div class="checkpoint-table">${roomClient ? renderAuthoritativeHistoryPanel() : renderCheckpointRows()}</div>
       ` : ""}
       <fieldset class="config-editor-fields" ${readOnly ? "disabled" : ""}>
         ${renderRoomPresetChooser()}
@@ -3628,8 +3562,59 @@ function renderSettingsPanel(): string {
   `;
 }
 
+function renderAuthoritativeHistoryPanel(): string {
+  const currentRevision = authoritativeStore.status?.revision ?? 0;
+  const mapCount = authoritativeStore.status?.match.maps.length ?? currentState?.maps.length ?? 0;
+  const history = authoritativeHistory.filter((item) => item.revision !== currentRevision);
+  const latestRevision = (mapIndex: number, phaseTypes: string[]): number | null => {
+    const matches = history.filter((item) => item.phase.mapIndex === mapIndex && phaseTypes.includes(item.phase.type));
+    return matches.length ? Math.max(...matches.map((item) => item.revision)) : null;
+  };
+  const stageDefinitions: Array<{ label: string; phases: string[]; enabled: boolean; unavailable: string }> = [
+    {
+      label: "选图",
+      phases: ["map_pick"],
+      enabled: settingsState.mapSelectionMode !== "fixed_map_order",
+      unavailable: settingsState.mapSelectionMode === "fixed_map_order" ? "固定地图顺序不可回退到选图" : "尚未到达此阶段",
+    },
+    {
+      label: "确认上人",
+      phases: ["lineup_pick"],
+      enabled: settingsState.rosterMode !== "skip",
+      unavailable: settingsState.rosterMode === "skip" ? "当前配置已跳过上人" : "尚未到达此阶段",
+    },
+    {
+      label: "确认 Ban",
+      phases: ["ban_order", "ban_first"],
+      enabled: settingsState.banEnabled,
+      unavailable: settingsState.banEnabled ? "尚未到达此阶段" : "当前配置已关闭英雄 Ban",
+    },
+    { label: "录入比赛得分", phases: ["score_entry"], enabled: true, unavailable: "尚未到达此阶段" },
+  ];
+  const options = Array.from({ length: mapCount }, (_, mapIndex) => {
+    const items = stageDefinitions.map((stage) => {
+      const revision = stage.enabled ? latestRevision(mapIndex, stage.phases) : null;
+      const reason = revision === null ? stage.unavailable : "";
+      return `<option value="${revision ?? ""}" ${revision === null ? "disabled" : ""}>第 ${mapIndex + 1} 张地图 · ${stage.label}${reason ? `（${escapeHtml(reason)}）` : ""}</option>`;
+    }).join("");
+    return `<optgroup label="第 ${mapIndex + 1} 张地图">${items}</optgroup>`;
+  }).join("");
+  const hasTarget = history.some((item) => ["map_pick", "lineup_pick", "ban_order", "ban_first", "score_entry"].includes(item.phase.type));
+  const globallyPaused = getRoomViewPolicy()?.globalPaused ?? false;
+  return `
+    <p>请选择业务阶段。系统会自动使用当前分支中最新的可回退记录，不显示内部版本号。</p>
+    <div class="settings-actions authoritative-history-actions">
+      <select id="authoritativeHistoryRevision" aria-label="恢复检查点" ${hasTarget && !globallyPaused ? "" : "disabled"}>
+        ${options || `<option value="">暂无可回退阶段</option>`}
+      </select>
+      <button id="rollbackToHistoryRevision" class="danger-button" type="button" ${hasTarget && !globallyPaused ? "" : "disabled"}>确认回退</button>
+      <button id="refreshAuthoritativeHistory" type="button" ${globallyPaused ? "disabled" : ""}>刷新阶段</button>
+    </div>
+  `;
+}
+
 function renderInteractiveRandomOverlay(): string {
-  if (!interactiveRandomState || isBroadcastPortal()) {
+  if (!interactiveRandomState) {
     return "";
   }
 
@@ -3660,7 +3645,7 @@ function renderInteractiveRandomOverlay(): string {
         </div>
         <footer class="interactive-random-footer">
           ${resolved
-            ? `<div class="interactive-random-result"><span>${leftChoice} XOR ${rightChoice} = ${leftChoice ^ rightChoice}</span><strong>${escapeHtml(getTeamName(state.resolvedSide!))}获得${state.purpose === "map_picker" ? "首次选图权" : state.purpose === "opening_ban" ? "禁用首次先手" : "攻防选择权"}</strong></div><button id="continueInteractiveRandom" type="button">继续</button>`
+            ? `<div class="interactive-random-result"><span>${leftChoice} XOR ${rightChoice} = ${leftChoice ^ rightChoice}</span><strong>${escapeHtml(getTeamName(state.resolvedSide!))}获得${state.purpose === "map_picker" ? "首次选图权" : state.purpose === "opening_ban" ? "禁用首次先手" : "攻防选择权"}</strong><small>结果展示结束后自动进入下一阶段</small></div>`
             : `<p>XOR 结果为 0 时，队伍1先选；为 1 时，队伍2先选。</p>`}
         </footer>
       </div>
@@ -3673,14 +3658,19 @@ function renderInteractiveRandomTeam(side: Side): string {
     return "";
   }
   const selected = interactiveRandomState.choices[side];
-  const editable = !interactiveRandomState.resolvedSide && portalConfig.side === side;
+  const editable = !interactiveRandomState.resolvedSide
+    && selected === null
+    && portalConfig.side === side;
+  const broadcast = isBroadcastPortal();
   return `
     <section class="interactive-random-team ${selected !== null ? "is-submitted" : ""}">
       <span>${side === "left" ? "队伍1" : "队伍2"}</span>
       <strong>${escapeHtml(getTeamName(side))}</strong>
-      <div>
-        ${([0, 1] as const).map((value) => `<button class="interactive-random-choice ${selected === value ? "is-selected" : ""}" type="button" data-random-value="${value}" ${editable ? "" : "disabled"}>${value}</button>`).join("")}
-      </div>
+      ${broadcast
+        ? `<div class="interactive-random-readonly-value">${interactiveRandomState.resolvedSide ? selected ?? 0 : "•"}</div>`
+        : `<div>
+            ${([0, 1] as const).map((value) => `<button class="interactive-random-choice ${selected === value ? "is-selected" : ""}" type="button" data-random-value="${value}" ${editable && !isRoomActionLocked() ? "" : "disabled"}>${value}</button>`).join("")}
+          </div>`}
       <small>${interactiveRandomState.resolvedSide ? `选择 ${selected ?? 0}` : selected !== null ? "已提交" : editable ? "请选择" : "等待提交"}</small>
     </section>
   `;
@@ -3690,7 +3680,6 @@ function bindInteractiveRandomEvents(): void {
   app.querySelectorAll<HTMLButtonElement>(".interactive-random-choice:not(:disabled)").forEach((button) => {
     button.addEventListener("click", () => submitInteractiveRandomChoice(Number(button.dataset.randomValue) as 0 | 1));
   });
-  document.getElementById("continueInteractiveRandom")?.addEventListener("click", continueAfterInteractiveRandom);
 }
 
 function renderConfigPresetManager(selectedPreset: ConfigPreset | null): string {
@@ -3713,7 +3702,9 @@ function renderConfigPresetManager(selectedPreset: ConfigPreset | null): string 
             <div>
               <button class="edit-config-preset" data-preset-id="${escapeHtml(preset.id)}" type="button">GUI 编辑</button>
               <button class="copy-config-preset-json" data-preset-id="${escapeHtml(preset.id)}" type="button">复制 JSON</button>
-              <button class="delete-config-preset" data-preset-id="${escapeHtml(preset.id)}" type="button">删除</button>
+              <button class="delete-config-preset" data-preset-id="${escapeHtml(preset.id)}" type="button"
+                ${adminSettings?.defaultPresetId === preset.id ? "disabled" : ""}
+                title="${adminSettings?.defaultPresetId === preset.id ? "请先切换新房间默认模板" : "删除模板"}">删除</button>
             </div>
           </article>
         `).join("") || `<div class="admin-empty-state"><strong>暂无模板</strong><p>可新建模板或导入完整 JSON。</p></div>`}
@@ -3751,14 +3742,18 @@ function renderConfigPresetManager(selectedPreset: ConfigPreset | null): string 
 
 function bindGlobalPresetManagerEvents(): void {
   document.getElementById("newConfigPreset")?.addEventListener("click", () => {
+    if (!confirmDiscardGlobalPresetChanges()) return;
     selectedGlobalPresetId = "__new__";
     globalPresetDraftMeta = { name: "" };
     settingsState = structuredClone(defaultSettings);
+    globalPresetDirty = false;
     renderGlobalAdminPage();
   });
   document.getElementById("cancelGlobalPresetEdit")?.addEventListener("click", () => {
+    if (!confirmDiscardGlobalPresetChanges()) return;
     selectedGlobalPresetId = null;
     globalPresetDraftMeta = null;
+    globalPresetDirty = false;
     renderGlobalAdminPage();
   });
   document.getElementById("showPresetJsonImport")?.addEventListener("click", () => {
@@ -3772,12 +3767,14 @@ function bindGlobalPresetManagerEvents(): void {
 
   app.querySelectorAll<HTMLButtonElement>(".edit-config-preset").forEach((button) => {
     button.addEventListener("click", () => {
+      if (!confirmDiscardGlobalPresetChanges()) return;
       selectedGlobalPresetId = button.dataset.presetId ?? null;
       const preset = configPresets.find((item) => item.id === selectedGlobalPresetId);
       globalPresetDraftMeta = preset ? { name: preset.name } : null;
       if (preset) {
         settingsState = mergeSettings(defaultSettings, preset.config);
       }
+      globalPresetDirty = false;
       renderGlobalAdminPage();
     });
   });
@@ -3795,12 +3792,22 @@ function bindGlobalPresetManagerEvents(): void {
     bindRosterEditorControls();
     ["matchFormat", "mapSelectionMode", "rosterMode", "fixedFirstMapEnabled", "symmetricSideChoiceEnabled", "banEnabled", "firstBanPolicy"].forEach((id) => {
       document.getElementById(id)?.addEventListener("change", () => {
+        globalPresetDirty = true;
         captureGlobalPresetDraftMeta();
         readSettingsFromForm();
         renderGlobalAdminPage();
       });
     });
+    app.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(".global-preset-editor input, .global-preset-editor select, .global-preset-editor textarea")
+      .forEach((control) => {
+        control.addEventListener("input", () => { globalPresetDirty = true; });
+        control.addEventListener("change", () => { globalPresetDirty = true; });
+      });
   }
+}
+
+function confirmDiscardGlobalPresetChanges(): boolean {
+  return !globalPresetDirty || window.confirm("当前模板有未保存的修改，确认放弃这些修改？");
 }
 
 function captureGlobalPresetDraftMeta(): void {
@@ -3840,15 +3847,20 @@ function bindRosterEditorControls(): void {
       const side = button.dataset.rosterSide as Side | undefined;
       const list = side ? app.querySelector<HTMLElement>(`.visual-roster-items[data-roster-side="${side}"]`) : null;
       if (side && list) {
+        globalPresetDirty = true;
         list.insertAdjacentHTML("beforeend", renderRosterMemberInput(side, ""));
         list.lastElementChild?.querySelector<HTMLButtonElement>(".remove-roster-member")?.addEventListener("click", (event) => {
+          globalPresetDirty = true;
           (event.currentTarget as HTMLElement).closest(".roster-member-row")?.remove();
         });
       }
     });
   });
   app.querySelectorAll<HTMLButtonElement>(".remove-roster-member").forEach((button) => {
-    button.addEventListener("click", () => button.closest(".roster-member-row")?.remove());
+    button.addEventListener("click", () => {
+      globalPresetDirty = true;
+      button.closest(".roster-member-row")?.remove();
+    });
   });
 }
 
@@ -3858,7 +3870,7 @@ async function saveGlobalPresetFromForm(): Promise<void> {
   }
   const validationErrors = validateSettingsForSubmit();
   if (validationErrors.length > 0) {
-    alert(validationErrors.join("\n"));
+    showLocalNotice(validationErrors.join("；"));
     return;
   }
   const id = selectedGlobalPresetId && selectedGlobalPresetId !== "__new__" ? selectedGlobalPresetId : "";
@@ -3871,16 +3883,17 @@ async function saveGlobalPresetFromForm(): Promise<void> {
     {
       method: existing ? "PUT" : "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ schemaVersion: 1, ...(id ? { id } : {}), name, config: settingsState }),
+      body: JSON.stringify({ schemaVersion: 2, ...(id ? { id } : {}), name, config: legacyConfigToCanonical(settingsState as unknown as Record<string, unknown>, stableId, stableId) }),
     },
   );
   if (!response.ok) {
-    alert(await getConfigErrorMessage(response));
+    showLocalNotice(await getConfigErrorMessage(response));
     return;
   }
   const preset = await response.json() as ConfigPreset;
   selectedGlobalPresetId = preset.id;
   globalPresetDraftMeta = null;
+  globalPresetDirty = false;
   await loadGlobalAdminData();
   renderGlobalAdminPage(`模板“${preset.name}”已保存。`);
 }
@@ -3899,6 +3912,9 @@ async function importGlobalPresetJson(): Promise<void> {
   }
   const id = payload.id ?? "";
   const existing = configPresets.some((preset) => preset.id === id);
+  if (!confirmDiscardGlobalPresetChanges()) {
+    return;
+  }
   if (existing && !window.confirm(`模板 ${id} 已存在，是否覆盖？`)) {
     return;
   }
@@ -3915,6 +3931,7 @@ async function importGlobalPresetJson(): Promise<void> {
   const preset = await response.json() as ConfigPreset;
   selectedGlobalPresetId = preset.id;
   globalPresetDraftMeta = null;
+  globalPresetDirty = false;
   await loadGlobalAdminData();
   renderGlobalAdminPage(`模板“${preset.name}”已导入。`);
 }
@@ -4091,7 +4108,7 @@ function renderMapSettingsPanel(): string {
           "从第二张地图开始，由上一张非平局地图的败者选择。",
           `<select id="mapPickerPolicy"><option value="loser_choose">败者选择</option></select>`,
         ) : ""}
-        ${renderAdminSettingRow("地图选择时间", "每张地图的选择时间，单位为秒。", `<input id="mapSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.mapSelectSeconds}" />`)}
+        ${renderAdminSettingRow("地图选择时间", "固定地图顺序下保留该值但不生效。", `<input id="mapSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.mapSelectSeconds}" ${settingsState.mapSelectionMode === "fixed_map_order" ? "disabled" : ""} />`)}
         ${showMapPool ? renderAdminSettingRow(
           "超时违规",
           "设置地图选择超时后的处理方式。",
@@ -4205,7 +4222,9 @@ function renderScoreTeamPause(side: Side): string {
         <div><dt>全局累计暂停</dt><dd data-score-pause-match-total="${side}">${formatDurationMs(getMatchTeamPauseTotalMs(side))}</dd></div>
         <div><dt>本次暂停</dt><dd data-score-pause-current="${side}">${formatDurationMs(getTeamPauseCurrentMs(side))}</dd></div>
       </dl>
-      <button type="button" data-score-pause-side="${side}" ${canControl ? "" : "disabled"}>${teamPause.active ? "取消暂停" : "暂停计时"}</button>
+      ${isBroadcastPortal()
+        ? `<span class="phase-readonly-label">${teamPause.active ? "队伍暂停中" : "队伍暂停未启用"}</span>`
+        : `<button type="button" data-score-pause-side="${side}" ${canControl ? "" : "disabled"}>${teamPause.active ? "取消暂停" : "暂停计时"}</button>`}
     </section>
   `;
 }
@@ -4234,12 +4253,20 @@ function renderSelectionConfirmation(): string {
     ? "确认选择地图"
     : kind === "lineup"
       ? "确认上场成员"
+      : kind === "room-config-rollback"
+        ? "回退到赛前配置"
+        : kind === "room-preset-import"
+          ? "导入房间模板"
       : banSelectorState?.step === "order-choice"
         ? "确认禁用顺序"
         : "确认禁用英雄";
   let summary = "";
 
-  if (kind === "map") {
+  if (kind === "room-config-rollback") {
+    summary = "此操作会清空地图、阵容、英雄禁用、比分和比赛进度，并重新开放配置。";
+  } else if (kind === "room-preset-import") {
+    summary = "导入模板会替换当前房间配置草稿。";
+  } else if (kind === "map") {
     const choice = findMapChoiceByKey(mapSelectorState?.selectedMapKey ?? null);
     summary = choice ? `${getModeLabel(choice.mode)} · ${getDisplayMapName(choice.nameEn)}` : "尚未选择地图";
   } else if (kind === "ban") {
@@ -4272,6 +4299,14 @@ function renderSelectionConfirmation(): string {
 }
 
 function requestSelectionConfirmation(kind: SelectionConfirmationKind): void {
+  const allowed = kind === "room-config-rollback" || kind === "room-preset-import"
+    ? isAdminPortal() && !isRoomActionLocked()
+    : kind === "map"
+    ? canOperateMapSelection()
+    : kind === "lineup"
+      ? canConfirmLineupSelection()
+      : canConfirmBanSelection();
+  if (!allowed || isRoomActionLocked()) return;
   selectionConfirmationState = { kind };
   renderCurrent();
 }
@@ -4282,11 +4317,14 @@ function bindSelectionConfirmationEvents(): void {
     renderCurrent();
   });
   document.getElementById("acceptSelectionConfirmation")?.addEventListener("click", () => {
-    const kind = selectionConfirmationState?.kind;
+    const pendingConfirmation = selectionConfirmationState;
+    const kind = pendingConfirmation?.kind;
     selectionConfirmationState = null;
     if (kind === "map") confirmSelectedMap();
     if (kind === "lineup") confirmLineups();
     if (kind === "ban") confirmBanSelection();
+    if (kind === "room-config-rollback") void performRollbackRoomToConfig();
+    if (kind === "room-preset-import") void performApplyRoomPreset(pendingConfirmation?.presetId ?? "");
   });
 }
 
@@ -4297,6 +4335,323 @@ function renderSidePolicySelect(id: string, value: SidePolicy, disabled = false)
     <option value="left" ${value === "left" ? "selected" : ""}>队伍1先</option>
     <option value="right" ${value === "right" ? "selected" : ""}>队伍2先</option>
   </select>`;
+}
+
+function applyAuthoritativeState(status: AuthoritativeStatus, runtime: AuthoritativeRuntime, shouldRender: boolean): void {
+  const legacyConfig = canonicalConfigToLegacy(
+    status.config,
+    resolveCanonicalMapName,
+    resolveCanonicalModeName,
+  ) as unknown as SettingsState;
+  settingsState = mergeSettings(defaultSettings, legacyConfig);
+  roomConfigState = {
+    status: status.phase.type === "configuring" ? "draft" : status.phase.type === "waiting_ready" ? "ready" : "locked",
+    revision: status.revision,
+    source: { type: "manual" },
+    value: settingsState,
+    confirmedAt: null,
+    lockedAt: null,
+  };
+
+  const matchState: MatchState = {
+    roomCode: status.roomId,
+    matchName: String(status.config.matchName ?? ""),
+    phase: status.lifecycle === "completed" ? "completed" : status.lifecycle === "running" ? "after" : "before",
+    currentCountdownSeconds: Math.ceil(runtime.remainingTimeMs / 1000),
+    currentOperation: status.phase.type,
+    teams: {
+      left: { ...status.match.teams.left },
+      right: { ...status.match.teams.right },
+    },
+    maps: status.match.maps.map(authoritativeMapToLegacy),
+  };
+
+  const phase = status.phase;
+  const index = phase.mapIndex ?? 0;
+  const firstBanSide = index < status.match.maps.length ? status.match.maps[index].bans.firstBanSide : null;
+  const lineupValues = {
+    left: lineupToLegacy(runtime.lineupSubmissions.left ?? status.match.maps[index]?.lineups?.left ?? {}),
+    right: lineupToLegacy(runtime.lineupSubmissions.right ?? status.match.maps[index]?.lineups?.right ?? {}),
+  };
+  const legacySnapshot: SharedRoomSnapshot = {
+    roomStarted: status.lifecycle !== "preparing",
+    currentState: matchState,
+    settingsState,
+    confirmedLineups: Object.fromEntries(status.match.maps.filter((map) => map.lineups).map((map) => [
+      map.index,
+      { left: lineupToLegacy(map.lineups!.left), right: lineupToLegacy(map.lineups!.right) },
+    ])),
+    mapSelectorState: phase.type === "map_pick" && phase.actorSide !== "both" && phase.actorSide
+      ? { open: true, minimized: false, selectedMapKey: null, targetMapIndex: index, pickerSide: phase.actorSide, timedOut: runtime.timedOut }
+      : null,
+    sideSelectorState: phase.type === "side_pick"
+      ? {
+        open: true,
+        mapIndex: index,
+        pickerSide: String(phase.data.chooserSide ?? phase.actorSide) as Side,
+        choiceKind: String(phase.data.choiceKind ?? "color") as "attack_defense" | "color",
+        selectedSide: null,
+      }
+      : null,
+    lineupSelectorState: phase.type === "lineup_pick"
+      ? {
+        open: true,
+        mapIndex: index,
+        values: lineupValues,
+        ready: { left: runtime.lineupSubmissions.left !== null, right: runtime.lineupSubmissions.right !== null },
+        timedOut: runtime.timedOut,
+      }
+      : null,
+    banSelectorState: ["ban_order", "ban_first", "ban_second"].includes(phase.type)
+      ? {
+        open: true,
+        mapIndex: index,
+        step: phase.type === "ban_order" ? "order-choice" : phase.type === "ban_first" ? "first-ban" : "second-ban",
+        chooserSide: String(phase.data.chooserSide ?? phase.actorSide ?? firstBanSide ?? "left") as Side,
+        activeSide: String(phase.actorSide ?? firstBanSide ?? "left") as Side,
+        firstBanSide,
+        selectedOrder: null,
+        selectedHeroKey: null,
+        timedOut: runtime.timedOut,
+      }
+      : null,
+    scoreSelectorState: phase.type === "score_entry"
+      ? {
+        open: true,
+        mapIndex: index,
+        values: runtime.scoreProposal
+          ? { left: String(runtime.scoreProposal.score.left), right: String(runtime.scoreProposal.score.right) }
+          : { left: "", right: "" },
+        submittedBy: runtime.scoreProposal?.submittedBy ?? null,
+        rejectedBy: runtime.scoreProposal?.rejectedBy ?? null,
+        timedOut: runtime.timedOut,
+        teamPauses: {
+          left: authoritativeTeamPause(runtime, "left"),
+          right: authoritativeTeamPause(runtime, "right"),
+        },
+        countdownPauseStartedAt: null,
+      }
+      : null,
+    matchTeamPauseTotals: {
+      left: runtime.pause.scoreTeams.left.matchTotalMs,
+      right: runtime.pause.scoreTeams.right.matchTotalMs,
+    },
+    restState: phase.type === "pre_start_rest" || phase.type === "post_map_rest"
+      ? { open: true, mapIndex: index, skipReady: { ...runtime.restSkip } }
+      : null,
+    pauseState: {
+      active: runtime.pause.global.active,
+      startedAt: runtime.pause.global.active
+        ? (pauseState.active && pauseState.startedAt ? pauseState.startedAt : Date.now())
+        : null,
+      totalPausedMs: runtime.pause.global.totalMs,
+      matchTotalPausedMs: runtime.pause.global.totalMs,
+      collapsed: pauseState.collapsed,
+    },
+    teamAckNotice: null,
+    adminNotice: runtime.awaitingAdminDecision ? "等待管理员处理超时裁定" : null,
+    openingSide: status.match.decisions.openingBanSide ?? "left",
+    firstMapPickerSide: status.match.decisions.firstMapPickerSide ?? "left",
+    interactiveRandomState: phase.type === "interactive_random"
+      ? {
+        purpose: String(phase.data.purpose) as InteractiveRandomPurpose,
+        mapIndex: index,
+        choices: {
+          ...(runtime.interactiveRandom ?? {
+            left: runtime.interactiveRandomResult?.left ?? null,
+            right: runtime.interactiveRandomResult?.right ?? null,
+          }),
+        },
+        resolvedSide: runtime.interactiveRandomResult?.resultSide ?? null,
+      }
+      : null,
+    interactiveRandomResults: {},
+    notificationEvents,
+  };
+  applyAuthoritativeRuntime(runtime);
+  applySharedRoomSnapshot(legacySnapshot, shouldRender);
+  lastRuntimeStructure = runtimeStructureSignature(runtime);
+}
+
+function applyAuthoritativeRuntime(runtime: AuthoritativeRuntime): void {
+  roomPresence = {
+    A: runtime.presence.A,
+    B: runtime.presence.B,
+    C: runtime.presence.C,
+  };
+  const globalPauseActive = runtime.pause.global.active;
+  const globalPauseStartedAt = globalPauseActive
+    ? (pauseState.active && pauseState.startedAt ? pauseState.startedAt : Date.now())
+    : null;
+  pauseState = {
+    ...pauseState,
+    active: globalPauseActive,
+    startedAt: globalPauseStartedAt,
+    totalPausedMs: runtime.pause.global.totalMs,
+    matchTotalPausedMs: runtime.pause.global.totalMs,
+  };
+  matchTeamPauseTotals = {
+    left: runtime.pause.scoreTeams.left.matchTotalMs,
+    right: runtime.pause.scoreTeams.right.matchTotalMs,
+  };
+}
+
+function formatAuthoritativeNotificationEvent(event: AuthoritativeNotificationEvent): MatchNotificationEvent {
+  const payload = event.payload;
+  const value = (key: string): string => String(payload[key] ?? "");
+  const teamName = value("teamName") || value("winnerTeam") || value("loserTeam");
+  const mapName = value("mapName") ? getMapNameZh(value("mapName")) : "";
+  const heroName = value("heroName") ? getHeroDisplayName(value("heroName")) : "";
+  const messages: Record<string, () => string> = {
+    MATCH_STARTED_MANUAL: () => "双方准备就绪，管理员开始了比赛",
+    MATCH_STARTED_FORCE: () => "管理员强制开始了比赛",
+    MATCH_STARTED_AUTO: () => "双方准备就绪，比赛自动开始",
+    FIXED_MAP_ANNOUNCED: () => `本张地图为固定地图${mapName}`,
+    RIGHT_ASSIGNED: () => `${teamName}获得了本张地图的${value("rightLabel")}`,
+    RIGHT_ASSIGNED_RANDOM: () => `系统随机结果为，${teamName}获得了本张地图的${value("rightLabel")}`,
+    INTERACTIVE_RANDOM_RESULT: () => `交互随机结果：${value("left")} XOR ${value("right")} = ${value("result")}，${teamName}获得${value("rightLabel")}`,
+    MAP_CONFIRMED: () => `${teamName}选择了地图${mapName}`,
+    MAP_CONFIRMED_BY_ADMIN: () => `管理员为${teamName}选择了地图${mapName}`,
+    MAP_TIMEOUT_RANDOM: () => `${teamName}进行地图选择超时，随机选择为${mapName}`,
+    SIDE_CONFIRMED: () => `${teamName}选择了${value("choice")}`,
+    SIDE_TIMEOUT_RANDOM: () => `${teamName}进行${value("choiceKind")}超时，随机选择为${value("choice")}`,
+    LINEUP_CONFIRMED_BY_ADMIN: () => "管理员为双方设置了上场人员",
+    BAN_ORDER_CONFIRMED: () => `${teamName}选择了${value("firstOrSecond")}`,
+    BAN_ORDER_CONFIRMED_BY_ADMIN: () => `管理员为${teamName}选择了${value("firstOrSecond")}`,
+    HERO_BAN_CONFIRMED: () => `${teamName}禁用了${heroName}`,
+    HERO_BAN_CONFIRMED_BY_ADMIN: () => `管理员为${teamName}禁用了${heroName}`,
+    HERO_BAN_RANDOM_BY_ADMIN: () => `管理员为${teamName}随机禁用了${heroName}`,
+    HERO_BAN_TIMEOUT_RANDOM: () => `${teamName}英雄禁用选择超时，随机禁用了${heroName}`,
+    SELECTION_TIMEOUT_EXTENDED: () => `${value("subject")}进行${value("selectionType")}超时，警告一次并且再给予${value("seconds")}秒选择`,
+    SELECTION_AWAITING_ADMIN: () => `${value("subject")}进行${value("selectionType")}超时，等待管理员裁定`,
+    ADMIN_DECISION_RESOLVED: () => `管理员完成了${value("decisionType")}裁定：${value("decisionSummary")}`,
+    LINEUP_BOTH_RESTARTED: () => `双方队伍进行上场人员选择超时，警告一次并且再给予${value("seconds")}秒选择`,
+    MAP_FORFEITED: () => `${value("loserTeam")}进行${value("selectionType")}超时，本张地图判负`,
+    MAP_WON: () => `${value("winnerTeam")}本张地图获胜`,
+    MATCH_WON: () => `${value("winnerTeam")}赢得本场比赛`,
+    STAGE_RESTORED: () => `管理员将比赛回退到了${value("stageLabel")}`,
+  };
+  const message = messages[event.eventType]?.() ?? `${event.actor.role}完成了${event.eventType}`;
+  return { id: event.eventId, createdAt: event.occurredAt, segments: [textSegment(message)] };
+}
+
+function ingestAuthoritativeNotificationEvents(events: AuthoritativeNotificationEvent[]): void {
+  events.forEach((authoritativeEvent) => {
+    if (seenNotificationIds.has(authoritativeEvent.eventId)) {
+      return;
+    }
+    seenNotificationIds.add(authoritativeEvent.eventId);
+    const event = formatAuthoritativeNotificationEvent(authoritativeEvent);
+    notificationEvents = [...notificationEvents, event].slice(-100);
+    showNotification(event);
+  });
+}
+
+function runtimeStructureSignature(runtime: AuthoritativeRuntime): string {
+  return JSON.stringify({
+    phaseId: runtime.phaseId,
+    presence: Object.fromEntries(Object.entries(runtime.presence).map(([code, value]) => [code, {
+      connected: value.connected, ready: value.ready, nameConfirmed: value.nameConfirmed,
+    }])),
+    interactiveRandom: runtime.interactiveRandom,
+    lineupSubmissions: runtime.lineupSubmissions,
+    scoreProposal: runtime.scoreProposal,
+    interactiveRandomResult: runtime.interactiveRandomResult,
+    restSkip: runtime.restSkip,
+    timedOut: runtime.timedOut,
+    awaitingAdminDecision: runtime.awaitingAdminDecision,
+    pauseActive: runtime.pause.global.active,
+    teamPauseActive: {
+      left: runtime.pause.scoreTeams.left.active,
+      right: runtime.pause.scoreTeams.right.active,
+    },
+  });
+}
+
+function authoritativeMapToLegacy(map: AuthoritativeStatus["match"]["maps"][number]): MatchMap {
+  const catalog = map.mapId ? findCatalogMapByStableId(map.mapId) : null;
+  const bans: Record<Side, HeroBan | null> = {
+    left: map.bans.leftHeroId ? authoritativeHeroBan(map.bans.leftHeroId) : null,
+    right: map.bans.rightHeroId ? authoritativeHeroBan(map.bans.rightHeroId) : null,
+  };
+  return {
+    id: map.mapId ?? `tbd-${map.index + 1}`,
+    mode: catalog?.mode ?? (map.modeId ? resolveCanonicalModeName(map.modeId) : null),
+    modeIconUrl: catalog?.modeIconUrl ?? null,
+    nameZh: catalog ? getMapNameZh(catalog.nameEn) : null,
+    nameEn: catalog?.nameEn ?? null,
+    status: map.status === "pending" ? "tbd" : map.status === "completed" || map.status === "forfeited" ? "completed" : "after",
+    imageUrl: catalog?.imageUrl ?? "/static/placeholders/map-blank.svg",
+    score: map.score ? { ...map.score } : { left: null, right: null },
+    bans,
+    firstBanSide: map.bans.firstBanSide,
+    sideChoiceKind: map.sideChoice?.kind ?? null,
+    selectedSide: map.sideChoice?.selectedSide ?? null,
+  };
+}
+
+function authoritativeHeroBan(heroId: string): HeroBan {
+  const hero = mapCatalogState.heroes.find((entry) => stableId(entry.nameEn) === heroId);
+  return hero ? createHeroBan(hero) : { hero: heroId, nameEn: heroId, role: "", imageUrl: "/static/placeholders/hero-blank.svg" };
+}
+
+function findCatalogMapByStableId(mapId: string): MapChoice | null {
+  for (const [mode, maps] of Object.entries(mapCatalogState.maps)) {
+    const item = maps.find((candidate) => stableId(candidate.nameEn) === mapId);
+    if (item) return { ...item, mode, key: `${mode}:${item.nameEn}`, modeIconUrl: mapCatalogState.modeIcons[mode]?.imageUrl ?? null };
+  }
+  return null;
+}
+
+function resolveCanonicalMapName(mapId: string): string {
+  return findCatalogMapByStableId(mapId)?.nameEn ?? mapId.replaceAll("_", " ");
+}
+
+function resolveCanonicalModeName(modeId: string): string {
+  return mapCatalogState.modes.find((mode) => stableId(mode) === modeId) ?? modeId.replace(/^./, (value) => value.toUpperCase());
+}
+
+function lineupToLegacy(lineup: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(lineup).map(([key, value]) => [key.replaceAll("_", "-"), value]));
+}
+
+function authoritativeTeamPause(runtime: AuthoritativeRuntime, side: Side): TeamPauseState {
+  const value = runtime.pause.scoreTeams[side];
+  return { active: value.active, startedAt: null, totalMs: value.phaseTotalMs, count: value.count };
+}
+
+function queueAuthoritativeOperation(operation: RoomOperation): void {
+  const specs = mapOperationToActions(operation, {
+    isAdmin: isAdminPortal(),
+    portalSide: portalConfig.side,
+    interactiveRandom: interactiveRandomState,
+    lineup: lineupSelectorState,
+    confirmedLineups,
+    score: scoreSelectorState,
+    stableId,
+  });
+  if (specs.length === 0 || !roomClient) return;
+  authoritativeActionQueue = authoritativeActionQueue.then(async () => {
+    for (const spec of specs) {
+      const ref = authoritativeStore.ref;
+      if (!ref) return;
+      try {
+        const response = await roomClient.action(ref, spec.type, spec.payload ?? {});
+        await authoritativeStore.apply(response);
+      } catch (error) {
+        if (error instanceof RoomApiError) {
+          const payload = error.payload as unknown as SyncResponse;
+          if (error.status === 409 && payload.kind === "full") {
+            roomClient.initializeNotificationStream(payload.notificationStream);
+            await authoritativeStore.apply(payload);
+          }
+          showLocalNotice(error.message);
+        } else {
+          showLocalNotice(error instanceof Error ? error.message : "网络请求失败，请重试");
+        }
+      }
+    }
+  });
 }
 
 function renderOpeningSidePolicySelect(
@@ -4362,11 +4717,11 @@ function renderRosterSettingsPanel(): string {
           <option value="skip">跳过该项</option>
         </select>`,
         )}
-        ${renderAdminSettingRow("上场成员选择时间", "双方确认上场成员的时间，单位为秒。", `<input id="playerSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.playerSelectSeconds}" />`)}
+        ${renderAdminSettingRow("上场成员选择时间", "跳过上人时保留该值但不生效。", `<input id="playerSelectSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.playerSelectSeconds}" ${settingsState.rosterMode === "skip" ? "disabled" : ""} />`)}
         ${renderAdminSettingRow(
           "上场选择超时",
           "设置选择上场成员超时后的处理方式。",
-          `<select id="lineupTimeoutPolicy">
+          `<select id="lineupTimeoutPolicy" ${settingsState.rosterMode === "skip" ? "disabled" : ""}>
             <option value="warn_extend_30">警告并延长30秒</option>
             <option value="forfeit_map">本小局判负</option>
             <option value="admin_decision">管理员判断</option>
@@ -4445,7 +4800,7 @@ function renderScoreRuleSettingsPanel(): string {
           <option value="team_submit_opponent_confirm">任一队伍填写，另一方确认</option>
         </select>`,
         )}
-        ${renderAdminSettingRow("比分确认时间", "一方提交比分后，另一方确认的时间，单位为秒。", `<input id="scoreConfirmSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.scoreConfirmSeconds}" />`)}
+        ${renderAdminSettingRow("比分确认时间", "管理员录分时保留该值但不生效。", `<input id="scoreConfirmSeconds" type="number" min="1" max="3600" value="${settingsState.stageLimits.scoreConfirmSeconds}" ${settingsState.scoreReportMode === "admin_only" ? "disabled" : ""} />`)}
       </div>
     </details>
   `;
@@ -4648,7 +5003,13 @@ function bindBanSelectorEvents(): void {
     button.addEventListener("click", () => selectHeroBan(button.dataset.heroKey ?? null));
   });
 
-  document.getElementById("confirmBanPick")?.addEventListener("click", () => requestSelectionConfirmation("ban"));
+  document.getElementById("confirmBanPick")?.addEventListener("click", () => {
+    if (banSelectorState?.step === "order-choice") {
+      confirmBanSelection();
+      return;
+    }
+    requestSelectionConfirmation("ban");
+  });
   document.getElementById("randomLegalBan")?.addEventListener("click", () => randomLegalBanChoice());
   document.getElementById("extendBan")?.addEventListener("click", () => extendBanChoiceTime());
   document.getElementById("forfeitBan")?.addEventListener("click", () => forfeitCurrentBanChoice());
@@ -4681,12 +5042,6 @@ function bindRestEvents(): void {
 }
 
 function bindPauseEvents(): void {
-  document.getElementById("togglePausePanel")?.addEventListener("click", () => {
-    pauseState.collapsed = !pauseState.collapsed;
-    publishSharedRoomSnapshot(createRoomOperation("ui", "pause_panel_toggled", { collapsed: pauseState.collapsed }));
-    renderCurrent();
-  });
-
   document.getElementById("resumeGlobalTimer")?.addEventListener("click", () => {
     if (isAdminPortal()) {
       resumeGlobalPause();
@@ -4731,6 +5086,8 @@ function bindSettingsEvents(): void {
   document.getElementById("rollbackToConfig")?.addEventListener("click", () => void rollbackRoomToConfig());
   document.getElementById("copyRoomConfigJson")?.addEventListener("click", () => void copyRoomConfigJson());
   document.getElementById("toggleGlobalPause")?.addEventListener("click", toggleGlobalPause);
+  document.getElementById("refreshAuthoritativeHistory")?.addEventListener("click", () => void refreshAuthoritativeHistory());
+  document.getElementById("rollbackToHistoryRevision")?.addEventListener("click", () => void rollbackToSelectedRevision());
   bindCheckpointEvents();
 
   if (roomConfigState?.status !== "draft") {
@@ -4864,7 +5221,7 @@ function bindCheckpointEvents(): void {
       const key = button.dataset.key as CheckpointKey;
       const checkpoint = settingsState.checkpoints[row]?.[key];
 
-      if (!checkpoint || !window.confirm(`确认回退到 MAP ${row + 1}：${checkpoint.label}？`)) {
+      if (!checkpoint || isRoomActionLocked()) {
         return;
       }
 
@@ -4974,62 +5331,6 @@ function rerenderActiveConfigEditor(): void {
     renderGlobalAdminPage();
     return;
   }
-  renderCurrent();
-}
-
-function resetRoomToBeginning(
-  started: boolean,
-  allowNonAdmin = false,
-  startKind: "manual" | "force" | "auto" = "manual",
-): void {
-  if (!currentState || (!allowNonAdmin && !canUseSettings())) {
-    return;
-  }
-
-  roomStarted = started;
-  currentState = createFreshMatchState(currentState);
-  currentState.phase = started ? "map-pick" : "waiting";
-  currentState.currentOperation = started ? "选择地图" : "等待管理员开始";
-  confirmedLineups = {};
-  localLineupDrafts = {};
-  localScoreDraft = null;
-  sideSelectorState = null;
-  lineupSelectorState = null;
-  banSelectorState = null;
-  scoreSelectorState = null;
-  matchTeamPauseTotals = { left: 0, right: 0 };
-  restState = null;
-  pauseState = { active: false, startedAt: null, totalPausedMs: 0, matchTotalPausedMs: 0, collapsed: false };
-  hiddenOverlay = null;
-  adminNotice = null;
-  firstMapPickerSide = resolveSidePolicy(settingsState.firstMapPickerPolicy);
-  openingSide = resolveOpeningSide();
-  interactiveRandomState = null;
-  interactiveRandomResults = {};
-
-  if (started) {
-    if (settingsState.stageLimits.preStartRestSeconds > 0) {
-      restState = { open: true, mapIndex: 0, skipReady: createRestSkipReadyState() };
-      mapSelectorState = null;
-    } else {
-      restState = null;
-      if (!settingsState.fixedFirstMapEnabled && settingsState.firstMapPickerPolicy === "interactive_random") {
-        startInteractiveRandom("map_picker", 0);
-        mapSelectorState = null;
-      } else {
-        openNextMapSelector();
-      }
-    }
-  } else {
-    mapSelectorState = null;
-  }
-
-  resetCountdown();
-  publishSharedRoomSnapshot(createRoomOperation(
-    "room",
-    started ? "started" : "reset",
-    started ? { startKind } : {},
-  ));
   renderCurrent();
 }
 
@@ -5195,7 +5496,7 @@ async function saveRoomConfigDraft(renderAfter = true): Promise<boolean> {
   }
   const validationErrors = validateSettingsForSubmit();
   if (validationErrors.length > 0) {
-    alert(validationErrors.join("\n"));
+    showLocalNotice(validationErrors.join("；"));
     return false;
   }
   const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config`, {
@@ -5203,16 +5504,17 @@ async function saveRoomConfigDraft(renderAfter = true): Promise<boolean> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       revision: roomConfigState?.revision,
-      config: settingsState,
+      config: legacyConfigToCanonical(settingsState as unknown as Record<string, unknown>, stableId, stableId),
       source: roomConfigState?.source ?? { type: "manual" },
     }),
   });
   if (!response.ok) {
-    alert(await getConfigErrorMessage(response));
+    showLocalNotice(await getConfigErrorMessage(response));
     return false;
   }
-  roomConfigState = await response.json() as RoomConfigState;
+  roomConfigState = adaptConfigResponse(await response.json() as RoomConfigState);
   settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  if (roomClient) await authoritativeStore.apply(await roomClient.sync(null));
   if (renderAfter) {
     renderCurrent();
   }
@@ -5226,23 +5528,27 @@ async function applyRoomPreset(): Promise<void> {
   const select = document.getElementById("roomPresetSelect") as HTMLSelectElement | null;
   const presetId = select?.value;
   if (!presetId) {
-    alert("请先选择一个默认模板。");
+    showLocalNotice("请先选择一个默认模板。");
     return;
   }
-  if (!window.confirm("导入模板会替换当前房间配置草稿，是否继续？")) {
-    return;
-  }
+  selectionConfirmationState = { kind: "room-preset-import", presetId };
+  renderCurrent();
+}
+
+async function performApplyRoomPreset(presetId: string): Promise<void> {
+  if (!roomToken || !isAdminPortal() || !presetId || isRoomActionLocked()) return;
   const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config/apply-preset`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ presetId }),
   });
   if (!response.ok) {
-    alert(await getConfigErrorMessage(response));
+    showLocalNotice(await getConfigErrorMessage(response));
     return;
   }
-  roomConfigState = await response.json() as RoomConfigState;
+  roomConfigState = adaptConfigResponse(await response.json() as RoomConfigState);
   settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  if (roomClient) await authoritativeStore.apply(await roomClient.sync(null));
   renderCurrent();
 }
 
@@ -5258,11 +5564,22 @@ function startInteractiveRandom(purpose: InteractiveRandomPurpose, mapIndex: num
 }
 
 function submitInteractiveRandomChoice(value: 0 | 1): void {
-  if (!interactiveRandomState || interactiveRandomState.resolvedSide || !portalConfig.side) {
+  if (isRoomActionLocked() || !interactiveRandomState || interactiveRandomState.resolvedSide || !portalConfig.side) {
+    return;
+  }
+  if (interactiveRandomState.choices[portalConfig.side] !== null) {
     return;
   }
   interactiveRandomState.choices[portalConfig.side] = value;
   if (interactiveRandomState.choices.left !== null && interactiveRandomState.choices.right !== null) {
+    if (roomToken && roomClient) {
+      publishSharedRoomSnapshot(createRoomOperation("room", "interactive_random_submitted", {
+        purpose: interactiveRandomState.purpose,
+        side: portalConfig.side,
+      }));
+      renderCurrent();
+      return;
+    }
     finalizeInteractiveRandom(false);
     return;
   }
@@ -5299,41 +5616,20 @@ function finalizeInteractiveRandom(timedOut: boolean): void {
     resultSide,
     timedOut,
   }));
-  resetCountdown(INTERACTIVE_RANDOM_RESULT_SECONDS);
-  renderCurrent();
-}
-
-function continueAfterInteractiveRandom(): void {
-  if (!interactiveRandomState?.resolvedSide) {
-    return;
-  }
-  const { purpose, mapIndex } = interactiveRandomState;
-  interactiveRandomState = null;
-  if (purpose === "map_picker") {
-    if (!restState) {
-      openNextMapSelector();
-    }
-  } else if (purpose === "opening_ban") {
-    openBanSelectorForMap(mapIndex);
-  } else {
-    openSideSelectorForMap(mapIndex);
-  }
-  resetCountdown();
-  publishSharedRoomSnapshot(createRoomOperation("room", "interactive_random_continued", { purpose, mapIndex }));
   renderCurrent();
 }
 
 async function importRoomConfigFromJson(): Promise<void> {
   const textarea = document.getElementById("roomConfigJson") as HTMLTextAreaElement | null;
   if (!textarea?.value.trim()) {
-    alert("请先粘贴配置 JSON。");
+    showLocalNotice("请先粘贴配置 JSON。");
     return;
   }
   try {
     const payload = JSON.parse(textarea.value) as { config?: unknown };
     await importRoomConfig(payload.config ?? payload, "json");
   } catch {
-    alert("粘贴的内容不是有效 JSON。");
+    showLocalNotice("粘贴的内容不是有效 JSON。");
   }
 }
 
@@ -5347,11 +5643,12 @@ async function importRoomConfig(config: unknown, sourceType: "json" | "builtin")
     body: JSON.stringify({ revision: roomConfigState?.revision, config, source: { type: sourceType } }),
   });
   if (!response.ok) {
-    alert(await getConfigErrorMessage(response));
+    showLocalNotice(await getConfigErrorMessage(response));
     return;
   }
-  roomConfigState = await response.json() as RoomConfigState;
+  roomConfigState = adaptConfigResponse(await response.json() as RoomConfigState);
   settingsState = mergeSettings(defaultSettings, roomConfigState.value);
+  if (roomClient) await authoritativeStore.apply(await roomClient.sync(null));
   renderCurrent();
 }
 
@@ -5362,62 +5659,83 @@ async function confirmRoomConfig(): Promise<void> {
   if (!(await saveRoomConfigDraft(false))) {
     return;
   }
-  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/config/confirm`, { method: "POST" });
-  if (!response.ok) {
-    alert(await getConfigErrorMessage(response));
-    return;
+  if (!roomClient || !authoritativeStore.ref) return;
+  try {
+    await authoritativeStore.apply(await roomClient.action(authoritativeStore.ref, "config_confirm"));
+  } catch (error) {
+    showLocalNotice(error instanceof Error ? error.message : "确认配置失败");
   }
-  roomConfigState = await response.json() as RoomConfigState;
-  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
-  renderCurrent();
 }
 
 async function startRoomMatch(force = false): Promise<void> {
   if (!roomToken || !isAdminPortal() || roomConfigState?.status !== "ready") {
-    alert("请先保存并确认比赛配置。");
+    showLocalNotice("请先保存并确认比赛配置。");
     return;
   }
-  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ force }),
-  });
-  if (!response.ok) {
-    alert(await getConfigErrorMessage(response));
-    return;
+  if (!roomClient || !authoritativeStore.ref) return;
+  try {
+    await authoritativeStore.apply(await roomClient.action(authoritativeStore.ref, "match_start", { force }));
+    settingsPanelOpen = false;
+  } catch (error) {
+    showLocalNotice(error instanceof Error ? error.message : "开始比赛失败");
   }
-  const payload = await response.json() as { config: RoomConfigState; version: number };
-  roomConfigState = payload.config;
-  serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
-  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
-  settingsPanelOpen = false;
-  resetRoomToBeginning(true, false, force ? "force" : "manual");
 }
 
 async function rollbackRoomToConfig(): Promise<void> {
-  if (!roomToken || !isAdminPortal()) {
+  if (!roomToken || !isAdminPortal() || isRoomActionLocked()) {
     return;
   }
-  if (!window.confirm("回退会清空地图、阵容、英雄禁用、比分和比赛进度，并重新开放配置。确认继续？")) {
-    return;
+  selectionConfirmationState = { kind: "room-config-rollback" };
+  renderCurrent();
+}
+
+async function performRollbackRoomToConfig(): Promise<void> {
+  if (!roomToken || !isAdminPortal() || isRoomActionLocked()) return;
+  if (!roomClient) return;
+  try {
+    await authoritativeStore.apply(await roomClient.rollback(1));
+    settingsPanelOpen = true;
+  } catch (error) {
+    showLocalNotice(error instanceof Error ? error.message : "回退失败");
   }
-  const response = await fetch(`/api/rooms/token/${encodeURIComponent(roomToken)}/rollback-to-config`, { method: "POST" });
-  if (!response.ok) {
-    alert(await getConfigErrorMessage(response));
-    return;
+}
+
+async function refreshAuthoritativeHistory(): Promise<void> {
+  if (!roomClient || !isAdminPortal()) return;
+  try {
+    authoritativeHistory = await roomClient.history();
+    renderCurrent();
+  } catch (error) {
+    showLocalNotice(error instanceof Error ? error.message : "读取状态历史失败");
   }
-  const payload = await response.json() as { config: RoomConfigState; version: number };
-  roomConfigState = payload.config;
-  serverSnapshotVersion = Number(payload.version ?? serverSnapshotVersion);
-  settingsState = mergeSettings(defaultSettings, roomConfigState.value);
-  settingsPanelOpen = true;
-  pendingServerSnapshot = null;
-  resetRoomToBeginning(false);
+}
+
+async function rollbackToSelectedRevision(): Promise<void> {
+  if (!roomClient || !isAdminPortal()) return;
+  const select = document.getElementById("authoritativeHistoryRevision") as HTMLSelectElement | null;
+  const revision = Number(select?.value);
+  if (isRoomActionLocked() || !Number.isInteger(revision) || revision < 1) return;
+  try {
+    await authoritativeStore.apply(await roomClient.rollback(revision));
+    authoritativeHistory = await roomClient.history();
+    renderCurrent();
+  } catch (error) {
+    showLocalNotice(error instanceof Error ? error.message : "回退失败");
+  }
+}
+
+function adaptConfigResponse(response: RoomConfigState): RoomConfigState {
+  const value = canonicalConfigToLegacy(
+    response.value as unknown as Record<string, unknown>,
+    resolveCanonicalMapName,
+    resolveCanonicalModeName,
+  ) as unknown as SettingsState;
+  return { ...response, value };
 }
 
 async function copyRoomConfigJson(): Promise<void> {
   if (!navigator.clipboard) {
-    alert("浏览器不支持复制到剪贴板。");
+    showLocalNotice("浏览器不支持复制到剪贴板。");
     return;
   }
   const payload = {
@@ -5425,10 +5743,10 @@ async function copyRoomConfigJson(): Promise<void> {
     id: "room-export",
     name: settingsState.matchName,
     description: "从比赛房间导出的配置",
-    config: settingsState,
+    config: legacyConfigToCanonical(settingsState as unknown as Record<string, unknown>, stableId, stableId),
   };
   await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
-  alert("当前配置 JSON 已复制。");
+  showLocalNotice("当前配置 JSON 已复制。");
 }
 
 async function getConfigErrorMessage(response: Response): Promise<string> {
@@ -5619,7 +5937,6 @@ function restoreCheckpoint(row: number, key: CheckpointKey): void {
   }
 
   recalculateSeriesScoresFromCompletedMaps();
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("room", "stage_restored", { mapIndex: row, checkpoint: key }));
   renderCurrent();
 }
@@ -5710,7 +6027,6 @@ function openMapSelector(targetMapIndex: number): void {
     pickerSide: getMapPickerSide(currentState, targetMapIndex),
     timedOut: false,
   };
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("map", "selector_opened", { mapIndex: targetMapIndex }));
   renderCurrent();
 }
@@ -5761,7 +6077,6 @@ function extendMapChoiceTime(automatic = false): void {
   if (!mapSelectorState || (!automatic && !isAdminPortal())) return;
   mapSelectorState.timedOut = false;
   adminNotice = "已警告并延长 30 秒选图时间。";
-  resetCountdown(30);
   publishSharedRoomSnapshot(createRoomOperation("map", "timeout_extended", {
     mapIndex: mapSelectorState.targetMapIndex,
     side: mapSelectorState.pickerSide,
@@ -5784,13 +6099,11 @@ function forfeitCurrentMapChoice(automatic = false): void {
   banSelectorState = null;
   scoreSelectorState = null;
   if (finishMatchIfSeriesWon()) {
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("map", "forfeited", { mapIndex, loserSide, matchFinished: true }));
     renderCurrent();
     return;
   }
   openRestPeriod(mapIndex);
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("map", "forfeited", { mapIndex, loserSide, matchFinished: false }));
   renderCurrent();
 }
@@ -5829,8 +6142,6 @@ function confirmSelectedMap(selectionSource: "manual" | "timeout_random" | "admi
   }
   mapSelectorState = null;
   openSideSelectorForMap(selectedMapIndex);
-
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("map", "confirmed", {
     mapIndex: selectedMapIndex,
     mapKey: choice.key,
@@ -5905,7 +6216,11 @@ function openSideSelectorForMap(mapIndex: number): void {
 }
 
 function canOperateSideSelection(): boolean {
-  return Boolean(sideSelectorState && (isAdminPortal() || portalConfig.side === sideSelectorState.pickerSide));
+  return Boolean(
+    sideSelectorState
+      && !isRoomActionLocked()
+      && (isAdminPortal() || portalConfig.side === sideSelectorState.pickerSide),
+  );
 }
 
 function getSideChoiceSummary(): string {
@@ -5924,7 +6239,6 @@ function confirmSideSelection(selectionSource: "manual" | "timeout_random" = "ma
   currentState.maps[mapIndex].selectedSide = selectedSide;
   sideSelectorState = null;
   openLineupSelector(mapIndex);
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("map", "side_choice_confirmed", {
     mapIndex,
     choiceKind,
@@ -5933,12 +6247,6 @@ function confirmSideSelection(selectionSource: "manual" | "timeout_random" = "ma
     selectionSource,
   }));
   renderCurrent();
-}
-
-function handleSideSelectionTimeout(): void {
-  if (!sideSelectorState || !canOperateSideSelection()) return;
-  sideSelectorState.selectedSide = Math.random() < 0.5 ? "left" : "right";
-  confirmSideSelection("timeout_random");
 }
 
 function openLineupSelector(mapIndex: number): void {
@@ -6007,7 +6315,6 @@ function openBanSelectorForMap(mapIndex: number): void {
   ) {
     banSelectorState = null;
     startInteractiveRandom("opening_ban", mapIndex);
-    resetCountdown();
     return;
   }
 
@@ -6103,7 +6410,6 @@ function extendBanChoiceTime(automatic = false): void {
   if (!banSelectorState || (!automatic && !isAdminPortal())) return;
   banSelectorState.timedOut = false;
   adminNotice = "已警告并延长 30 秒禁用时间。";
-  resetCountdown(30);
   publishSharedRoomSnapshot(createRoomOperation("ban", "timeout_extended", {
     mapIndex: banSelectorState.mapIndex,
     side: banSelectorState.step === "order-choice" ? banSelectorState.chooserSide : banSelectorState.activeSide,
@@ -6126,13 +6432,11 @@ function forfeitCurrentBanChoice(automatic = false): void {
   banSelectorState = null;
   scoreSelectorState = null;
   if (finishMatchIfSeriesWon()) {
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("ban", "forfeited", { mapIndex, loserSide, matchFinished: true }));
     renderCurrent();
     return;
   }
   openRestPeriod(mapIndex);
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("ban", "forfeited", { mapIndex, loserSide, matchFinished: false }));
   renderCurrent();
 }
@@ -6157,7 +6461,6 @@ function confirmBanSelection(context: Record<string, unknown> = {}): void {
       adminNotice = message;
       createTeamAckNotice(message);
     }
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("ban", "order_confirmed", {
       mapIndex: banSelectorState.mapIndex,
       firstBanSide,
@@ -6181,7 +6484,6 @@ function confirmBanSelection(context: Record<string, unknown> = {}): void {
     banSelectorState.step = "second-ban";
     banSelectorState.activeSide = getOppositeSide(side);
     banSelectorState.selectedHeroKey = null;
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("ban", "hero_confirmed", {
       mapIndex: banSelectorState.mapIndex,
       side,
@@ -6196,7 +6498,6 @@ function confirmBanSelection(context: Record<string, unknown> = {}): void {
   const mapIndex = banSelectorState.mapIndex;
   banSelectorState = null;
   openScoreSelectorForMap(mapIndex);
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("ban", "hero_confirmed", {
     mapIndex,
     side,
@@ -6258,7 +6559,6 @@ function confirmScoreSelection(): void {
       scoreSelectorState.submittedBy = side;
       scoreSelectorState.rejectedBy = null;
       localScoreDraft = null;
-      resetCountdown();
       publishSharedRoomSnapshot(createRoomOperation("score", "submitted", {
         mapIndex: scoreSelectorState.mapIndex,
         side,
@@ -6324,7 +6624,6 @@ function finalizeScoreSelection(): void {
   scoreSelectorState = null;
   localScoreDraft = null;
   if (finishMatchIfSeriesWon()) {
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("score", "confirmed", {
       mapIndex,
       leftScore,
@@ -6335,7 +6634,6 @@ function finalizeScoreSelection(): void {
     return;
   }
   openRestPeriod(mapIndex);
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("score", "confirmed", {
     mapIndex,
     leftScore,
@@ -6392,7 +6690,7 @@ function createRestSkipReadyState(): Record<Side, boolean> {
 }
 
 function canSkipRestPeriod(): boolean {
-  return Boolean(restState && (isAdminPortal() || portalConfig.side));
+  return Boolean(restState && !isRoomActionLocked() && (isAdminPortal() || portalConfig.side));
 }
 
 function skipRestPeriod(): void {
@@ -6451,7 +6749,6 @@ function finishRestPeriod(): void {
   const mapIndex = restState.mapIndex;
 
   if (finishMatchIfSeriesWon()) {
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("rest", "finished", { mapIndex, matchFinished: true }));
     renderCurrent();
     return;
@@ -6464,7 +6761,6 @@ function finishRestPeriod(): void {
   } else {
     openNextMapSelector();
   }
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("rest", "finished", {
     mapIndex,
     matchFinished: false,
@@ -6594,7 +6890,7 @@ function isLineupComplete(): boolean {
 }
 
 function canConfirmLineupSelection(): boolean {
-  if (!lineupSelectorState || isBroadcastPortal()) {
+  if (!lineupSelectorState || isBroadcastPortal() || isRoomActionLocked() || isAwaitingAdminDecision()) {
     return false;
   }
 
@@ -6631,7 +6927,6 @@ function finalizeLineupSelection(setByAdmin = false): void {
   lineupSelectorState = null;
   adminNotice = null;
   openBanSelectorForMap(mapIndex);
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("lineup", "confirmed", { mapIndex, setByAdmin }));
   renderCurrent();
 }
@@ -6643,7 +6938,7 @@ function isSideLineupComplete(values: Record<string, string>): boolean {
 }
 
 function canOperateBanOrderChoice(): boolean {
-  if (!banSelectorState || banSelectorState.step !== "order-choice") {
+  if (!banSelectorState || banSelectorState.step !== "order-choice" || isRoomActionLocked() || isAwaitingAdminDecision()) {
     return false;
   }
 
@@ -6655,7 +6950,7 @@ function canOperateBanOrderChoice(): boolean {
 }
 
 function canOperateHeroBan(): boolean {
-  if (!banSelectorState || banSelectorState.step === "order-choice") {
+  if (!banSelectorState || banSelectorState.step === "order-choice" || isRoomActionLocked() || isAwaitingAdminDecision()) {
     return false;
   }
 
@@ -6680,13 +6975,14 @@ function canConfirmBanSelection(): boolean {
 }
 
 function canEditScore(): boolean {
-  if (!scoreSelectorState || scoreSelectorState.timedOut) {
+  if (!scoreSelectorState || scoreSelectorState.timedOut || isRoomActionLocked()) {
     return false;
   }
 
   if (isAdminPortal()) {
     return true;
   }
+  if (isAwaitingAdminDecision()) return false;
 
   return Boolean(
     settingsState.scoreReportMode === "team_submit_opponent_confirm"
@@ -6696,13 +6992,14 @@ function canEditScore(): boolean {
 }
 
 function canConfirmScoreSelection(): boolean {
-  if (!scoreSelectorState || !isScoreComplete() || isBroadcastPortal()) {
+  if (!scoreSelectorState || !isScoreComplete() || isBroadcastPortal() || isRoomActionLocked()) {
     return false;
   }
 
   if (isAdminPortal()) {
     return true;
   }
+  if (isAwaitingAdminDecision()) return false;
 
   if (settingsState.scoreReportMode !== "team_submit_opponent_confirm" || !portalConfig.side) {
     return false;
@@ -6722,6 +7019,8 @@ function canConfirmScoreSelection(): boolean {
 function canRejectScoreSelection(): boolean {
   return Boolean(
     scoreSelectorState
+      && !isRoomActionLocked()
+      && !isAwaitingAdminDecision()
       && settingsState.scoreReportMode === "team_submit_opponent_confirm"
       && portalConfig.side
       && scoreSelectorState.submittedBy
@@ -7146,6 +7445,10 @@ function getBanConfirmButtonLabel(): string {
     return "确认";
   }
 
+  if (isAwaitingAdminDecision()) {
+    return "等待管理员裁定";
+  }
+
   if (!isAdminPortal() && portalConfig.side !== banSelectorState.activeSide && banSelectorState.step !== "order-choice") {
     return `等待${getTeamName(banSelectorState.activeSide)}操作`;
   }
@@ -7186,8 +7489,12 @@ function getScoreConfirmButtonLabel(): string {
     return "确认比分";
   }
 
+  if (isAwaitingAdminDecision() && !isAdminPortal()) {
+    return "等待管理员裁定";
+  }
+
   if (isAdminPortal()) {
-    return "确认并记录比分";
+    return isAwaitingAdminDecision() ? "管理员裁定并记录比分" : "确认并记录比分";
   }
 
   if (settingsState.scoreReportMode === "admin_only") {
@@ -7210,6 +7517,28 @@ function getHeroesByRole(role: string): HeroCatalogItem[] {
   return mapCatalogState.heroes.filter((hero) => getHeroRoleKey(hero) === roleKey);
 }
 
+function buildHeroPoolFromCatalog(): Record<string, string[]> {
+  const pool: Record<string, string[]> = { tank: [], damage: [], support: [] };
+  mapCatalogState.heroes.forEach((hero) => {
+    const role = getHeroRoleKey(hero);
+    const heroId = getHeroKey(hero.nameEn);
+    if (role in pool && heroId && !pool[role].includes(heroId)) {
+      pool[role].push(heroId);
+    }
+  });
+  return pool;
+}
+
+function applyCatalogHeroPoolDefaults(): void {
+  const heroPool = buildHeroPoolFromCatalog();
+  if (Object.values(heroPool).some((heroes) => heroes.length > 0)) {
+    defaultSettings.heroPool = heroPool;
+    if (!roomConfigState?.value && !currentState) {
+      settingsState.heroPool = structuredClone(heroPool);
+    }
+  }
+}
+
 function toggleScoreTeamPause(side: Side): void {
   if (
     !scoreSelectorState
@@ -7230,7 +7559,6 @@ function toggleScoreTeamPause(side: Side): void {
     teamPause.startedAt = null;
 
     if (!isAnyScoreTeamPaused() && scoreSelectorState.countdownPauseStartedAt !== null) {
-      countdownStartedAt += now - scoreSelectorState.countdownPauseStartedAt;
       scoreSelectorState.countdownPauseStartedAt = null;
     }
   } else {
@@ -7337,6 +7665,11 @@ function getHeroBanAvailability(hero: HeroCatalogItem): MapAvailability {
 
   const heroKey = getHeroKey(hero.nameEn);
   const activeSide = banSelectorState.activeSide;
+  const heroPool = Object.values(settingsState.heroPool ?? {}).flat().map(getHeroKey);
+
+  if (!heroPool.includes(heroKey)) {
+    return { available: false, reason: "该英雄不在本场禁用英雄池" };
+  }
 
   if (hasSideBannedHero(activeSide, heroKey, banSelectorState.mapIndex)) {
     return { available: false, reason: `${getTeamName(activeSide)}本场已禁用过` };
@@ -7472,6 +7805,10 @@ function getMapConfirmButtonLabel(): string {
     return "确认选择";
   }
 
+  if (isAwaitingAdminDecision()) {
+    return "等待管理员裁定";
+  }
+
   if (isBroadcastPortal()) {
     return "直播只读";
   }
@@ -7506,6 +7843,10 @@ function getMapDisabledReason(availability: MapAvailability): string {
 function getLineupConfirmButtonLabel(): string {
   if (!lineupSelectorState) {
     return "确认阵容";
+  }
+
+  if (isAwaitingAdminDecision()) {
+    return "等待管理员裁定";
   }
 
   if (isBroadcastPortal()) {
@@ -7632,82 +7973,44 @@ function resolveSidePolicy(policy: SidePolicy): Side {
 }
 
 function startCountdownTimer(): void {
-  if (countdownTimerId !== null) {
-    window.clearInterval(countdownTimerId);
+  if (countdownTextTimerId !== null) {
+    window.clearTimeout(countdownTextTimerId);
+    countdownTextTimerId = null;
   }
-
-  countdownTimerId = window.setInterval(updateCountdownDom, 50);
+  updateCountdownDom();
 }
 
-function resetCountdown(overrideSeconds?: number): void {
-  const totalSeconds = overrideSeconds ?? getActiveCountdownTotalSeconds();
-  countdownStartSeconds = totalSeconds;
-  countdownStartedAt = Date.now();
-  pauseState = {
-    ...pauseState,
-    startedAt: pauseState.active ? Date.now() : null,
-    totalPausedMs: 0,
-  };
+function renderPrimaryForeground(policy: RoomViewPolicy | null): string {
+  const foreground = policy?.foreground
+    ?? (interactiveRandomState
+      ? "interactive-random"
+      : restState?.open
+        ? "rest"
+        : scoreSelectorState?.open
+          ? "score"
+          : banSelectorState?.open
+            ? "ban"
+            : lineupSelectorState?.open
+              ? "lineup"
+              : sideSelectorState?.open
+                ? "side"
+                : mapSelectorState?.open
+                  ? "map"
+                  : "none");
+  if (foreground === "map") return renderMapSelector();
+  if (foreground === "side") return renderSideSelector();
+  if (foreground === "lineup") return renderLineupSelector();
+  if (foreground === "ban") return renderBanSelector();
+  if (foreground === "score") return renderScoreSelector();
+  if (foreground === "rest") return renderRestOverlay();
+  if (foreground === "interactive-random") return renderInteractiveRandomOverlay();
+  return "";
 }
 
 function getCountdownSnapshot(): { remaining: number; percent: number } {
-  const totalSeconds = getActiveCountdownTotalSeconds();
-  const pausedMs = pauseState.totalPausedMs + (pauseState.active && pauseState.startedAt ? Date.now() - pauseState.startedAt : 0);
-  const scorePausedMs = scoreSelectorState?.countdownPauseStartedAt
-    ? Date.now() - scoreSelectorState.countdownPauseStartedAt
-    : 0;
-  const elapsedSeconds = Math.max(0, Date.now() - countdownStartedAt - pausedMs - scorePausedMs) / 1000;
-  const remaining = Math.max(0, countdownStartSeconds - elapsedSeconds);
-  const percent = (remaining / Math.max(1, countdownStartSeconds || totalSeconds)) * 100;
-
-  return { remaining, percent: Math.max(0, Math.min(100, percent)) };
-}
-
-function getActiveCountdownTotalSeconds(): number {
-  if (interactiveRandomState) {
-    return interactiveRandomState.resolvedSide ? INTERACTIVE_RANDOM_RESULT_SECONDS : 30;
-  }
-
-  if (banSelectorState?.open) {
-    if (banSelectorState.step === "order-choice") {
-      return Math.max(1, settingsState.stageLimits.firstBanChoiceSeconds);
-    }
-
-    return Math.max(
-      1,
-      banSelectorState.step === "first-ban"
-        ? settingsState.stageLimits.firstBanActionSeconds
-        : settingsState.stageLimits.secondBanActionSeconds,
-    );
-  }
-
-  if (lineupSelectorState?.open) {
-    return Math.max(1, settingsState.stageLimits.playerSelectSeconds);
-  }
-
-  if (sideSelectorState?.open) {
-    return Math.max(1, settingsState.stageLimits.mapSelectSeconds);
-  }
-
-  if (scoreSelectorState?.open) {
-    return isScoreConfirmationCounting() ? Math.max(1, settingsState.stageLimits.scoreConfirmSeconds) : 1;
-  }
-
-  if (restState?.open) {
-    const map = currentState?.maps[restState.mapIndex];
-    return Math.max(
-      1,
-      map?.status === "completed"
-        ? settingsState.stageLimits.postMatchRestSeconds
-        : settingsState.stageLimits.preStartRestSeconds,
-    );
-  }
-
-  if (!roomStarted) {
-    return Math.max(1, settingsState.stageLimits.postMatchRestSeconds);
-  }
-
-  return Math.max(1, settingsState.stageLimits.mapSelectSeconds);
+  return authoritativeStore.runtime
+    ? countdownPresentationClock.snapshot(authoritativeStore.runtime)
+    : { remaining: 0, percent: 0 };
 }
 
 function getActiveOverlayKind(): OverlayKind | null {
@@ -7783,58 +8086,110 @@ function getActiveOverlaySummary(kind: OverlayKind): string {
   return "";
 }
 
-function updateCountdownDom(): void {
+function updateCountdownDom(authoritativeMode: "adjust" | "reset" = "reset"): void {
   const { remaining, percent } = getCountdownSnapshot();
+  restartAuthoritativeCountdownAnimation(percent, remaining * 1000, authoritativeMode);
+  scheduleAuthoritativeCountdownText();
+  updateAuthoritativePauseDom();
+  ensurePauseDisplayTimer();
+}
+
+function ensurePauseDisplayTimer(): void {
+  if (pauseDisplayTimerId !== null || (!pauseState.active && !isAnyScoreTeamPaused())) {
+    return;
+  }
+
+  pauseDisplayTimerId = window.setInterval(() => {
+    if (!pauseState.active && !isAnyScoreTeamPaused()) {
+      if (pauseDisplayTimerId !== null) {
+        window.clearInterval(pauseDisplayTimerId);
+        pauseDisplayTimerId = null;
+      }
+      return;
+    }
+
+    updateAuthoritativePauseDom();
+  }, 250);
+}
+
+function isAuthoritativeCountdownRunning(runtime: AuthoritativeRuntime): boolean {
+  return runtime.totalTimeMs > 0
+    && runtime.remainingTimeMs > 0
+    && !runtime.timedOut
+    && !runtime.pause.global.active
+    && !runtime.pause.scoreTeams.left.active
+    && !runtime.pause.scoreTeams.right.active;
+}
+
+function restartAuthoritativeCountdownAnimation(
+  startPercent: number,
+  displayedRemainingMs: number,
+  mode: "adjust" | "reset",
+): void {
+  const runtime = authoritativeStore.runtime;
+  if (!runtime) return;
+  const durationMs = mode === "adjust"
+    ? Math.max(0, runtime.remainingTimeMs)
+    : Math.max(0, displayedRemainingMs);
+  const shouldRun = isAuthoritativeCountdownRunning(runtime) && durationMs > 0;
 
   document
     .querySelectorAll<HTMLElement>(
       ".map-selector-progress, .map-selector-progress-mini, .side-selector-progress, .lineup-selector-progress, .ban-selector-progress, .score-selector-progress, .rest-progress, .interactive-random-progress",
     )
-    .forEach((element) => element.style.setProperty("--progress-width", `${percent}%`));
+    .forEach((element) => {
+      element.classList.remove("countdown-progress-ready");
+      element.style.setProperty("--progress-width", `${startPercent}%`);
+      const bar = element.querySelector<HTMLElement>(".countdown-bar");
+      if (!bar) return;
+      bar.getAnimations().forEach((animation) => animation.cancel());
+      bar.style.width = `${startPercent}%`;
+      if (shouldRun) {
+        bar.animate(
+          [{ width: `${startPercent}%` }, { width: "0%" }],
+          { duration: durationMs, easing: "linear", fill: "forwards" },
+        );
+      }
+    });
+}
 
+function scheduleAuthoritativeCountdownText(): void {
+  if (countdownTextTimerId !== null) {
+    window.clearTimeout(countdownTextTimerId);
+    countdownTextTimerId = null;
+  }
+  const runtime = authoritativeStore.runtime;
+  if (!runtime) return;
+
+  const remainingMs = countdownPresentationClock.snapshot(runtime).remaining * 1000;
   document
     .querySelectorAll<HTMLTimeElement>(".countdown-time")
     .forEach((element) => {
-      element.textContent = formatCountdown(remaining);
+      element.textContent = formatCountdown(remainingMs / 1000);
     });
 
+  if (!isAuthoritativeCountdownRunning(runtime) || remainingMs <= 0) return;
+  const delayMs = countdownPresentationClock.millisecondsUntilNextSecond(runtime);
+  if (delayMs !== null) {
+    countdownTextTimerId = window.setTimeout(
+      scheduleAuthoritativeCountdownText,
+      Math.max(16, delayMs + 5),
+    );
+  }
+}
+
+function updateAuthoritativePauseDom(): void {
   document
     .querySelectorAll<HTMLElement>(".pause-elapsed")
     .forEach((element) => {
       element.textContent = formatElapsedPause();
     });
-
   document
     .querySelectorAll<HTMLElement>(".pause-total-elapsed")
     .forEach((element) => {
       element.textContent = formatGlobalPause();
     });
-
   updateScorePauseDom();
-
-  if (pauseState.active || isAnyScoreTeamPaused()) {
-    return;
-  }
-
-  if (remaining <= 0) {
-    if (interactiveRandomState && !interactiveRandomState.resolvedSide) {
-      finalizeInteractiveRandom(true);
-    } else if (interactiveRandomState?.resolvedSide) {
-      continueAfterInteractiveRandom();
-    } else if (banSelectorState?.open) {
-      handleBanSelectionTimeout();
-    } else if (sideSelectorState?.open) {
-      handleSideSelectionTimeout();
-    } else if (lineupSelectorState?.open) {
-      handleLineupSelectionTimeout();
-    } else if (scoreSelectorState?.open && isScoreConfirmationCounting()) {
-      finalizeScoreSelection();
-    } else if (mapSelectorState?.open) {
-      handleMapSelectionTimeout();
-    } else if (restState?.open) {
-      finishRestPeriod();
-    }
-  }
 }
 
 function updateSelectedMapDom(): void {
@@ -7868,112 +8223,6 @@ function updateSelectedMapDom(): void {
   });
 }
 
-function handleBanSelectionTimeout(): void {
-  if (!banSelectorState || banSelectorState.timedOut || isBroadcastPortal()) {
-    return;
-  }
-
-  const canOperateCurrentStep =
-    banSelectorState.step === "order-choice" ? canOperateBanOrderChoice() : canOperateHeroBan();
-
-  if (!canOperateCurrentStep) {
-    return;
-  }
-
-  if (banSelectorState.step === "order-choice") {
-    banSelectorState.selectedOrder = pickRandomItem<BanOrderChoice>(["first", "second"]);
-    confirmBanSelection({ selectionSource: "timeout_random" });
-    return;
-  }
-
-  if (settingsState.banTimeoutPolicy === "warn_extend_30") {
-    extendBanChoiceTime(true);
-  } else if (settingsState.banTimeoutPolicy === "random_legal_ban") {
-    randomLegalBanChoice(true);
-  } else if (settingsState.banTimeoutPolicy === "forfeit_map") {
-    forfeitCurrentBanChoice(true);
-  } else {
-    banSelectorState.timedOut = true;
-    publishSharedRoomSnapshot(createRoomOperation("ban", "timed_out", {
-      mapIndex: banSelectorState.mapIndex,
-      step: banSelectorState.step,
-      side: banSelectorState.activeSide,
-    }));
-    renderCurrent();
-  }
-}
-
-function handleMapSelectionTimeout(): void {
-  if (!mapSelectorState || mapSelectorState.timedOut || isBroadcastPortal() || !canOperateMapSelection()) {
-    return;
-  }
-
-  if (settingsState.mapTimeoutPolicy === "warn_extend_30") {
-    extendMapChoiceTime(true);
-  } else if (settingsState.mapTimeoutPolicy === "random_legal_map") {
-    randomLegalMapChoice(true);
-  } else if (settingsState.mapTimeoutPolicy === "forfeit_map") {
-    forfeitCurrentMapChoice(true);
-  } else {
-    mapSelectorState.timedOut = true;
-    publishSharedRoomSnapshot(createRoomOperation("map", "timed_out", {
-      mapIndex: mapSelectorState.targetMapIndex,
-      side: mapSelectorState.pickerSide,
-    }));
-    renderCurrent();
-  }
-}
-
-function handleLineupSelectionTimeout(): void {
-  if (!lineupSelectorState || isBroadcastPortal()) {
-    return;
-  }
-
-  if (lineupSelectorState.timedOut && (lineupSelectorState.ready.left || lineupSelectorState.ready.right)) {
-    return;
-  }
-
-  if (isLineupReadyToFinalize()) {
-    finalizeLineupSelection();
-    return;
-  }
-
-  const readySides = (["left", "right"] as Side[]).filter((side) => lineupSelectorState!.ready[side]);
-
-  if (readySides.length === 0) {
-    const mapIndex = lineupSelectorState.mapIndex;
-    lineupSelectorState.values = createInitialLineupValues();
-    lineupSelectorState.ready = createLineupReadyState();
-    lineupSelectorState.timedOut = false;
-    selectionConfirmationState = null;
-    adminNotice = "双方均未确认上场成员，已清空本轮输入并重新开始完整选人计时。";
-    resetCountdown(settingsState.stageLimits.playerSelectSeconds);
-    publishSharedRoomSnapshot(createRoomOperation("lineup", "both_sides_restarted", {
-      mapIndex,
-      seconds: settingsState.stageLimits.playerSelectSeconds,
-    }));
-    renderCurrent();
-    return;
-  }
-
-  if (settingsState.lineupTimeoutPolicy === "warn_extend_30") {
-    extendLineupChoiceTime();
-    return;
-  }
-
-  if (settingsState.lineupTimeoutPolicy === "forfeit_map") {
-    forfeitIncompleteLineup();
-    return;
-  }
-
-  lineupSelectorState.timedOut = true;
-  publishSharedRoomSnapshot(createRoomOperation("lineup", "timed_out", {
-    mapIndex: lineupSelectorState.mapIndex,
-    incompleteSide: lineupSelectorState.ready.left ? "right" : "left",
-  }));
-  renderCurrent();
-}
-
 function extendLineupChoiceTime(): void {
   if (!lineupSelectorState) {
     return;
@@ -7981,7 +8230,6 @@ function extendLineupChoiceTime(): void {
 
   lineupSelectorState.timedOut = false;
   adminNotice = "未完成方已被警告，并获得额外30秒选人时间。";
-  resetCountdown(30);
   publishSharedRoomSnapshot(createRoomOperation("lineup", "timeout_extended", {
     mapIndex: lineupSelectorState.mapIndex,
     seconds: 30,
@@ -8006,7 +8254,6 @@ function forfeitIncompleteLineup(): void {
     lineupSelectorState.values = createInitialLineupValues();
     lineupSelectorState.ready = createLineupReadyState();
     lineupSelectorState.timedOut = false;
-    resetCountdown(settingsState.stageLimits.playerSelectSeconds);
     publishSharedRoomSnapshot(createRoomOperation("lineup", "both_sides_restarted", {
       mapIndex: lineupSelectorState.mapIndex,
       seconds: settingsState.stageLimits.playerSelectSeconds,
@@ -8020,13 +8267,11 @@ function forfeitIncompleteLineup(): void {
   lineupSelectorState = null;
   selectionConfirmationState = null;
   if (finishMatchIfSeriesWon()) {
-    resetCountdown();
     publishSharedRoomSnapshot(createRoomOperation("lineup", "forfeited", { mapIndex, loserSide, matchFinished: true }));
     renderCurrent();
     return;
   }
   openRestPeriod(mapIndex);
-  resetCountdown();
   publishSharedRoomSnapshot(createRoomOperation("lineup", "forfeited", { mapIndex, loserSide, matchFinished: false }));
   renderCurrent();
 }
@@ -8041,12 +8286,6 @@ function formatCountdown(seconds: number): string {
 
 function toggleGlobalPause(): void {
   if (!isAdminPortal()) {
-    return;
-  }
-
-  if (!pauseState.active && isAnyScoreTeamPaused()) {
-    adminNotice = "请先结束队伍暂停，再使用全局暂停。";
-    renderCurrent();
     return;
   }
 

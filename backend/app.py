@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 import unicodedata
@@ -29,6 +30,23 @@ except ModuleNotFoundError:  # Support `python backend/app.py` from the reposito
         MatchConfigValidationError,
         default_match_config,
         normalize_match_config,
+    )
+
+try:
+    from backend.room_engine import RoomSession, RoomStateRegistry, StateActionError
+    from backend.state_models import (
+        StateValidationError,
+        default_config,
+        hero_pool_from_catalog,
+        normalize_config,
+    )
+except ModuleNotFoundError:  # Support `python backend/app.py` from the repository root.
+    from room_engine import RoomSession, RoomStateRegistry, StateActionError  # type: ignore[no-redef]
+    from state_models import (  # type: ignore[no-redef]
+        StateValidationError,
+        default_config,
+        hero_pool_from_catalog,
+        normalize_config,
     )
 
 
@@ -90,6 +108,7 @@ DEFAULT_GLOBAL_SETTINGS = {
 }
 room_store_lock = threading.Lock()
 catalog_refresh_lock = threading.Lock()
+authoritative_rooms = RoomStateRegistry()
 catalog_refresh_jobs: dict[str, dict[str, Any]] = {}
 active_catalog_refresh_job_id: str | None = None
 
@@ -228,7 +247,7 @@ def create_app() -> Flask:
                 return jsonify({"error": "not_found"}), 404
             try:
                 preset = save_config_preset(payload, replace=False)
-            except MatchConfigValidationError as exc:
+            except (MatchConfigValidationError, StateValidationError) as exc:
                 return jsonify({"error": "invalid_config", "details": exc.errors}), 400
             except FileExistsError:
                 return jsonify({"error": "already_exists"}), 409
@@ -246,7 +265,7 @@ def create_app() -> Flask:
                 return jsonify({"error": "not_found"}), 404
             try:
                 preset = save_config_preset(payload, replace=True)
-            except MatchConfigValidationError as exc:
+            except (MatchConfigValidationError, StateValidationError) as exc:
                 return jsonify({"error": "invalid_config", "details": exc.errors}), 400
             except FileNotFoundError:
                 return jsonify({"error": "not_found"}), 404
@@ -260,6 +279,11 @@ def create_app() -> Flask:
             store = load_room_store_unlocked()
             if not is_admin_hash_valid_unlocked(store, admin_hash):
                 return jsonify({"error": "not_found"}), 404
+            if store.get("globalSettings", {}).get("defaultPresetId") == preset_id:
+                return jsonify({
+                    "error": "active_default_preset",
+                    "message": "当前默认模板不能删除，请先切换新房间默认模板",
+                }), 409
             path = get_config_preset_path(preset_id)
             if path is None or not path.exists():
                 return jsonify({"error": "not_found"}), 404
@@ -296,6 +320,7 @@ def create_app() -> Flask:
             except Exception:
                 rollback_created_room_unlocked(store, room)
                 raise
+            register_authoritative_room_unlocked(room)
 
         return jsonify(format_created_room(room))
 
@@ -320,6 +345,7 @@ def create_app() -> Flask:
             except Exception:
                 rollback_created_room_unlocked(store, room)
                 raise
+            register_authoritative_room_unlocked(room)
 
         return jsonify(format_created_room(room))
 
@@ -348,7 +374,90 @@ def create_app() -> Flask:
             store.get("globalSettings", {}).get("notificationDurationSeconds"),
         ))
 
-    @app.post("/api/rooms/token/<room_token>/presence")
+    @app.post("/api/rooms/token/<room_token>/sync")
+    def sync_authoritative_room(room_token: str) -> Any:
+        resolved = resolve_authoritative_session(room_token)
+        if resolved is None:
+            with room_store_lock:
+                if is_archived_token_unlocked(room_token):
+                    return jsonify({"error": "closed"}), 410
+            return jsonify({"error": "not_found"}), 404
+        session, portal_code = resolved
+        payload = request.get_json(silent=True) or {}
+        client = payload.get("status") if isinstance(payload.get("status"), dict) else None
+        notification_cursor = payload.get("notificationCursor")
+        if isinstance(notification_cursor, bool) or not isinstance(notification_cursor, int):
+            notification_cursor = None
+        return jsonify(session.heartbeat(portal_code, client, notification_cursor))
+
+    @app.post("/api/rooms/token/<room_token>/actions")
+    def apply_authoritative_action(room_token: str) -> Any:
+        resolved = resolve_authoritative_session(room_token)
+        if resolved is None:
+            return jsonify({"error": "not_found"}), 404
+        session, portal_code = resolved
+        payload = request.get_json(silent=True) or {}
+        action_type = payload.get("type")
+        details = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        expected = payload.get("expected") if isinstance(payload.get("expected"), dict) else None
+        request_id = payload.get("requestId")
+        notification_cursor = payload.get("notificationCursor")
+        if isinstance(notification_cursor, bool) or not isinstance(notification_cursor, int):
+            notification_cursor = None
+        if not isinstance(action_type, str) or not isinstance(request_id, str):
+            return jsonify({"error": "invalid_action"}), 400
+        try:
+            result = session.apply_action(
+                portal_code,
+                action_type,
+                details,
+                expected,
+                request_id,
+                notification_cursor,
+            )
+        except StateActionError as exc:
+            body: dict[str, Any] = {"error": exc.code, "message": exc.message}
+            if exc.code == "stale_status":
+                body.update(session.response(
+                    notification_cursor=notification_cursor,
+                    force_full=True,
+                ))
+            return jsonify(body), exc.status_code
+        touch_authoritative_room(room_token)
+        return jsonify(result)
+
+    @app.get("/api/rooms/token/<room_token>/status-history")
+    def get_authoritative_history(room_token: str) -> Any:
+        resolved = resolve_authoritative_session(room_token)
+        if resolved is None:
+            return jsonify({"error": "not_found"}), 404
+        session, portal_code = resolved
+        if portal_code != "C":
+            return jsonify({"error": "forbidden"}), 403
+        return jsonify({"items": session.history_summary()})
+
+    @app.post("/api/rooms/token/<room_token>/rollback")
+    def rollback_authoritative_status(room_token: str) -> Any:
+        resolved = resolve_authoritative_session(room_token)
+        if resolved is None:
+            return jsonify({"error": "not_found"}), 404
+        session, portal_code = resolved
+        if portal_code != "C":
+            return jsonify({"error": "forbidden"}), 403
+        payload = request.get_json(silent=True) or {}
+        revision = payload.get("revision")
+        notification_cursor = payload.get("notificationCursor")
+        if isinstance(notification_cursor, bool) or not isinstance(notification_cursor, int):
+            notification_cursor = None
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            return jsonify({"error": "invalid_revision"}), 400
+        try:
+            result = session.rollback(revision, notification_cursor)
+        except StateActionError as exc:
+            return jsonify({"error": exc.code, "message": exc.message}), exc.status_code
+        touch_authoritative_room(room_token)
+        return jsonify(result)
+
     def update_room_presence(room_token: str) -> Any:
         payload = request.get_json(silent=True) or {}
         requested_ready = payload.get("ready")
@@ -442,7 +551,6 @@ def create_app() -> Flask:
 
         return jsonify(response)
 
-    @app.put("/api/rooms/token/<room_token>/team-name")
     def update_own_team_name(room_token: str) -> Any:
         payload = request.get_json(silent=True) or {}
         name = payload.get("name")
@@ -509,6 +617,13 @@ def create_app() -> Flask:
 
     @app.get("/api/rooms/token/<room_token>/config")
     def get_room_config(room_token: str) -> Any:
+        resolved = resolve_authoritative_session(room_token)
+        if resolved is None:
+            return jsonify({"error": "not_found"}), 404
+        session, _portal_code = resolved
+        return jsonify(format_authoritative_config(session))
+
+        # Legacy implementation retained as unreachable reference during the UI migration.
         with room_store_lock:
             store = load_room_store_unlocked()
             lookup = find_room_by_token_unlocked(store, room_token)
@@ -522,6 +637,22 @@ def create_app() -> Flask:
     @app.put("/api/rooms/token/<room_token>/config")
     def update_room_config(room_token: str) -> Any:
         payload = request.get_json(silent=True) or {}
+        resolved = resolve_authoritative_session(room_token)
+        if resolved is None:
+            return jsonify({"error": "not_found"}), 404
+        session, portal_code = resolved
+        if portal_code != "C":
+            return jsonify({"error": "forbidden"}), 403
+        try:
+            session.update_config(payload.get("config", payload))
+        except StateValidationError as exc:
+            return jsonify({"error": "invalid_config", "details": exc.errors}), 400
+        except StateActionError as exc:
+            return jsonify({"error": exc.code, "message": exc.message}), exc.status_code
+        touch_authoritative_room(room_token)
+        return jsonify(format_authoritative_config(session))
+
+        # Legacy implementation retained as unreachable reference during the UI migration.
         with room_store_lock:
             store = load_room_store_unlocked()
             lookup = find_room_by_token_unlocked(store, room_token)
@@ -555,6 +686,31 @@ def create_app() -> Flask:
     def apply_room_config_preset(room_token: str) -> Any:
         payload = request.get_json(silent=True) or {}
         preset_id = str(payload.get("presetId") or "")
+        resolved = resolve_authoritative_session(room_token)
+        if resolved is None:
+            return jsonify({"error": "not_found"}), 404
+        session, portal_code = resolved
+        if portal_code != "C":
+            return jsonify({"error": "forbidden"}), 403
+        with room_store_lock:
+            preset = load_config_preset(preset_id)
+        if preset is None:
+            return jsonify({"error": "not_found"}), 404
+        try:
+            session.update_config(preset["config"])
+        except (StateValidationError, StateActionError) as exc:
+            if isinstance(exc, StateValidationError):
+                return jsonify({"error": "invalid_config", "details": exc.errors}), 400
+            return jsonify({"error": exc.code, "message": exc.message}), exc.status_code
+        touch_authoritative_room(room_token)
+        return jsonify(format_authoritative_config(session, {
+            "type": "preset",
+            "presetId": preset["id"],
+            "presetName": preset["name"],
+            "presetRevision": preset["revision"],
+        }))
+
+        # Legacy implementation retained as unreachable reference during the UI migration.
         with room_store_lock:
             store = load_room_store_unlocked()
             lookup = find_room_by_token_unlocked(store, room_token)
@@ -585,7 +741,6 @@ def create_app() -> Flask:
             save_room_store_unlocked(store)
             return jsonify(config_state)
 
-    @app.post("/api/rooms/token/<room_token>/config/confirm")
     def confirm_room_config(room_token: str) -> Any:
         with room_store_lock:
             store = load_room_store_unlocked()
@@ -608,7 +763,6 @@ def create_app() -> Flask:
             save_room_store_unlocked(store)
             return jsonify(config_state)
 
-    @app.post("/api/rooms/token/<room_token>/start")
     def start_room(room_token: str) -> Any:
         payload = request.get_json(silent=True) or {}
         force_start = payload.get("force") is True
@@ -639,7 +793,6 @@ def create_app() -> Flask:
             save_room_store_unlocked(store)
             return jsonify({"ok": True, "config": config_state, "version": room.get("version", 0)})
 
-    @app.post("/api/rooms/token/<room_token>/rollback-to-config")
     def rollback_room_to_config(room_token: str) -> Any:
         with room_store_lock:
             store = load_room_store_unlocked()
@@ -671,7 +824,6 @@ def create_app() -> Flask:
             save_room_store_unlocked(store)
             return jsonify({"ok": True, "config": config_state, "version": next_version})
 
-    @app.get("/api/rooms/token/<room_token>/snapshot")
     def get_room_snapshot(room_token: str) -> Any:
         with room_store_lock:
             store = load_room_store_unlocked()
@@ -701,7 +853,6 @@ def create_app() -> Flask:
             ),
         })
 
-    @app.put("/api/rooms/token/<room_token>/snapshot")
     def update_room_snapshot(room_token: str) -> Any:
         payload = request.get_json(silent=True) or {}
         expected_version = payload.get("version")
@@ -1067,7 +1218,11 @@ def save_config_preset(payload: Any, *, replace: bool) -> dict[str, Any]:
         raise FileExistsError(preset_id)
     if existing is None and replace:
         raise FileNotFoundError(preset_id)
-    normalized = normalize_match_config(payload.get("config", payload), load_assets().get("maps", {}))
+    normalized = normalize_config(
+        payload.get("config", payload),
+        accept_legacy=True,
+        hero_pool=current_hero_pool(),
+    )
     now = current_timestamp()
     preset = {
         "schemaVersion": 1,
@@ -1084,10 +1239,15 @@ def save_config_preset(payload: Any, *, replace: bool) -> dict[str, Any]:
 
 
 def build_room_config(value: Any = None, source: dict[str, Any] | None = None) -> dict[str, Any]:
+    hero_pool = current_hero_pool()
     try:
-        normalized = normalize_match_config(value if isinstance(value, dict) else {}, load_assets().get("maps", {}))
-    except MatchConfigValidationError:
-        normalized = default_match_config()
+        normalized = normalize_config(
+            value if isinstance(value, dict) else {},
+            accept_legacy=True,
+            hero_pool=hero_pool,
+        )
+    except StateValidationError:
+        normalized = default_config(hero_pool)
     return {
         "status": "draft",
         "revision": 1,
@@ -1208,7 +1368,7 @@ def migrate_legacy_config_presets_unlocked(store: dict[str, Any]) -> None:
                     replace=False,
                 )
                 existing_ids.add(preset_id)
-            except (ValueError, MatchConfigValidationError, FileExistsError):
+            except (ValueError, MatchConfigValidationError, StateValidationError, FileExistsError):
                 continue
 
     global_settings = store.setdefault("globalSettings", dict(DEFAULT_GLOBAL_SETTINGS))
@@ -1222,21 +1382,55 @@ def migrate_legacy_config_presets_unlocked(store: dict[str, Any]) -> None:
                     replace=False,
                 )
             global_settings["defaultPresetId"] = preset_id
-        except (ValueError, MatchConfigValidationError, FileExistsError):
+        except (ValueError, MatchConfigValidationError, StateValidationError, FileExistsError):
             pass
+
+
+def migrate_authoritative_config_presets_unlocked() -> None:
+    """One-way preset migration; the original JSON is retained beside the new file."""
+    for path in CONFIG_PRESETS_DIR.glob("*.json"):
+        if ".legacy-v" in path.name:
+            continue
+        try:
+            with path.open(encoding="utf-8") as file:
+                preset = json.load(file)
+            if not isinstance(preset, dict) or not isinstance(preset.get("config"), dict):
+                continue
+            config = preset["config"]
+            if config.get("schemaVersion") == 1 and "drawMapReserve" in config and "lineupSlots" in config:
+                continue
+            normalized = normalize_config(
+                config,
+                accept_legacy=True,
+                hero_pool=current_hero_pool(),
+            )
+            backup = path.with_name(f"{path.stem}.legacy-v0.json")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+            preset["schemaVersion"] = 2
+            preset["config"] = normalized
+            preset["migration"] = {"from": "legacy", "usedCanonicalDefaults": True}
+            save_json_atomic(path, preset)
+        except (OSError, json.JSONDecodeError, StateValidationError):
+            continue
 
 
 def initialize_room_store() -> None:
     with room_store_lock:
+        authoritative_rooms.clear()
         ROOM_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
         rebuild_history_index_unlocked()
         store = load_room_store_unlocked()
         migrate_legacy_config_presets_unlocked(store)
+        migrate_authoritative_config_presets_unlocked()
         for room in store.get("rooms", []):
             ensure_room_config_unlocked(room)
         reconcile_active_rooms_unlocked(store)
-        cleanup_inactive_rooms_unlocked(store, current_timestamp())
+        now = current_timestamp()
+        for room in list(store.get("rooms", [])):
+            close_room_unlocked(room, now, "server_restart")
+        store["rooms"] = []
         save_room_store_unlocked(store)
         print(f"Unlimited room creation URL: /r/{unlimited_create_hash()}")
         print(f"Admin manage URL: /admin/{store['adminHash']}")
@@ -1331,6 +1525,7 @@ def create_room_record_unlocked(store: dict[str, Any], now: int) -> dict[str, An
 
 def rollback_created_room_unlocked(store: dict[str, Any], room: dict[str, Any]) -> None:
     store["rooms"] = [entry for entry in store.get("rooms", []) if entry is not room]
+    authoritative_rooms.remove(str(room.get("id") or ""))
     archive_key = str(room.get("archiveKey") or "")
     history_path = get_history_path(archive_key)
 
@@ -1911,6 +2106,7 @@ def close_room_unlocked(room: dict[str, Any], now: int, reason: str) -> None:
         return
 
     is_manual = reason == "manual"
+    is_closed = reason in {"manual", "server_restart"}
     append_room_history_unlocked(
         room,
         now,
@@ -1923,14 +2119,15 @@ def close_room_unlocked(room: dict[str, Any], now: int, reason: str) -> None:
         ),
         {
             "category": "lifecycle",
-            "action": "closed" if is_manual else "expired",
+            "action": "closed" if is_closed else "expired",
             "details": {"reason": reason},
         },
-        status="closed" if is_manual else "expired",
+        status="closed" if is_closed else "expired",
         closed_at=now,
         close_reason=reason,
         last_active_at=int(room.get("lastActiveAt") or room.get("createdAt") or now),
     )
+    authoritative_rooms.remove(str(room.get("id") or ""))
 
 
 def get_history_path(archive_key: str) -> Path | None:
@@ -2140,7 +2337,12 @@ def cleanup_inactive_rooms_unlocked(store: dict[str, Any], now: int) -> bool:
 
         last_active = int(room.get("lastActiveAt") or room.get("createdAt") or now)
 
-        if now - last_active > timeout_seconds:
+        session = authoritative_rooms.get(str(room.get("id") or ""))
+        has_live_portal = bool(
+            session
+            and session.has_live_presence()
+        )
+        if now - last_active > timeout_seconds and not has_live_portal:
             close_room_unlocked(room, now, "inactive_timeout")
             changed = True
             continue
@@ -2169,6 +2371,39 @@ def find_room_by_token_unlocked(store: dict[str, Any], token: str) -> tuple[dict
                 return room, portal_code
 
     return None
+
+
+def register_authoritative_room_unlocked(room: dict[str, Any]) -> RoomSession:
+    room_id = str(room.get("id") or "")
+    existing = authoritative_rooms.get(room_id)
+    if existing is not None:
+        return existing
+    config_state = ensure_room_config_unlocked(room)
+    assets = load_assets()
+    catalog_hash = catalog_data.compute_catalog_hash(assets)
+    return authoritative_rooms.create(
+        room_id,
+        {str(code): str(token) for code, token in (room.get("tokens") or {}).items()},
+        config_state.get("value") if isinstance(config_state.get("value"), dict) else default_config(),
+        catalog_hash,
+    )
+
+
+def resolve_authoritative_session(token: str) -> tuple[RoomSession, str] | None:
+    if not SHORT_CODE_PATTERN.fullmatch(token):
+        return None
+    return authoritative_rooms.resolve(token)
+
+
+def touch_authoritative_room(token: str) -> None:
+    with room_store_lock:
+        store = load_room_store_unlocked()
+        lookup = find_room_by_token_unlocked(store, token)
+        if lookup is None:
+            return
+        room, _portal = lookup
+        touch_room_unlocked(room, current_timestamp())
+        save_room_store_unlocked(store)
 
 
 def is_archived_token_unlocked(token: str) -> bool:
@@ -2217,6 +2452,7 @@ def format_room_token_payload(
     room: dict[str, Any], portal_code: str, notification_duration_seconds: Any = None
 ) -> dict[str, Any]:
     config_state = ensure_room_config_unlocked(room)
+    session = register_authoritative_room_unlocked(room)
     return {
         "room": {
             "id": room.get("id"),
@@ -2234,8 +2470,19 @@ def format_room_token_payload(
             300,
             DEFAULT_GLOBAL_SETTINGS["notificationDurationSeconds"],
         ),
-        "version": room.get("version", 0),
-        "snapshot": room.get("snapshot"),
+        "authoritativeState": session.response(force_full=True),
+    }
+
+
+def format_authoritative_config(session: RoomSession, source: dict[str, Any] | None = None) -> dict[str, Any]:
+    phase = session.status.phase["type"]
+    return {
+        "status": "draft" if phase == "configuring" else "ready" if phase == "waiting_ready" else "locked",
+        "revision": session.status.revision,
+        "source": source or {"type": "manual"},
+        "value": deepcopy(session.status.config),
+        "confirmedAt": None,
+        "lockedAt": None,
     }
 
 
@@ -2485,6 +2732,10 @@ def load_assets() -> dict[str, Any]:
         payload = json.load(file)
 
     return {"maps": payload.get("maps", {}), "modeIcons": {}, "heroes": []}
+
+
+def current_hero_pool() -> dict[str, list[str]]:
+    return hero_pool_from_catalog(load_assets().get("heroes", []))
 
 
 def map_catalog(assets: dict[str, Any]) -> dict[str, dict[str, str]]:

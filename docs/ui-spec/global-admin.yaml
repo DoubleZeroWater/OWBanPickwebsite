@@ -1,0 +1,1005 @@
+schemaVersion: 1
+kind: global-admin-ui-spec
+title: 全局管理员页面配置与交互规范
+status: confirmed-product-specification
+sources:
+  - frontend/src/main.ts
+  - backend/app.py
+  - backend/match_config.py
+  - static/config/match-config.schema.json
+
+access:
+  routeMode: global-admin
+  credential: URL 中的全局管理哈希
+  allowedRoles:
+    - global-admin
+  states:
+    missingHash:
+      page: error
+      message: 缺少全局管理哈希。
+    invalidHash:
+      page: error
+      message: 全局管理入口不存在。
+    validHash:
+      page: global-admin
+  roomAdminCanAccess: false
+  teamCanAccess: false
+  broadcastCanAccess: false
+
+pageSections:
+  order:
+    - general-settings
+    - catalog-maintenance
+    - config-presets
+    - active-rooms
+    - room-history
+  globalFeedback:
+    position: page-heading-below
+    persistence: until-next-render
+    purpose: 保存、删除、导入和后台任务结果
+  nativeDialogPolicy:
+    allowedWhen: 全局管理员正在创建、修改、导入或删除网站配置及配置模板
+    forbiddenWhen:
+      - 关闭活动房间
+      - 房间内比赛操作
+      - 普通比赛结果或错误反馈
+
+generalSettings:
+  title: 常规设置
+  description: 创建房间时使用的全局规则
+  controls:
+    roomsPerHour:
+      elementId: adminRoomsPerHour
+      label: 每 IP 每小时创建数
+      type: integer
+      unit: rooms
+      visibleWhen: always
+      enabledWhen: always
+      inputConstraint:
+        minimum: 1
+        maximum: 500
+        step: 1
+      serverBehavior:
+        invalidOrOutOfRange: clamp-to-1-500
+      effect: 限制单个 IP 地址每小时最多可以创建的房间数量
+
+    inactiveTimeoutMinutes:
+      elementId: adminInactiveTimeout
+      label: 不活跃关闭分钟数
+      type: integer
+      unit: minutes
+      visibleWhen: always
+      enabledWhen: always
+      inputConstraint:
+        minimum: 1
+        maximum: 43200
+        step: 1
+      serverBehavior:
+        invalidOrOutOfRange: clamp-to-1-43200
+      effect: 房间在指定分钟内没有活动时自动关闭并归档
+
+    notificationDurationSeconds:
+      elementId: adminNotificationDuration
+      label: 关键节点提示秒数
+      type: integer
+      unit: seconds
+      visibleWhen: always
+      enabledWhen: always
+      inputConstraint:
+        minimum: 1
+        maximum: 300
+        step: 1
+      serverBehavior:
+        invalidOrOutOfRange: clamp-to-1-300
+      effect: 控制房间页面右上角比赛动态提示的自动关闭时间
+
+    defaultPresetId:
+      elementId: adminDefaultPreset
+      label: 新房间默认模板
+      type: select
+      visibleWhen: always
+      enabledWhen: always
+      options:
+        - value: null
+          label: 网站内置默认配置
+        - valueSource: configPresets[].id
+          labelSource: configPresets[].name
+      invalidSelection:
+        serverResult: preset_not_found
+        saveRejected: true
+      effect: 新建房间时复制所选模板；之后房间配置与模板相互独立
+
+  actions:
+    save:
+      elementId: saveGlobalSettings
+      label: 保存全局设置
+      visibleWhen: always
+      enabledWhen: always
+      successMessage: 全局设置已保存。
+      successTimestamp: hidden
+      pendingPresentation: none
+      failure:
+        preserveAllInputs: true
+        showServerMessage: true
+        retryButton:
+          visible: true
+          label: 重试
+
+catalogMaintenance:
+  title: 英雄与地图数据
+  summary:
+    fields:
+      - currentCatalogSource
+      - modeCount
+      - heroCount
+      - mapCount
+      - updatedAt
+      - displayLanguage
+    catalogSources:
+      runtime: 管理员爬取数据
+      bundled: 内置数据
+    displayLanguage:
+      whenTranslationValid: 中文映射有效
+      whenTranslationInvalid: 映射不匹配，当前全英文
+
+  translationDiagnostics:
+    valid:
+      display: 目录哈希、键集合和全部中文值均匹配。
+    invalid:
+      display: expandable-details
+      categories:
+        - formatVersionMismatch
+        - catalogHashMismatch
+        - fieldTypeErrors
+        - missingModeKeys
+        - extraModeKeys
+        - blankModeValues
+        - missingMapKeys
+        - extraMapKeys
+        - blankMapValues
+        - missingHeroKeys
+        - extraHeroKeys
+        - blankHeroValues
+
+  controls:
+    refreshEnglishCatalog:
+      elementId: refreshEnglishCatalog
+      label:
+        idle: 爬取英文更新
+        queuedOrRunning: 正在爬取...
+      visibleWhen: catalogMaintenance.loaded
+      enabledWhen: job.status not-in [queued, running]
+      disabledWhen: job.status in [queued, running]
+      progress:
+        visibleWhen: job.status in [queued, running]
+        fields:
+          - percentage
+          - job.message
+      success:
+        message: 英文目录更新完成，映射模板已生成。
+        nextUI:
+          - 打开英文到中文映射模板对话框
+          - 尝试自动复制 JSON
+      failure:
+        preservePreviousCatalog: true
+
+    openCatalogTranslation:
+      elementId: openCatalogTranslation
+      label: 更新中文映射
+      visibleWhen: catalogMaintenance.loaded
+      enabledWhen: always
+      opens: catalogTranslationDialog
+
+    saveCatalogTranslation:
+      elementId: saveCatalogTranslation
+      label: 保存映射
+      type: json-object-submit
+      visibleWhen: catalogTranslationDialog.open
+      enabledWhen: request.notPending
+      disabledWhen: request.pending
+      clientValidation:
+        - 必须是有效 JSON
+        - JSON 根节点必须是对象，不能是数组或 null
+      invalidJson:
+        message: JSON 格式错误，旧映射未被覆盖。
+        overwriteOldTranslation: false
+      catalogMismatch:
+        saveAllowed: true
+        activateTranslation: false
+        siteLanguage: English
+        message: 中文映射已保存，但与当前目录不匹配；网站现统一显示英文。
+      validMapping:
+        activateTranslation: true
+        message: 中文映射已保存并启用。
+
+    copyGeneratedTranslationTemplate:
+      elementId: copyCatalogTemplate
+      label: 手动复制
+      visibleWhen: catalogTemplateDialog.open
+      enabledWhen: always
+      clipboardDenied:
+        fallback:
+          - 聚焦并全选 textarea
+          - 提示用户按 Ctrl+C
+
+configPresets:
+  title: 默认配置模板
+  description: 为新房间保存可重复使用的完整比赛配置
+
+  list:
+    emptyState: 暂无模板，可新建模板或导入完整 JSON。
+    itemFields:
+      - name
+      - revision
+      - updatedAt
+    itemActions:
+      edit:
+        label: GUI 编辑
+        enabledWhen: always
+        result: 打开所选模板编辑器
+      copyJson:
+        label: 复制 JSON
+        enabledWhen: browser.clipboard.available
+        disabledBehavior: 当前实现直接不执行，无错误提示
+      delete:
+        label: 删除
+        enabledWhen: preset.id != generalSettings.defaultPresetId
+        disabledWhen: preset.id == generalSettings.defaultPresetId
+        disabledReason: 请先将新房间默认模板切换为网站内置默认配置或其他模板
+        confirmationRequired: true
+        confirmationTextTemplate: 确认删除模板 {presetId}？已复制到房间的配置不会受影响。
+        effects:
+          existingRoomsChanged: false
+          selectedEditorClosed: true
+        currentDefaultPresetHandling:
+          deleteAllowed: false
+          serverRejection: 409 active_default_preset
+          globalDefaultPresetIdAutomaticallyCleared: false
+
+  toolbar:
+    newPreset:
+      elementId: newConfigPreset
+      label: 新建模板
+      enabledWhen: always
+      initializesFrom: website-built-in-default
+      opens: preset-gui-editor
+    toggleJsonImport:
+      elementId: showPresetJsonImport
+      label: 粘贴 JSON 导入
+      enabledWhen: always
+      behavior: toggle-import-panel
+    viewExample:
+      label: 查看完整示例
+      enabledWhen: always
+      target: /docs/config/match-config.example.json
+
+  jsonImport:
+    panelVisibleWhen: user.toggledImportPanel
+    input:
+      type: textarea
+      format: match-config JSON
+    action:
+      elementId: importGlobalPresetJson
+      label: 校验并导入
+      enabledWhen: always
+    clientValidation:
+      - 必须是有效 JSON
+    serverValidation:
+      - 必须符合完整模板结构
+      - 模板和 config 字段必须通过 backend/match_config.py 校验
+    existingId:
+      confirmationRequired: true
+      confirmedResult: overwrite-existing-preset
+      cancelledResult: no-change
+    newId:
+      result: create-preset
+
+  guiEditor:
+    visibleWhen: selectedPresetId != null
+    modes:
+      new:
+        condition: selectedPresetId == __new__
+        heading: 新建配置模板
+        state: 未保存
+      edit:
+        condition: selectedPresetId matches existing preset
+        heading: 编辑配置模板
+        initializesFrom: selected-preset
+    sectionExpansion:
+      globalAdminPage: all-config-sections-open
+    actions:
+      save:
+        elementId: saveGlobalPreset
+        label: 保存模板
+        enabledWhen: always
+        behavior:
+          existingPreset: update
+          newPreset: create
+        validationOrder:
+          - read-current-form
+          - run-client-cross-field-validation
+          - run-server-complete-validation
+      cancel:
+        elementId: cancelGlobalPresetEdit
+        label: 取消
+        enabledWhen: always
+        unsavedChangeConfirmation: true
+        confirmationText: 放弃未保存的修改？
+        confirmedResult: close-editor-and-discard-local-draft
+        cancelledResult: keep-editor-and-local-draft
+    dirtyState:
+      becomesDirtyWhen: 任一模板字段相对打开时的初始值发生变化
+      guardedActions:
+        - cancel-editor
+        - switch-preset
+        - create-new-preset
+        - import-preset
+        - leave-page
+      clearedWhen:
+        - save-success
+        - discard-confirmed
+
+    metadata:
+      name:
+        elementId: globalPresetName
+        label: 模板名称
+        type: text
+        visibleWhen: editor.open
+        enabledWhen: always
+        frontendHtmlMaxLength: null
+        serverConstraint:
+          minimumLength: 1
+          maximumLength: 80
+        placeholder: 杯赛 A
+
+    matchInformation:
+      section: 比赛信息
+      controls:
+        matchName:
+          elementId: matchName
+          label: 比赛名称
+          type: text
+          visibleWhen: editor.open
+          enabledWhen: always
+          serverConstraint:
+            minimumLength: 1
+            maximumLength: 120
+
+        leftTeamName:
+          elementId: leftTeamName
+          label: 队伍1队名
+          type: text
+          visibleWhen: editor.open
+          enabledWhen: always
+          serverConstraint:
+            minimumLength: 1
+            maximumLength: 60
+
+        rightTeamName:
+          elementId: rightTeamName
+          label: 队伍2队名
+          type: text
+          visibleWhen: editor.open
+          enabledWhen: always
+          serverConstraint:
+            minimumLength: 1
+            maximumLength: 60
+
+        teamsCanEditOwnName:
+          elementId: teamsCanEditOwnName
+          label: 队伍能否修改自己队伍的名称
+          type: boolean
+          options:
+            - true
+            - false
+          visibleWhen: editor.open
+          enabledWhen: always
+
+        startWithDefaultConfig:
+          elementId: startWithDefaultConfig
+          label: 以默认配置开始
+          type: boolean
+          options:
+            - true
+            - false
+          visibleWhen: editor.open
+          enabledWhen: always
+
+        matchFormat:
+          elementId: matchFormat
+          label: 比赛赛制
+          type: select
+          options:
+            - value: ft2
+              derivedStageCount: 5
+            - value: ft3
+              derivedStageCount: 7
+            - value: ft4
+              derivedStageCount: 9
+          visibleWhen: editor.open
+          enabledWhen: always
+          onChange:
+            - 自动重算 stageCount
+            - 重新渲染依赖地图槽位数量的控件
+
+    intermission:
+      section: 场间设置
+      controls:
+        preStartRestSeconds:
+          elementId: preStartRestSeconds
+          label: 准备时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 0
+            maximum: 3600
+          zeroMeaning: 跳过赛前准备阶段
+          visibleWhen: editor.open
+          enabledWhen: always
+
+        postMatchRestSeconds:
+          elementId: postMatchRestSeconds
+          label: 场间时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 0
+            maximum: 3600
+          zeroMeaning: 地图完成后直接进入下一阶段
+          visibleWhen: editor.open
+          enabledWhen: always
+
+    mapSettings:
+      section: 地图设置
+      controls:
+        mapSelectionMode:
+          elementId: mapSelectionMode
+          label: 地图选择模式
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: always
+          options:
+            - value: first_mode_then_unique_mode
+              label: 首图指定模式，未选完所有模式前不可重复选择
+            - value: unique_mode_until_cycle
+              label: 首图任意模式，未选完所有模式前不可重复选择
+            - value: strict_mode_order
+              label: 指定模式顺序，已选择地图不可重复选择
+            - value: unique_map
+              label: 任意选择，已选择地图不可重复选择
+            - value: fixed_map_order
+              label: 固定地图顺序
+          onChange:
+            - fixed_map_order 时强制 fixedFirstMapEnabled=false
+            - 重新渲染地图条件控件
+
+        fixedFirstMapEnabled:
+          elementId: fixedFirstMapEnabled
+          label: 固定第一张地图
+          type: boolean
+          options:
+            - true
+            - false
+          visibleWhen: config.mapSelectionMode != fixed_map_order
+          enabledWhen: config.mapSelectionMode != fixed_map_order
+          onEnable:
+            - firstMapPickerPolicy 整个控件禁用
+            - firstSideChoicePolicy.map_picker 选项禁用
+            - openingSidePolicy.follow_map_picker 选项禁用
+            - 当前 firstSideChoicePolicy=map_picker 时自动改为 left
+            - 当前 openingSidePolicy=follow_map_picker 时自动改为 random
+
+        fixedFirstMapName:
+          elementId: fixedFirstMapName
+          label: 固定首图地图
+          type: select
+          optionSource: 全部目录地图
+          optionLabel: "{modeLabel} - {mapName}"
+          visibleWhen: config.mapSelectionMode != fixed_map_order
+          enabledWhen: config.fixedFirstMapEnabled == true
+          disabledWhen: config.fixedFirstMapEnabled == false
+          saveRequirements:
+            - 必须来自当前地图池
+            - first_mode_then_unique_mode 下必须属于 firstMapMode
+            - strict_mode_order 下必须属于 modeOrder[0]
+
+        firstMapPickerPolicy:
+          elementId: firstMapPickerPolicy
+          label: 第一张地图选择方
+          type: select
+          visibleWhen: config.mapSelectionMode != fixed_map_order
+          enabledWhen: config.fixedFirstMapEnabled == false
+          disabledWhen: config.fixedFirstMapEnabled == true
+          options:
+            - value: random
+              label: 系统随机
+            - value: interactive_random
+              label: 交互随机
+            - value: left
+              label: 队伍1先
+            - value: right
+              label: 队伍2先
+
+        firstMapMode:
+          elementId: firstMapMode
+          label: 第一张地图模式
+          type: select
+          optionSource: 当前目录的地图模式
+          visibleWhen: config.mapSelectionMode == first_mode_then_unique_mode
+          enabledWhen: visible
+
+        mapPickerPolicy:
+          elementId: mapPickerPolicy
+          label: 后续地图选择方
+          type: select
+          visibleWhen: config.mapSelectionMode != fixed_map_order
+          enabledWhen: visible
+          options:
+            - value: loser_choose
+              label: 败者选择
+          userCanChooseAlternative: false
+
+        mapSelectSeconds:
+          elementId: mapSelectSeconds
+          label: 地图选择时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 1
+            maximum: 3600
+          visibleWhen: editor.open
+          enabledWhen: config.mapSelectionMode != fixed_map_order
+          disabledWhen: config.mapSelectionMode == fixed_map_order
+          inactiveWhen: config.mapSelectionMode == fixed_map_order
+          inactiveLabel: 当前地图模式下不生效
+
+        mapTimeoutPolicy:
+          elementId: mapTimeoutPolicy
+          label: 超时违规
+          type: select
+          visibleWhen: config.mapSelectionMode != fixed_map_order
+          enabledWhen: visible
+          options:
+            - value: warn_extend_30
+              label: 警告并延长30秒
+            - value: random_legal_map
+              label: 随机合法地图
+            - value: forfeit_map
+              label: 本小局判负
+            - value: admin_decision
+              label: 管理员判断
+
+        symmetricSideChoiceEnabled:
+          elementId: symmetricSideChoiceEnabled
+          label: 对称地图选择阵营
+          type: boolean
+          options:
+            - true
+            - false
+          visibleWhen: editor.open
+          enabledWhen: always
+
+        firstSideChoicePolicy:
+          elementId: firstSideChoicePolicy
+          label: 第一张地图攻防选择方
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: always
+          options:
+            - value: none
+              label: 无
+            - value: map_picker
+              label: 第一张地图选择方
+              enabledWhen: config.fixedFirstMapEnabled == false
+              disabledWhen: config.fixedFirstMapEnabled == true
+            - value: left
+              label: 队伍1
+            - value: right
+              label: 队伍2
+            - value: left_attack
+              label: 队伍1进攻方 / 红色方（根据地图自适应）
+            - value: left_defense
+              label: 队伍1防守方 / 蓝色方（根据地图自适应）
+
+        subsequentSideChoicePolicy:
+          elementId: subsequentSideChoicePolicy
+          label: 后续地图攻防选择方
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: always
+          options:
+            - value: previous_loser
+              label: 上一张地图败者
+            - value: previous_winner
+              label: 上一张地图胜者
+
+        mapPool:
+          label: 地图池
+          type: catalog-checkbox-groups
+          groupsSource: catalog.modes
+          optionsSource: catalog.mapsByMode
+          visibleWhen: config.mapSelectionMode != fixed_map_order
+          enabledWhen: visible
+          dragReorder:
+            allowedWithinSameMode: true
+            allowedAcrossModes: false
+          saveRequirements:
+            - 总选中地图数量至少为 stageCount
+            - 每个选中地图必须存在于当前目录
+            - strict_mode_order 下每个模式的地图数量必须满足 modeOrder 前 stageCount 项的出现次数
+
+        modeOrder:
+          label: 模式顺序
+          type: ordered-repeatable-list
+          optionSource: catalog.modes
+          visibleWhen: config.mapSelectionMode == strict_mode_order
+          enabledWhen: visible
+          operations:
+            add: allowed
+            remove: allowed
+            dragReorder: allowed
+            duplicateMode: allowed
+          saveRequirements:
+            - 长度至少为 stageCount
+            - 每一项必须存在于当前地图模式目录
+
+        fixedMapOrder:
+          label: 固定地图顺序
+          type: map-select-per-stage
+          numberOfSelectors: stageCount
+          optionSource:
+            - 未选择
+            - 全部目录地图
+          visibleWhen: config.mapSelectionMode == fixed_map_order
+          enabledWhen: visible
+          saveRequirements:
+            - 前 stageCount 个地图都必须选择
+            - 地图不能重复
+            - 每张地图必须存在于当前目录
+
+    rosterSettings:
+      section: 上场设置
+      controls:
+        rosterMode:
+          elementId: rosterMode
+          label: 上场成员模式
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: always
+          options:
+            - value: free_input
+              label: 双方自由输入
+            - value: preset_only
+              label: 仅可从预设成员输入
+            - value: skip
+              label: 跳过该项
+
+        playerSelectSeconds:
+          elementId: playerSelectSeconds
+          label: 上场成员选择时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 1
+            maximum: 3600
+          visibleWhen: editor.open
+          enabledWhen: config.rosterMode != skip
+          disabledWhen: config.rosterMode == skip
+          inactiveWhen: config.rosterMode == skip
+          inactiveLabel: 当前阵容模式下不生效
+
+        lineupTimeoutPolicy:
+          elementId: lineupTimeoutPolicy
+          label: 上场选择超时
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: config.rosterMode != skip
+          disabledWhen: config.rosterMode == skip
+          inactiveWhen: config.rosterMode == skip
+          inactiveLabel: 当前阵容模式下不生效
+          options:
+            - value: warn_extend_30
+              label: 警告并延长30秒
+            - value: forfeit_map
+              label: 本小局判负
+            - value: admin_decision
+              label: 管理员判断
+
+        presetRosters:
+          type: repeatable-text-list-per-team
+          visibleWhen: config.rosterMode == preset_only
+          enabledWhen: visible
+          teams:
+            - left
+            - right
+          operations:
+            addMember: allowed
+            removeMember: allowed
+          currentGuiValidation:
+            minimumMembersPerTeam: null
+            duplicateMemberPrevention: false
+          storageField: presetRosterText
+          serverConstraint:
+            maximumLength: 20000
+
+    banSettings:
+      section: 禁用规则
+      controls:
+        banEnabled:
+          elementId: banEnabled
+          label: 是否启用禁用规则
+          type: boolean
+          options:
+            - true
+            - false
+          visibleWhen: editor.open
+          enabledWhen: always
+          whenFalse:
+            - 禁用 ban-rule-controls fieldset 中的所有控件
+            - 比赛流程跳过全部英雄禁用步骤
+
+        firstBanPolicy:
+          elementId: firstBanPolicy
+          label: 先后禁用选择规则
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: config.banEnabled == true
+          disabledWhen: config.banEnabled == false
+          options:
+            - value: allow_loser_choose
+              label: 败者选择先后
+            - value: loser_must_first
+              label: 败者先手禁用
+
+        openingSidePolicy:
+          elementId: openingSidePolicy
+          label: 禁用首次先手方
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: config.banEnabled == true
+          disabledWhen: config.banEnabled == false
+          options:
+            - value: follow_map_picker
+              label: 跟随地图选图权
+              enabledWhen: config.fixedFirstMapEnabled == false
+              disabledWhen: config.fixedFirstMapEnabled == true
+            - value: random
+              label: 系统随机
+            - value: interactive_random
+              label: 交互随机
+            - value: left
+              label: 队伍1先
+            - value: right
+              label: 队伍2先
+
+        firstBanChoiceSeconds:
+          elementId: firstBanChoiceSeconds
+          label: 先后禁用选择时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 1
+            maximum: 3600
+          visibleWhen: editor.open
+          enabledWhen: config.banEnabled == true && config.firstBanPolicy == allow_loser_choose
+          disabledWhen: config.banEnabled == false || config.firstBanPolicy == loser_must_first
+
+        firstBanActionSeconds:
+          elementId: firstBanActionSeconds
+          label: 先手禁用时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 1
+            maximum: 3600
+          visibleWhen: editor.open
+          enabledWhen: config.banEnabled == true
+          disabledWhen: config.banEnabled == false
+
+        secondBanActionSeconds:
+          elementId: secondBanActionSeconds
+          label: 后手禁用时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 1
+            maximum: 3600
+          visibleWhen: editor.open
+          enabledWhen: config.banEnabled == true
+          disabledWhen: config.banEnabled == false
+
+        banTimeoutPolicy:
+          elementId: banTimeoutPolicy
+          label: 禁用超时违规
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: config.banEnabled == true
+          disabledWhen: config.banEnabled == false
+          notAppliedTo: ban_order
+          options:
+            - value: warn_extend_30
+              label: 警告并延长30秒
+            - value: random_legal_ban
+              label: 随机合法英雄
+            - value: forfeit_map
+              label: 本小局判负
+            - value: admin_decision
+              label: 管理员判断
+
+    scoreSettings:
+      section: 比分规则
+      controls:
+        scoreReportMode:
+          elementId: scoreReportMode
+          label: 比分录入模式
+          type: select
+          visibleWhen: editor.open
+          enabledWhen: always
+          options:
+            - value: admin_only
+              label: 管理员填写比分
+            - value: team_submit_opponent_confirm
+              label: 任一队伍填写，另一方确认
+
+        scoreConfirmSeconds:
+          elementId: scoreConfirmSeconds
+          label: 比分确认时间
+          type: integer
+          unit: seconds
+          range:
+            minimum: 1
+            maximum: 3600
+          visibleWhen: editor.open
+          enabledWhen: config.scoreReportMode == team_submit_opponent_confirm
+          disabledWhen: config.scoreReportMode == admin_only
+          activeWhen: config.scoreReportMode == team_submit_opponent_confirm
+          inactiveWhen: config.scoreReportMode == admin_only
+          inactiveLabel: 当前比分录入模式下不生效
+
+    derivedOrImportOnlyFields:
+      presetId:
+        guiEditable: false
+        createBehavior: 服务器自动生成
+        importEditable: true
+        importedFormat: "^[a-z0-9][a-z0-9_-]{0,63}$"
+      presetDescription:
+        guiEditable: false
+        importEditable: true
+        serverConstraint:
+          maximumLength: 500
+      stageCount:
+        guiEditable: false
+        derivedFrom:
+          ft2: 5
+          ft3: 7
+          ft4: 9
+      fixedMapOrderText:
+        guiEditableDirectly: false
+        generatedFrom: fixedMapOrder selectors
+      presetRosterText:
+        guiEditableDirectly: false
+        generatedFrom: presetRosters visual lists
+
+  crossFieldValidation:
+    - id: STAGE_COUNT_MATCH_FORMAT
+      rule: stageCount 必须由 matchFormat 推导为 5、7 或 9
+    - id: NON_FIXED_MAP_POOL_COUNT
+      when: mapSelectionMode != fixed_map_order
+      rule: 地图池总数必须不少于 stageCount
+    - id: STRICT_MODE_ORDER_LENGTH
+      when: mapSelectionMode == strict_mode_order
+      rule: modeOrder 长度必须不少于 stageCount
+    - id: STRICT_MODE_POOL_CAPACITY
+      when: mapSelectionMode == strict_mode_order
+      rule: 每个模式的地图池数量必须覆盖 modeOrder 前 stageCount 项中的出现次数
+    - id: FIXED_ORDER_COMPLETE
+      when: mapSelectionMode == fixed_map_order
+      rule: 固定地图顺序至少包含 stageCount 张地图
+    - id: FIXED_ORDER_UNIQUE
+      when: mapSelectionMode == fixed_map_order
+      rule: 固定地图顺序中的地图不能重复
+    - id: FIXED_FIRST_IN_POOL
+      when: fixedFirstMapEnabled == true
+      rule: 固定首图必须来自当前地图池
+    - id: FIXED_FIRST_MODE
+      when: fixedFirstMapEnabled == true && mapSelectionMode == first_mode_then_unique_mode
+      rule: 固定首图必须属于 firstMapMode
+    - id: FIXED_FIRST_STRICT_MODE
+      when: fixedFirstMapEnabled == true && mapSelectionMode == strict_mode_order
+      rule: 固定首图模式必须等于 modeOrder[0]
+    - id: FIXED_FIRST_NO_MAP_PICKER_SIDE_POLICY
+      when: fixedFirstMapEnabled == true
+      rule: firstSideChoicePolicy 不能为 map_picker
+    - id: FIXED_FIRST_NO_FOLLOW_BAN_SIDE
+      when: fixedFirstMapEnabled == true
+      rule: openingSidePolicy 不能为 follow_map_picker
+    - id: CATALOG_REFERENCES_EXIST
+      rule: 地图、地图模式和固定地图必须存在于当前目录
+    - id: TIME_INTEGER_RANGE
+      rule: 所有时间必须是各自范围内的整数
+
+activeRooms:
+  title: 房间列表
+  emptyState: 暂无房间
+  itemFields:
+    - status
+    - roomId
+    - createdAt
+    - lastActiveAt
+    - closedAt
+    - fourPortalHashesAndUrls
+  actions:
+    copyPortalUrl:
+      label: 复制
+      enabledWhen: browser.clipboard.available
+    closeRoom:
+      label: 关闭房间
+      enabledWhen: room.closedAt == null
+      disabledWhen: room.closedAt != null
+      confirmation:
+        required: true
+        type: in-app-confirmation-window
+        textTemplate: 确认关闭房间 {roomId}？
+        actions:
+          - cancel
+          - confirm-close
+      postConfirmationPendingButton: false
+      successMessage: 房间已关闭。
+
+roomHistory:
+  title: 永久历史
+  pageSize: 20
+  itemStatuses:
+    active: 活跃
+    closed: 手动关闭
+    expired: 超时归档
+  itemFields:
+    - roomId
+    - archiveKey
+    - createdAt
+    - updatedAt
+    - closedAt
+    - currentVersion
+    - operationCount
+    - closeReason
+  actions:
+    viewJson:
+      label: 查看
+      enabledWhen: archiveKey exists
+      result: 打开只读 JSON 对话框
+    downloadJson:
+      label: 下载
+      enabledWhen: archiveKey exists
+    previousPage:
+      label: 上一页
+      enabledWhen: currentPage > 1
+      disabledWhen: currentPage <= 1
+    nextPage:
+      label: 下一页
+      enabledWhen: currentPage < totalPages
+      disabledWhen: currentPage >= totalPages
+
+confirmedDecisions:
+  - id: GLOBAL_SETTINGS_FAILURE_FEEDBACK
+    reviewStatus: confirmed
+    decision: 失败时保留全部输入并显示服务器错误原因和重试按钮；不显示保存中状态，成功后不显示保存时间
+  - id: DELETE_ACTIVE_DEFAULT_PRESET
+    reviewStatus: confirmed
+    decision: 禁止删除当前默认模板，必须先切换默认模板；前端禁用且后端返回 409 兜底
+  - id: INACTIVE_FIELDS_STILL_EDITABLE
+    reviewStatus: confirmed
+    affectedControls:
+      - mapSelectSeconds when fixed_map_order
+      - playerSelectSeconds when rosterMode=skip
+      - lineupTimeoutPolicy when rosterMode=skip
+      - scoreConfirmSeconds when scoreReportMode=admin_only
+    decision: 保留字段和值，但在不生效的配置组合下禁用输入
+  - id: PRESET_UNSAVED_CHANGES
+    reviewStatus: confirmed
+    decision: 取消、切换、导入或离开前，如存在修改则确认是否放弃
+  - id: GLOBAL_CHECKPOINT_CONFIGURATION_EXCLUDED
+    reviewStatus: confirmed
+    decision: 全局管理员页面不提供、也不通过 JSON 导入检查点配置；阶段回退仅存在于房间管理员页面
+  - id: CLOSE_ROOM_CONFIRMATION
+    reviewStatus: confirmed
+    decision: 点击关闭房间后打开一次站内确认窗口；确认后直接请求关闭，不增加处理中或再次确认按钮

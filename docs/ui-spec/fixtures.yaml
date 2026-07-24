@@ -1,0 +1,229 @@
+schemaVersion: 1
+kind: ui-fixtures
+
+defaults:
+  status:
+    lifecycle: preparing
+    phase:
+      type: configuring
+      mapIndex: null
+      actorSide: null
+      data: {}
+    match:
+      teams:
+        left:
+          name: 队伍1
+          seriesScore: 0
+        right:
+          name: 队伍2
+          seriesScore: 0
+  runtime:
+    remainingTimeMs: 0
+    timedOut: false
+    awaitingAdminDecision: false
+    pause:
+      global:
+        active: false
+        totalMs: 0
+      scoreTeams:
+        left:
+          active: false
+          phaseTotalMs: 0
+          matchTotalMs: 0
+          count: 0
+        right:
+          active: false
+          phaseTotalMs: 0
+          matchTotalMs: 0
+          count: 0
+    presence:
+      A:
+        connected: true
+        ready: false
+        nameConfirmed: false
+      B:
+        connected: true
+        ready: false
+        nameConfirmed: false
+      C:
+        connected: true
+        ready: false
+        nameConfirmed: false
+    interactiveRandom:
+      left: null
+      right: null
+    lineupSubmissions:
+      left: null
+      right: null
+    scoreProposal: null
+    restSkip:
+      left: false
+      right: false
+  config:
+    matchFormat: ft2
+    startWithDefaultConfig: false
+    teamsCanEditOwnName: true
+    stageLimits:
+      preStartRestSeconds: 30
+      mapSelectSeconds: 60
+      playerSelectSeconds: 120
+      firstBanChoiceSeconds: 30
+      firstBanActionSeconds: 60
+      secondBanActionSeconds: 60
+      scoreConfirmSeconds: 120
+      postMatchRestSeconds: 120
+    mapSelectionMode: unique_map
+    fixedFirstMapEnabled: false
+    firstMapPickerPolicy: left
+    symmetricSideChoiceEnabled: true
+    firstSideChoicePolicy: map_picker
+    rosterMode: free_input
+    banEnabled: true
+    firstBanPolicy: allow_loser_choose
+    openingSidePolicy: follow_map_picker
+    scoreReportMode: team_submit_opponent_confirm
+  localUI:
+    foregroundMinimized: false
+    selectionConfirmation: null
+    selectedMapId: null
+    selectedSide: null
+    selectedBanOrder: null
+    selectedHeroId: null
+    lineupDraft:
+      left: {}
+      right: {}
+    scoreDraft:
+      left: ""
+      right: ""
+
+fixtures:
+  configuring-room:
+    status:
+      lifecycle: preparing
+      phase:
+        type: configuring
+        mapIndex: null
+        actorSide: null
+
+  waiting-ready:
+    status:
+      lifecycle: preparing
+      phase:
+        type: waiting_ready
+        mapIndex: null
+        actorSide: both
+
+  pre-start-rest:
+    status:
+      lifecycle: running
+      phase:
+        type: pre_start_rest
+        mapIndex: 0
+        actorSide: both
+    runtime:
+      remainingTimeMs: 30000
+
+  interactive-random:
+    status:
+      lifecycle: running
+      phase:
+        type: interactive_random
+        mapIndex: 0
+        actorSide: both
+        data:
+          purpose: map_picker
+    runtime:
+      remainingTimeMs: 30000
+
+  map-pick-left:
+    status:
+      lifecycle: running
+      phase:
+        type: map_pick
+        mapIndex: 0
+        actorSide: left
+    runtime:
+      remainingTimeMs: 60000
+
+  side-pick-right:
+    status:
+      lifecycle: running
+      phase:
+        type: side_pick
+        mapIndex: 0
+        actorSide: right
+        data:
+          chooserSide: right
+          choiceKind: attack_defense
+    runtime:
+      remainingTimeMs: 30000
+
+  lineup-pick:
+    status:
+      lifecycle: running
+      phase:
+        type: lineup_pick
+        mapIndex: 0
+        actorSide: both
+    runtime:
+      remainingTimeMs: 120000
+
+  ban-order-left:
+    status:
+      lifecycle: running
+      phase:
+        type: ban_order
+        mapIndex: 0
+        actorSide: left
+        data:
+          chooserSide: left
+    runtime:
+      remainingTimeMs: 30000
+
+  ban-first-left:
+    status:
+      lifecycle: running
+      phase:
+        type: ban_first
+        mapIndex: 0
+        actorSide: left
+    runtime:
+      remainingTimeMs: 60000
+
+  ban-second-right:
+    status:
+      lifecycle: running
+      phase:
+        type: ban_second
+        mapIndex: 0
+        actorSide: right
+    runtime:
+      remainingTimeMs: 60000
+
+  score-entry:
+    status:
+      lifecycle: running
+      phase:
+        type: score_entry
+        mapIndex: 0
+        actorSide: both
+    runtime:
+      remainingTimeMs: 0
+
+  post-map-rest:
+    status:
+      lifecycle: running
+      phase:
+        type: post_map_rest
+        mapIndex: 0
+        actorSide: both
+    runtime:
+      remainingTimeMs: 120000
+
+  completed-match:
+    status:
+      lifecycle: completed
+      phase:
+        type: completed
+        mapIndex: null
+        actorSide: null
