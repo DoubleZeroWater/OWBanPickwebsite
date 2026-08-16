@@ -1,429 +1,393 @@
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
-import re
+import shutil
+import time
 import unicodedata
-from html import unescape
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
+
+from bs4 import BeautifulSoup, Tag
+
+try:
+    from backend.catalog import CATALOG_SCHEMA_VERSION, MODES, compute_catalog_hash
+except ModuleNotFoundError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from backend.catalog import CATALOG_SCHEMA_VERSION, MODES, compute_catalog_hash
 
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = ROOT / "static"
-MAP_DIR = STATIC_DIR / "maps"
-HERO_DIR = STATIC_DIR / "heroes"
-MODE_DIR = STATIC_DIR / "modes"
 DATA_DIR = ROOT / "backend" / "data"
 ASSETS_MANIFEST_PATH = DATA_DIR / "assets.json"
 MAPS_MANIFEST_PATH = DATA_DIR / "maps.json"
 
-LIQUIPEDIA_MAPS_URL = "https://liquipedia.net/overwatch/Portal:Maps"
 FANDOM_API_URL = "https://overwatch.fandom.com/api.php"
 FANDOM_HEROES_URL = "https://overwatch.fandom.com/wiki/Heroes"
-USER_AGENT = "Mozilla/5.0 OWBanPickwebsite asset scraper"
-
-MODES = ["Control", "Escort", "Flashpoint", "Hybrid", "Push"]
-MODE_ICON_FILES = {
-    "Control": "Control.png",
-    "Escort": "Escort.png",
-    "Flashpoint": "Flashpoint.png",
-    "Hybrid": "Hybrid.png",
-    "Push": "Push.png",
-}
-
-ROLE_ZH = {
-    "Tank": "重装",
-    "Damage": "输出",
-    "Support": "支援",
-}
-
-FALLBACK_HEROES = [
-    ("D.Va", "Tank"),
-    ("Doomfist", "Tank"),
-    ("Hazard", "Tank"),
-    ("Junker Queen", "Tank"),
-    ("Mauga", "Tank"),
-    ("Orisa", "Tank"),
-    ("Ramattra", "Tank"),
-    ("Reinhardt", "Tank"),
-    ("Roadhog", "Tank"),
-    ("Sigma", "Tank"),
-    ("Winston", "Tank"),
-    ("Wrecking Ball", "Tank"),
-    ("Zarya", "Tank"),
-    ("Ashe", "Damage"),
-    ("Bastion", "Damage"),
-    ("Cassidy", "Damage"),
-    ("Echo", "Damage"),
-    ("Freja", "Damage"),
-    ("Genji", "Damage"),
-    ("Hanzo", "Damage"),
-    ("Junkrat", "Damage"),
-    ("Mei", "Damage"),
-    ("Pharah", "Damage"),
-    ("Reaper", "Damage"),
-    ("Sojourn", "Damage"),
-    ("Soldier: 76", "Damage"),
-    ("Sombra", "Damage"),
-    ("Symmetra", "Damage"),
-    ("Torbjörn", "Damage"),
-    ("Tracer", "Damage"),
-    ("Venture", "Damage"),
-    ("Widowmaker", "Damage"),
-    ("Ana", "Support"),
-    ("Baptiste", "Support"),
-    ("Brigitte", "Support"),
-    ("Illari", "Support"),
-    ("Juno", "Support"),
-    ("Kiriko", "Support"),
-    ("Lifeweaver", "Support"),
-    ("Lúcio", "Support"),
-    ("Mercy", "Support"),
-    ("Moira", "Support"),
-    ("Zenyatta", "Support"),
-    ("Anran", "Damage"),
-    ("Domina", "Tank"),
-    ("Emre", "Damage"),
-    ("Mizuki", "Support"),
-    ("Vendetta", "Damage"),
-    ("Wuyang", "Support"),
-]
+FANDOM_HOME_URL = "https://overwatch.fandom.com/wiki/Overwatch_Wiki"
+USER_AGENT = "OWBanPickwebsite catalog updater/1.0"
+ROLE_ZH = {"Tank": "重装", "Damage": "输出", "Support": "支援"}
+TRUSTED_IMAGE_HOSTS = {"static.wikia.nocookie.net"}
 
 
 def main() -> None:
-    for directory in [MAP_DIR, HERO_DIR, MODE_DIR, DATA_DIR]:
-        directory.mkdir(parents=True, exist_ok=True)
-
-    previous = read_json(ASSETS_MANIFEST_PATH)
-    errors: list[str] = []
-
-    maps = previous.get("maps", {})
+    parser = argparse.ArgumentParser(description="Refresh bundled Overwatch catalog assets.")
+    parser.parse_args()
+    stage = ROOT / f".catalog-stage-{uuid.uuid4().hex}"
     try:
-        maps = scrape_maps()
-    except Exception as exc:  # pragma: no cover - network fallback
-        errors.append(f"maps: {exc}")
+        assets = scrape_catalog(stage, "/static", progress=print_progress, deadline=time.monotonic() + 600)
+        publish_bundled(stage, assets)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
 
-    mode_icons = previous.get("modeIcons", {})
-    try:
-        mode_icons = scrape_mode_icons()
-    except Exception as exc:  # pragma: no cover - network fallback
-        errors.append(f"mode icons: {exc}")
+    map_count = sum(len(items) for items in assets["maps"].values())
+    print(f"Prepared {map_count} maps, {len(assets['modeIcons'])} mode icons, {len(assets['heroes'])} heroes.")
 
-    heroes = previous.get("heroes", [])
-    try:
-        heroes = scrape_heroes()
-    except Exception as exc:  # pragma: no cover - network fallback
-        errors.append(f"heroes: {exc}")
 
-    manifest = {
+def print_progress(stage: str, percent: int, message: str) -> None:
+    print(f"[{percent:3d}%] {stage}: {message}", flush=True)
+
+
+def scrape_catalog(
+    output_dir: Path,
+    public_prefix: str,
+    *,
+    progress: Callable[[str, int, str], None] | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    report = progress or (lambda _stage, _percent, _message: None)
+    for folder in ("maps", "heroes", "modes", "roles"):
+        (output_dir / folder).mkdir(parents=True, exist_ok=True)
+
+    report("fetch", 3, "正在读取英雄页面")
+    heroes_html = fetch_parsed_page("Heroes", deadline)
+    report("fetch", 9, "正在读取地图页面")
+    home_html = fetch_parsed_page("Overwatch_Wiki", deadline)
+
+    report("parse", 15, "正在解析正式英雄名单")
+    heroes, role_icons = parse_heroes(heroes_html, public_prefix)
+    report("parse", 22, "正在解析标准比赛地图")
+    maps, mode_icons = parse_maps(home_html, public_prefix)
+    validate_parsed_catalog(heroes, maps, mode_icons, role_icons)
+
+    downloads: list[tuple[str, Path]] = []
+    for hero in heroes:
+        downloads.append((hero["sourceImageUrl"], output_dir / "heroes" / hero["fileName"]))
+    for items in maps.values():
+        for item in items:
+            downloads.append((item["sourceImageUrl"], output_dir / "maps" / item["fileName"]))
+    for item in mode_icons.values():
+        downloads.append((item["sourceImageUrl"], output_dir / "modes" / item["fileName"]))
+    for item in role_icons.values():
+        downloads.append((item["sourceImageUrl"], output_dir / "roles" / item["fileName"]))
+
+    for index, (url, path) in enumerate(downloads, start=1):
+        download_image(url, path, deadline)
+        percent = 25 + round(index / len(downloads) * 68)
+        report("download", percent, f"已下载 {index}/{len(downloads)} 个图片")
+
+    assets: dict[str, Any] = {
+        "schemaVersion": CATALOG_SCHEMA_VERSION,
         "sources": {
-            "maps": LIQUIPEDIA_MAPS_URL,
-            "modeIcons": FANDOM_API_URL,
             "heroes": FANDOM_HEROES_URL,
+            "maps": FANDOM_HOME_URL,
+            "api": FANDOM_API_URL,
         },
-        "modes": MODES,
+        "updatedAt": int(time.time()),
+        "modes": list(MODES),
         "modeIcons": mode_icons,
+        "roleIcons": role_icons,
         "maps": maps,
         "heroes": heroes,
-        "errors": errors,
     }
-
-    ASSETS_MANIFEST_PATH.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    assets["catalogHash"] = compute_catalog_hash(assets)
+    (output_dir / "assets.json").write_text(
+        json.dumps(assets, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    MAPS_MANIFEST_PATH.write_text(
-        json.dumps(
-            {
-                "source": LIQUIPEDIA_MAPS_URL,
-                "modes": MODES,
-                "maps": maps,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    report("validate", 98, "目录和图片校验完成")
+    validate_downloads(output_dir, downloads)
+    report("publish", 100, "英文目录已准备完成")
+    return assets
+
+
+def fetch_parsed_page(page: str, deadline: float | None) -> str:
+    check_deadline(deadline)
+    query = urlencode(
+        {
+            "action": "parse",
+            "page": page,
+            "prop": "text",
+            "format": "json",
+            "formatversion": "2",
+            "origin": "*",
+        }
     )
-
-    map_count = sum(len(items) for items in maps.values())
-    print(
-        f"Prepared {map_count} maps, {len(mode_icons)} mode icons, "
-        f"{len(heroes)} hero icons."
-    )
-    if errors:
-        print("Asset refresh used cached data for: " + "; ".join(errors))
+    payload = fetch_json(f"{FANDOM_API_URL}?{query}", deadline)
+    html = payload.get("parse", {}).get("text")
+    if not isinstance(html, str) or not html:
+        raise ValueError(f"Fandom did not return parsed HTML for {page}")
+    return html
 
 
-def scrape_maps() -> dict[str, list[dict[str, str]]]:
-    html = fetch_text(LIQUIPEDIA_MAPS_URL)
-    manifest: dict[str, list[dict[str, str]]] = {}
-
-    for index, mode in enumerate(MODES):
-        next_mode = MODES[index + 1] if index + 1 < len(MODES) else None
-        section = extract_mode_section(html, mode, next_mode)
-        regular_section = section.split("Stadium Exclusive", 1)[0]
-        manifest[mode] = extract_maps(regular_section, mode)
-
-    for maps in manifest.values():
-        for map_info in maps:
-            download_image(map_info["sourceImageUrl"], MAP_DIR / map_info["fileName"])
-
-    return manifest
-
-
-def scrape_mode_icons() -> dict[str, dict[str, str]]:
-    icons: dict[str, dict[str, str]] = {}
-
-    for mode, file_name in MODE_ICON_FILES.items():
-        image_url = fetch_fandom_file_url(file_name)
-        local_file_name = f"{slugify(mode)}{Path(file_name).suffix.lower()}"
-        download_image(image_url, MODE_DIR / local_file_name)
-        icons[mode] = {
-            "mode": mode,
-            "sourceImageUrl": image_url,
-            "imageUrl": f"/static/modes/{local_file_name}",
-            "fileName": local_file_name,
-        }
-
-    return icons
-
-
-def scrape_heroes() -> list[dict[str, str]]:
-    try:
-        html = fetch_text(FANDOM_HEROES_URL)
-        page_heroes = extract_heroes_from_page(html)
-    except Exception:
-        page_heroes = {}
-
-    hero_by_key = {
-        normalize_key(name): {
-            "nameEn": name,
-            "role": role,
-            "roleZh": ROLE_ZH.get(role, role),
-        }
-        for name, role in FALLBACK_HEROES
-    }
-
-    for hero in page_heroes.values():
-        existing = hero_by_key.get(normalize_key(hero["nameEn"]), {})
-        hero_by_key[normalize_key(hero["nameEn"])] = {
-            "nameEn": hero["nameEn"],
-            "role": existing.get("role", hero.get("role", "")),
-            "roleZh": existing.get("roleZh", ROLE_ZH.get(hero.get("role", ""), "")),
-            "pageImageUrl": hero.get("pageImageUrl", ""),
-        }
+def parse_heroes(html: str, public_prefix: str) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
+    soup = BeautifulSoup(html, "html.parser")
+    heading = soup.find(id="Hero_roster")
+    table = heading.find_parent("h2").find_next("table") if isinstance(heading, Tag) else None
+    if not isinstance(table, Tag):
+        raise ValueError("Hero roster table was not found")
 
     heroes: list[dict[str, str]] = []
-    for hero in sorted(hero_by_key.values(), key=lambda item: item["nameEn"].lower()):
-        image_url = hero.get("pageImageUrl") or find_hero_image_url(hero["nameEn"])
-        if not image_url:
-            continue
-
-        extension = image_extension(image_url, ".png")
-        file_name = f"{slugify(hero['nameEn'])}{extension}"
-        download_image(image_url, HERO_DIR / file_name)
-        heroes.append(
-            {
-                "nameEn": hero["nameEn"],
-                "role": hero.get("role", ""),
-                "roleZh": hero.get("roleZh", ""),
-                "sourceImageUrl": image_url,
-                "imageUrl": f"/static/heroes/{file_name}",
-                "fileName": file_name,
-            }
-        )
-
-    return heroes
-
-
-def fetch_text(url: str) -> str:
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8", errors="replace")
-
-
-def fetch_json(url: str) -> dict[str, Any]:
-    return json.loads(fetch_text(url))
-
-
-def fetch_fandom_file_url(file_name: str) -> str:
-    params = urlencode(
-        {
-            "action": "query",
-            "titles": f"File:{file_name}",
-            "prop": "imageinfo",
-            "iiprop": "url",
-            "format": "json",
-        }
-    )
-    payload = fetch_json(f"{FANDOM_API_URL}?{params}")
-    pages = payload.get("query", {}).get("pages", {})
-
-    for page in pages.values():
-        image_info = page.get("imageinfo", [])
-        if image_info:
-            return image_info[0]["url"]
-
-    raise ValueError(f"Unable to resolve Fandom file: {file_name}")
-
-
-def extract_mode_section(html: str, mode: str, next_mode: str | None) -> str:
-    title_marker = f'<div class="font-title"><a href="/overwatch/{mode}" title="{mode}">{mode}</a>'
-    start = html.index(title_marker)
-
-    if next_mode:
-        next_marker = (
-            f'<div class="font-title"><a href="/overwatch/{next_mode}" '
-            f'title="{next_mode}">{next_mode}</a>'
-        )
-        end = html.index(next_marker, start + len(title_marker))
-    else:
-        next_tab_group = re.search(r'</div></div></div>\s*</div><div class="content\d+">', html[start:])
-        if not next_tab_group:
-            raise ValueError(f"Unable to find end of {mode}")
-        end = start + next_tab_group.start()
-
-    return html[start:end]
-
-
-def extract_maps(section: str, mode: str) -> list[dict[str, str]]:
-    pattern = re.compile(
-        r'<div class="thumb"[^>]*>.*?'
-        r'<a href="(?P<href>[^"]+)" title="(?P<title>[^"]+)">'
-        r'<img alt="(?P<alt>[^"]+)" src="(?P<src>[^"]+)"',
-        re.S,
-    )
-    maps: list[dict[str, str]] = []
+    role_icons: dict[str, dict[str, str]] = {}
     seen: set[str] = set()
+    current_role = ""
 
-    for match in pattern.finditer(section):
-        name = unescape(match.group("title"))
-        if name in seen:
+    for row in table.find_all("tr"):
+        role_link = row.find("a", href=lambda value: isinstance(value, str) and value in {"/wiki/Roles#Tank", "/wiki/Roles#Damage", "/wiki/Roles#Support"})
+        if isinstance(role_link, Tag):
+            current_role = str(role_link.get("href")).rsplit("#", 1)[-1]
+            icon = role_link.find("img") or row.find("img", alt=lambda value: isinstance(value, str) and value.lower().endswith("icon"))
+            if isinstance(icon, Tag):
+                role_icons[current_role] = build_icon_item(current_role, icon, "roles", public_prefix)
+
+        if current_role not in ROLE_ZH:
             continue
 
-        image_url = urljoin(LIQUIPEDIA_MAPS_URL, unescape(match.group("src")))
-        file_name = build_map_file_name(name, image_url)
-        maps.append(
+        for image in row.find_all("img"):
+            image_name = str(image.get("data-image-name") or image.get("alt") or "")
+            if not image_name.lower().startswith("icon-"):
+                continue
+            cell = image.find_parent("td")
+            name_link = cell.find("a", title=True) if isinstance(cell, Tag) else None
+            name = str(name_link.get("title") if isinstance(name_link, Tag) else image_name[5:])
+            name = name.removesuffix(".png").removesuffix(".webp").strip()
+            key = normalize_key(name)
+            if not key or key in seen:
+                continue
+            source = image_url(image, 160)
+            file_name = asset_file_name(name, source, image_name)
+            heroes.append(
+                {
+                    "nameEn": name,
+                    "role": current_role,
+                    "roleZh": ROLE_ZH[current_role],
+                    "pageUrl": urljoin(FANDOM_HEROES_URL, str(name_link.get("href") or "")) if isinstance(name_link, Tag) else FANDOM_HEROES_URL,
+                    "sourceImageUrl": source,
+                    "imageUrl": f"{public_prefix}/heroes/{file_name}",
+                    "fileName": file_name,
+                }
+            )
+            seen.add(key)
+
+    return heroes, role_icons
+
+
+def parse_maps(html: str, public_prefix: str) -> tuple[dict[str, list[dict[str, str]]], dict[str, dict[str, str]]]:
+    soup = BeautifulSoup(html, "html.parser")
+    standard_label = soup.find("li", attrs={"data-hash": "Standard_Play"})
+    standard_content = standard_label.find_next_sibling("div", class_="wds-tab__content") if isinstance(standard_label, Tag) else None
+    if not isinstance(standard_content, Tag):
+        standard_content = next(
+            (
+                item
+                for item in soup.select(".wds-tab__content")
+                if item.find(string=lambda value: isinstance(value, str) and value.strip() == "Standard Play")
+            ),
+            None,
+        )
+    if not isinstance(standard_content, Tag):
+        raise ValueError("Standard Play map section was not found")
+
+    maps: dict[str, list[dict[str, str]]] = {mode: [] for mode in MODES}
+    mode_icons: dict[str, dict[str, str]] = {}
+    seen: dict[str, set[str]] = {mode: set() for mode in MODES}
+    current_mode = ""
+
+    all_standard_modes = {*MODES, "Clash"}
+    for child in standard_content.descendants:
+        if not isinstance(child, Tag) or child.name != "div":
+            continue
+        mode_link = child.find("a", title=lambda value: value in all_standard_modes, recursive=False)
+        if not isinstance(mode_link, Tag):
+            bold = child.find("b", recursive=False)
+            mode_link = bold.find("a", title=lambda value: value in all_standard_modes) if isinstance(bold, Tag) else None
+        if isinstance(mode_link, Tag):
+            current_mode = str(mode_link.get("title"))
+            icon = child.find("img")
+            if current_mode in MODES and isinstance(icon, Tag):
+                mode_icons[current_mode] = build_icon_item(current_mode, icon, "modes", public_prefix)
+            continue
+
+        if "fpimagelink-mask" not in (child.get("class") or []):
+            continue
+        card = child.select_one(".fpimagelink")
+        if current_mode not in MODES or not isinstance(card, Tag):
+            continue
+        text_link = card.select_one(".text a[title]")
+        image = card.find("img")
+        if not isinstance(text_link, Tag) or not isinstance(image, Tag):
+            continue
+        name = str(text_link.get("title") or text_link.get_text(" ", strip=True)).strip()
+        if not name or name in seen[current_mode]:
+            continue
+        source = image_url(image, 800)
+        file_name = asset_file_name(name, source, str(image.get("data-image-name") or image.get("alt") or ""))
+        maps[current_mode].append(
             {
-                "mode": mode,
+                "mode": current_mode,
                 "nameEn": name,
-                "pageUrl": urljoin(LIQUIPEDIA_MAPS_URL, unescape(match.group("href"))),
-                "sourceImageUrl": image_url,
-                "imageUrl": f"/static/maps/{file_name}",
+                "pageUrl": urljoin(FANDOM_HOME_URL, str(text_link.get("href") or "")),
+                "sourceImageUrl": source,
+                "imageUrl": f"{public_prefix}/maps/{file_name}",
                 "fileName": file_name,
             }
         )
-        seen.add(name)
+        seen[current_mode].add(name)
 
-    return maps
-
-
-def extract_heroes_from_page(html: str) -> dict[str, dict[str, str]]:
-    heroes: dict[str, dict[str, str]] = {}
-
-    for tag in re.findall(r"<img\b[^>]*>", html, re.I | re.S):
-        image_name_match = re.search(r'data-image-name="Icon-([^"]+?)\.(?:png|webp)"', tag, re.I)
-        if not image_name_match:
-            image_name_match = re.search(r'alt="Icon-([^"]+)"', tag, re.I)
-        if not image_name_match:
-            continue
-
-        name = normalize_hero_display_name(unescape(image_name_match.group(1)))
-        if not name or name.lower() in {"tank", "damage", "support"}:
-            continue
-
-        image_url = find_img_url(tag)
-        heroes[normalize_key(name)] = {
-            "nameEn": name,
-            "pageImageUrl": image_url,
-        }
-
-    return heroes
+    return maps, mode_icons
 
 
-def find_img_url(tag: str) -> str:
-    for attribute in ["data-src", "src"]:
-        match = re.search(rf'{attribute}="([^"]+)"', tag, re.I)
-        if match:
-            url = unescape(match.group(1))
-            if not url.startswith("data:"):
-                return urljoin(FANDOM_HEROES_URL, url)
-    return ""
+def build_icon_item(name: str, image: Tag, folder: str, public_prefix: str) -> dict[str, str]:
+    source = image_url(image, 96)
+    original_name = str(image.get("data-image-name") or image.get("alt") or "")
+    file_name = asset_file_name(name, source, original_name)
+    return {
+        "mode" if folder == "modes" else "role": name,
+        "sourceImageUrl": source,
+        "imageUrl": f"{public_prefix}/{folder}/{file_name}",
+        "fileName": file_name,
+    }
 
 
-def find_hero_image_url(hero_name: str) -> str:
-    file_names = [
-        f"Icon-{hero_name}.png",
-        f"Icon-{hero_name.replace(':', '')}.png",
-        f"Icon-{hero_name.replace(': ', ' ')}.png",
-    ]
-
-    if hero_name == "Lúcio":
-        file_names.extend(["Icon-Lucio.png", "Icon-Lúcio.png"])
-    if hero_name == "Torbjörn":
-        file_names.extend(["Icon-Torbjorn.png", "Icon-Torbjörn.png"])
-
-    for file_name in dict.fromkeys(file_names):
-        try:
-            return fetch_fandom_file_url(file_name)
-        except Exception:
-            continue
-
-    return ""
+def image_url(image: Tag, desired_width: int) -> str:
+    source = str(image.get("data-src") or image.get("src") or "").strip()
+    if not source or source.startswith("data:"):
+        raise ValueError("Image is missing a non-placeholder source URL")
+    source = urljoin(FANDOM_HOME_URL, source)
+    validate_image_url(source)
+    if "/revision/" in source:
+        base, remainder = source.split("/revision/", 1)
+        query = "?" + remainder.split("?", 1)[1] if "?" in remainder else ""
+        source = f"{base}/revision/latest/scale-to-width-down/{desired_width}{query}"
+    return source
 
 
-def build_map_file_name(name: str, image_url: str) -> str:
-    source_name = urlparse(image_url).path.rsplit("/", 1)[-1]
-    source_name = re.sub(r"^\d+px-", "", source_name)
-    suffix = Path(source_name).suffix.lower() or ".jpg"
-    return f"{slugify(name)}{suffix}"
+def validate_image_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in TRUSTED_IMAGE_HOSTS:
+        raise ValueError(f"Untrusted image URL: {url}")
 
 
-def image_extension(url: str, fallback: str) -> str:
-    suffix = Path(urlparse(url).path).suffix.lower()
-    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
-        return suffix
-    return fallback
+def asset_file_name(name: str, source_url: str, original_name: str) -> str:
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
+        match = next((ext for ext in (".png", ".jpg", ".jpeg", ".webp", ".svg") if ext in urlparse(source_url).path.lower()), ".png")
+        suffix = match
+    digest = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:12]
+    return f"{slugify(name)}-{digest}{suffix}"
 
 
-def download_image(url: str, path: Path) -> None:
-    if path.exists() and path.stat().st_size > 0:
-        return
+def validate_parsed_catalog(
+    heroes: list[dict[str, str]],
+    maps: dict[str, list[dict[str, str]]],
+    mode_icons: dict[str, dict[str, str]],
+    role_icons: dict[str, dict[str, str]],
+) -> None:
+    if len(heroes) < 40:
+        raise ValueError(f"Expected at least 40 heroes, found {len(heroes)}")
+    if set(maps) != set(MODES) or any(not maps[mode] for mode in MODES):
+        raise ValueError("One or more selected map modes are empty")
+    if set(mode_icons) != set(MODES):
+        raise ValueError("One or more mode icons are missing")
+    if set(role_icons) != set(ROLE_ZH):
+        raise ValueError("One or more role icons are missing")
 
-    request = Request(url, headers={"User-Agent": USER_AGENT})
+
+def validate_downloads(output_dir: Path, downloads: list[tuple[str, Path]]) -> None:
+    missing = [str(path.relative_to(output_dir)) for _url, path in downloads if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        raise ValueError("Missing downloaded assets: " + ", ".join(missing))
+
+
+def fetch_json(url: str, deadline: float | None) -> dict[str, Any]:
+    check_deadline(deadline)
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     with urlopen(request, timeout=30) as response:
-        path.write_bytes(response.read())
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Expected an object from Fandom API")
+    return payload
 
 
-def normalize_hero_display_name(value: str) -> str:
-    name = value.strip().replace("_", " ")
-    name = re.sub(r"\.(?:png|webp)$", "", name, flags=re.I)
-    return name
+def download_image(url: str, path: Path, deadline: float | None) -> None:
+    check_deadline(deadline)
+    validate_image_url(url)
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/*"})
+    with urlopen(request, timeout=30) as response:
+        validate_image_url(response.geturl())
+        content_type = response.headers.get_content_type()
+        data = response.read()
+    if not content_type.startswith("image/") or not data:
+        raise ValueError(f"Invalid image response from {url}")
+    path.write_bytes(data)
+
+
+def check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("Catalog refresh exceeded ten minutes")
+
+
+def publish_bundled(stage: Path, assets: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for folder in ("maps", "heroes", "modes", "roles"):
+        source = stage / folder
+        destination = STATIC_DIR / ("role-icons" if folder == "roles" else folder)
+        destination.mkdir(parents=True, exist_ok=True)
+        for source_file in source.iterdir():
+            shutil.copy2(source_file, destination / source_file.name)
+
+    temporary_assets = ASSETS_MANIFEST_PATH.with_name(f".{ASSETS_MANIFEST_PATH.name}.tmp")
+    temporary_assets.write_text(json.dumps(assets, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary_assets.replace(ASSETS_MANIFEST_PATH)
+    maps_payload = {
+        "schemaVersion": CATALOG_SCHEMA_VERSION,
+        "source": FANDOM_HOME_URL,
+        "updatedAt": assets["updatedAt"],
+        "catalogHash": assets["catalogHash"],
+        "modes": list(MODES),
+        "maps": assets["maps"],
+    }
+    temporary_maps = MAPS_MANIFEST_PATH.with_name(f".{MAPS_MANIFEST_PATH.name}.tmp")
+    temporary_maps.write_text(json.dumps(maps_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary_maps.replace(MAPS_MANIFEST_PATH)
 
 
 def normalize_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", strip_accents(value).lower())
+    normalized = unicodedata.normalize("NFKD", value)
+    return "".join(character.lower() for character in normalized if character.isalnum() and not unicodedata.combining(character))
 
 
 def slugify(value: str) -> str:
-    stripped = strip_accents(value)
-    return re.sub(r"[^a-z0-9]+", "-", stripped.lower()).strip("-")
-
-
-def strip_accents(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value)
-    return "".join(character for character in normalized if not unicodedata.combining(character))
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-
-    with path.open(encoding="utf-8") as file:
-        return json.load(file)
+    ascii_value = "".join(character for character in normalized if not unicodedata.combining(character))
+    output = []
+    previous_dash = False
+    for character in ascii_value.lower():
+        if character.isalnum():
+            output.append(character)
+            previous_dash = False
+        elif not previous_dash:
+            output.append("-")
+            previous_dash = True
+    return "".join(output).strip("-") or "asset"
 
 
 if __name__ == "__main__":

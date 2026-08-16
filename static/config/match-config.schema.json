@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://owbanpick.local/schema/match-config.schema.json",
+  "title": "OW Ban Pick 比赛配置模板",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "name", "config"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 2 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "description": { "type": "string", "maxLength": 500 },
+    "config": { "$ref": "#/$defs/config" }
+  },
+  "$defs": {
+    "seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+    "optionalSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+    "nullableLimit": { "type": ["integer", "null"], "minimum": 1 },
+    "sideNames": {
+      "type": "object", "additionalProperties": false, "required": ["left", "right"],
+      "properties": { "left": { "type": "string", "minLength": 1, "maxLength": 60 }, "right": { "type": "string", "minLength": 1, "maxLength": 60 } }
+    },
+    "config": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "matchName", "teamNames", "matchFormat", "startPolicy", "teamsCanEditOwnName", "timing", "map", "sideChoice", "lineup", "ban", "score", "pause", "rollback"],
+      "properties": {
+        "schemaVersion": { "const": 2 },
+        "matchName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "teamNames": { "$ref": "#/$defs/sideNames" },
+        "matchFormat": { "enum": ["ft2", "ft3", "ft4"] },
+        "startPolicy": { "enum": ["manual", "auto_when_both_ready"] },
+        "teamsCanEditOwnName": { "type": "boolean" },
+        "timing": {
+          "type": "object", "additionalProperties": false,
+          "required": ["preMatchRestSeconds", "interMapRestSeconds", "interactiveRandomSeconds", "mapPickSeconds", "sidePickSeconds", "lineupSubmitSeconds", "banOrderSeconds", "firstBanSeconds", "secondBanSeconds", "scoreConfirmationSeconds", "timeoutExtensionSeconds"],
+          "properties": {
+            "preMatchRestSeconds": { "$ref": "#/$defs/optionalSeconds" }, "interMapRestSeconds": { "$ref": "#/$defs/optionalSeconds" },
+            "interactiveRandomSeconds": { "$ref": "#/$defs/seconds" }, "mapPickSeconds": { "$ref": "#/$defs/seconds" }, "sidePickSeconds": { "$ref": "#/$defs/seconds" },
+            "lineupSubmitSeconds": { "$ref": "#/$defs/seconds" }, "banOrderSeconds": { "$ref": "#/$defs/seconds" }, "firstBanSeconds": { "$ref": "#/$defs/seconds" },
+            "secondBanSeconds": { "$ref": "#/$defs/seconds" }, "scoreConfirmationSeconds": { "$ref": "#/$defs/seconds" }, "timeoutExtensionSeconds": { "$ref": "#/$defs/seconds" }
+          }
+        },
+        "map": {
+          "type": "object", "additionalProperties": false,
+          "required": ["mapPool", "selectionPolicy", "firstMapMode", "modeOrder", "fixedMapOrder", "fixedFirstMapEnabled", "fixedFirstMapId", "initialPriorityPolicy", "subsequentPriorityPolicy", "mapPickTimeoutPolicy", "interactiveRandomMissingInputPolicy"],
+          "properties": {
+            "mapPool": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } },
+            "selectionPolicy": { "enum": ["unique_map", "unique_mode_until_cycle", "first_mode_then_unique_mode", "strict_mode_order", "fixed_map_order"] },
+            "firstMapMode": { "type": "string", "minLength": 1 }, "modeOrder": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "fixedMapOrder": { "type": "array", "items": { "type": "string", "minLength": 1 } }, "fixedFirstMapEnabled": { "type": "boolean" }, "fixedFirstMapId": { "type": ["string", "null"] },
+            "initialPriorityPolicy": { "enum": ["system_random", "interactive_random", "left", "right"] }, "subsequentPriorityPolicy": { "enum": ["previous_loser", "previous_winner"] },
+            "mapPickTimeoutPolicy": { "enum": ["retry_after_delay", "random_legal_map", "forfeit_map", "admin_decision"] }, "interactiveRandomMissingInputPolicy": { "enum": ["use_zero", "server_random", "admin_decision"] }
+          }
+        },
+        "sideChoice": {
+          "type": "object", "additionalProperties": false, "required": ["firstMapSideChoiceEnabled", "symmetricSideChoiceEnabled", "chooserRelation", "timeoutPolicy"],
+          "properties": { "firstMapSideChoiceEnabled": { "type": "boolean" }, "symmetricSideChoiceEnabled": { "type": "boolean" }, "chooserRelation": { "enum": ["priority", "non_priority"] }, "timeoutPolicy": { "enum": ["random_legal_choice", "chooser_blue_defense", "chooser_red_attack", "admin_decision", "retry_after_delay", "forfeit_map"] } }
+        },
+        "lineup": {
+          "type": "object", "additionalProperties": false, "required": ["mode", "presetRosters", "timeoutPolicy"],
+          "properties": { "mode": { "enum": ["free_input", "preset_only", "skip"] }, "presetRosters": { "type": "object", "required": ["left", "right"], "additionalProperties": false, "properties": { "left": { "type": "array", "items": { "type": "string" } }, "right": { "type": "array", "items": { "type": "string" } } } }, "timeoutPolicy": { "enum": ["retry_after_delay", "forfeit_map", "admin_decision"] } }
+        },
+        "ban": {
+          "type": "object", "additionalProperties": false, "required": ["enabled", "advantageRelation", "orderPolicy", "orderTimeoutPolicy", "actionTimeoutPolicy"],
+          "properties": { "enabled": { "type": "boolean" }, "advantageRelation": { "enum": ["priority", "non_priority"] }, "orderPolicy": { "enum": ["advantage_chooses", "advantage_must_first"] }, "orderTimeoutPolicy": { "enum": ["random_legal_order", "advantage_first", "advantage_second", "admin_decision", "retry_after_delay", "forfeit_map"] }, "actionTimeoutPolicy": { "enum": ["random_legal_hero", "retry_after_delay", "forfeit_map", "admin_decision"] } }
+        },
+        "score": { "type": "object", "additionalProperties": false, "required": ["confirmationTimeoutPolicy"], "properties": { "confirmationTimeoutPolicy": { "enum": ["auto_confirm", "admin_decision"] } } },
+        "pause": { "type": "object", "additionalProperties": false, "required": ["globalPauseEnabled", "teamPauseEnabled", "teamPauseMaxCountPerMap", "teamPauseMaxSingleSeconds", "teamPauseMaxTotalSeconds"], "properties": { "globalPauseEnabled": { "type": "boolean" }, "teamPauseEnabled": { "type": "boolean" }, "teamPauseMaxCountPerMap": { "$ref": "#/$defs/nullableLimit" }, "teamPauseMaxSingleSeconds": { "$ref": "#/$defs/nullableLimit" }, "teamPauseMaxTotalSeconds": { "$ref": "#/$defs/nullableLimit" } } },
+        "rollback": { "type": "object", "additionalProperties": false, "required": ["enabled", "defaultCheckpoints", "mapOverrides", "allowAfterCompletion"], "properties": { "enabled": { "type": "boolean" }, "defaultCheckpoints": { "type": "array", "uniqueItems": true, "items": { "enum": ["pre_countdown", "map_pick", "lineup", "ban_order", "first_ban", "second_ban", "score_entry"] } }, "mapOverrides": { "type": "object", "additionalProperties": { "type": "array" } }, "allowAfterCompletion": { "type": "boolean" } } }
+      }
+    }
+  }
+}

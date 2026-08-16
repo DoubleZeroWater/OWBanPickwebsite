@@ -1,0 +1,77 @@
+{
+  "$schema": "./match-config.schema.json",
+  "schemaVersion": 2,
+  "name": "杯赛 A",
+  "config": {
+    "schemaVersion": 2,
+    "matchName": "杯赛 A",
+    "teamNames": { "left": "队伍1", "right": "队伍2" },
+    "matchFormat": "ft3",
+    "startPolicy": "manual",
+    "teamsCanEditOwnName": false,
+    "timing": {
+      "preMatchRestSeconds": 30,
+      "interMapRestSeconds": 120,
+      "interactiveRandomSeconds": 30,
+      "mapPickSeconds": 45,
+      "sidePickSeconds": 30,
+      "lineupSubmitSeconds": 60,
+      "banOrderSeconds": 25,
+      "firstBanSeconds": 25,
+      "secondBanSeconds": 25,
+      "scoreConfirmationSeconds": 30,
+      "timeoutExtensionSeconds": 30
+    },
+    "map": {
+      "mapPool": {
+        "control": ["lijiang_tower", "ilios"],
+        "escort": ["circuit_royal", "dorado"],
+        "hybrid": ["kings_row", "hollywood"],
+        "push": ["colosseo", "new_queen_street"],
+        "flashpoint": ["suravasa", "new_junk_city"]
+      },
+      "selectionPolicy": "first_mode_then_unique_mode",
+      "firstMapMode": "control",
+      "modeOrder": ["control", "push", "hybrid", "escort", "flashpoint"],
+      "fixedMapOrder": [],
+      "fixedFirstMapEnabled": false,
+      "fixedFirstMapId": null,
+      "initialPriorityPolicy": "interactive_random",
+      "subsequentPriorityPolicy": "previous_loser",
+      "mapPickTimeoutPolicy": "retry_after_delay",
+      "interactiveRandomMissingInputPolicy": "use_zero"
+    },
+    "sideChoice": {
+      "firstMapSideChoiceEnabled": false,
+      "symmetricSideChoiceEnabled": false,
+      "chooserRelation": "priority",
+      "timeoutPolicy": "chooser_blue_defense"
+    },
+    "lineup": {
+      "mode": "free_input",
+      "presetRosters": { "left": [], "right": [] },
+      "timeoutPolicy": "retry_after_delay"
+    },
+    "ban": {
+      "enabled": true,
+      "advantageRelation": "priority",
+      "orderPolicy": "advantage_chooses",
+      "orderTimeoutPolicy": "advantage_first",
+      "actionTimeoutPolicy": "retry_after_delay"
+    },
+    "score": { "confirmationTimeoutPolicy": "auto_confirm" },
+    "pause": {
+      "globalPauseEnabled": true,
+      "teamPauseEnabled": true,
+      "teamPauseMaxCountPerMap": null,
+      "teamPauseMaxSingleSeconds": null,
+      "teamPauseMaxTotalSeconds": null
+    },
+    "rollback": {
+      "enabled": true,
+      "defaultCheckpoints": ["pre_countdown", "map_pick", "lineup", "ban_order", "first_ban", "second_ban", "score_entry"],
+      "mapOverrides": {},
+      "allowAfterCompletion": false
+    }
+  }
+}
