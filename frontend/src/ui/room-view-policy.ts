@@ -91,8 +91,6 @@ export function deriveRoomViewPolicy(
     canActAsPhaseOwner,
     canResolveAdminDecision,
     primaryActionState,
-    canMinimize: canMutateMatch
-      && foreground !== "none"
-      && foreground !== "interactive-random",
+    canMinimize: !completed && foreground !== "none",
   };
 }

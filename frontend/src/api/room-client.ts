@@ -2,7 +2,8 @@ import type {
   ActionRequest,
   AuthoritativeStatus,
   NotificationStream,
-  StatusRef,
+  CommandContext,
+  StateCheck,
   SyncResponse,
 } from "../state/protocol";
 
@@ -23,17 +24,20 @@ export class RoomClient extends EventTarget {
     this.ingestNotificationStream(stream);
   }
 
-  async sync(status: Pick<StatusRef, "epoch" | "revision" | "hash"> | null): Promise<SyncResponse> {
+  async sync(check: StateCheck | null): Promise<SyncResponse> {
     return this.request<SyncResponse>("sync", {
-      status,
+      check,
       notificationCursor: this.notificationCursor,
     });
   }
 
-  async action(expected: StatusRef, type: string, payload: Record<string, unknown> = {}): Promise<SyncResponse> {
+  async action(context: CommandContext, type: string, payload: Record<string, unknown> = {}, commandId?: string): Promise<SyncResponse> {
     const body: ActionRequest = {
-      requestId: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      expected,
+      commandId: commandId ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      epoch: context.epoch,
+      phaseId: context.phaseId,
+      runtimeId: context.runtimeId,
+      check: context.check,
       type,
       payload,
       notificationCursor: this.notificationCursor,

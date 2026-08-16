@@ -1,0 +1,151 @@
+.debug-page-body {
+  --debug-toolbar-height: 130px;
+  padding-top: var(--debug-toolbar-height);
+}
+
+.debug-page-body .debug-toolbar {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 10000;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px 18px;
+  height: var(--debug-toolbar-height);
+  padding: 10px 16px;
+  color: #f7f8fb;
+  background: rgba(12, 16, 23, 0.97);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(16px);
+}
+
+/* The debug toolbar consumes viewport space; phase windows begin below it. */
+.debug-page-body .pop-window-overlay {
+  inset: var(--debug-toolbar-height) 0 0;
+}
+
+.debug-page-body .pop-window-minimized {
+  right: auto !important;
+  left: 18px !important;
+  top: calc(var(--debug-toolbar-height) + 18px) !important;
+}
+
+.debug-page-body .pop-window-panel,
+.debug-page-body .map-selector-panel,
+.debug-page-body .lineup-selector-panel,
+.debug-page-body .side-selector-panel,
+.debug-page-body .ban-selector-panel,
+.debug-page-body .score-selector-panel {
+  max-height: calc(100dvh - var(--debug-toolbar-height) - 32px);
+}
+
+.debug-page-body .pop-window-floating.pause-overlay {
+  inset: calc(var(--debug-toolbar-height) + 18px) 18px auto auto !important;
+}
+
+.debug-toolbar-heading {
+  grid-row: 1 / span 2;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 130px;
+}
+
+.debug-toolbar-heading strong {
+  color: #ff9c2a;
+  font-size: 0.92rem;
+  letter-spacing: 0.13em;
+}
+
+.debug-toolbar-heading span {
+  margin-top: 3px;
+  color: #99a5b5;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.debug-toolbar-row {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center;
+  min-width: 0;
+}
+
+.debug-toolbar-label,
+.debug-toolbar-group {
+  color: #8d99aa;
+  font-size: 0.72rem;
+  font-weight: var(--base-text-weight-medium);
+  white-space: nowrap;
+}
+
+.debug-toolbar-group {
+  padding-left: 8px;
+  border-left: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.debug-toolbar-scroll {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 2px 2px 5px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.debug-toolbar button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 5px 11px;
+  color: #d9dee7;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: var(--base-text-weight-medium);
+  line-height: 1;
+  background: #242b36;
+  border: 1px solid #3b4554;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.debug-toolbar button:hover,
+.debug-toolbar button:focus-visible {
+  color: #fff;
+  border-color: #8390a3;
+  outline: none;
+}
+
+.debug-toolbar button.is-active {
+  color: #12161d;
+  background: #ff9c2a;
+  border-color: #ffb55f;
+}
+
+@media (max-width: 760px) {
+  .debug-page-body {
+    --debug-toolbar-height: 154px;
+  }
+
+  .debug-page-body .debug-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+    padding-inline: 10px;
+  }
+
+  .debug-toolbar-heading {
+    grid-row: auto;
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: flex-start;
+    gap: 9px;
+  }
+
+  .debug-toolbar-heading span {
+    margin-top: 0;
+  }
+
+  .debug-toolbar-row {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+}

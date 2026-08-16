@@ -41,8 +41,7 @@ export class HeartbeatController {
     if (this.stopped || this.inFlight) return;
     this.inFlight = true;
     try {
-      const ref = this.store.ref;
-      const response = await this.client.sync(ref ? { epoch: ref.epoch, revision: ref.revision, hash: ref.hash } : null);
+      const response = await this.client.sync(this.store.check);
       await this.store.apply(response);
       this.failureIndex = 0;
     } catch (error) {

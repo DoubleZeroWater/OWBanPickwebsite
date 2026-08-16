@@ -1,6 +1,26 @@
 export type Side = "left" | "right";
 export type PortalCode = "A" | "B" | "C" | "D";
 
+export interface StateCheck {
+  epoch: number;
+  boardHash: string;
+  factsRevision: number;
+  factsHash: string;
+  phaseId: string;
+  runtimeId: string;
+  runtimeSeq: number;
+  presenceHash: string;
+  privateHash: string;
+}
+
+export interface CommandContext {
+  epoch: number;
+  phaseId: string;
+  runtimeId: string;
+  check: StateCheck;
+}
+
+/** Compatibility shape used by history/notification rendering only. */
 export interface StatusRef {
   epoch: number;
   revision: number;
@@ -13,7 +33,8 @@ export interface AuthoritativePhase {
   type:
     | "configuring" | "waiting_ready" | "pre_start_rest" | "interactive_random"
     | "map_pick" | "side_pick" | "lineup_pick" | "ban_order" | "ban_first"
-    | "ban_second" | "score_entry" | "post_map_rest" | "completed";
+    | "ban_second" | "score_entry" | "score_confirmation" | "post_map_rest"
+    | "admin_decision" | "completed";
   mapIndex: number | null;
   actorSide: Side | "both" | null;
   data: Record<string, unknown>;
@@ -25,15 +46,50 @@ export interface AuthoritativeMap {
   mapId: string | null;
   modeId: string | null;
   pickerSide: Side | null;
-  sideChoice: null | { kind: "attack_defense" | "color"; chooserSide: Side; selectedSide: Side };
+  sideChoice: null | {
+    kind: "attack_defense" | "color" | "none";
+    chooserSide: Side;
+    selectedSide: Side;
+    automatic?: boolean;
+  };
   lineups: null | Record<Side, Record<string, string>>;
   bans: { firstBanSide: Side | null; leftHeroId: string | null; rightHeroId: string | null };
   score: null | Record<Side, number>;
+  resultType: "score" | "forfeit" | null;
   winnerSide: Side | null;
   forfeitSide: Side | null;
   forfeitReason: string | null;
 }
 
+export interface BaseboardSegment {
+  schemaVersion: 1;
+  roomId: string;
+  catalogHash: string;
+  configVersion: number;
+  configHash: string;
+  boardHash: string;
+  config: Record<string, unknown>;
+}
+
+export interface MatchFactsSegment {
+  epoch: number;
+  revision: number;
+  factsHash: string;
+  lifecycle: "preparing" | "running" | "completed";
+  match: {
+    teams: Record<Side, { id: string; name: string; seed: number; seriesScore: number }>;
+    decisions: {
+      firstMapPickerSide: Side | null;
+      firstMapSidePickerSide: Side | null;
+      openingBanSide: Side | null;
+      initialPrioritySide?: Side | null;
+    };
+    winnerSide: Side | null;
+    maps: AuthoritativeMap[];
+  };
+}
+
+/** Local projection assembled from independently checked network segments. */
 export interface AuthoritativeStatus {
   schemaVersion: 2;
   roomId: string;
@@ -43,16 +99,7 @@ export interface AuthoritativeStatus {
   catalogHash: string;
   lifecycle: "preparing" | "running" | "completed";
   config: Record<string, unknown>;
-  match: {
-    teams: Record<Side, { id: string; name: string; seed: number; seriesScore: number }>;
-    decisions: {
-      firstMapPickerSide: Side | null;
-      firstMapSidePickerSide: Side | null;
-      openingBanSide: Side | null;
-    };
-    winnerSide: Side | null;
-    maps: AuthoritativeMap[];
-  };
+  match: MatchFactsSegment["match"];
   phase: AuthoritativePhase;
 }
 
@@ -60,6 +107,8 @@ export interface AuthoritativeRuntime {
   baseStatusRevision: number;
   baseStatusHash: string;
   phaseId: string;
+  runtimeId: string;
+  runtimeSeq: number;
   totalTimeMs: number;
   remainingTimeMs: number;
   pause: {
@@ -68,8 +117,10 @@ export interface AuthoritativeRuntime {
   };
   presence: Record<PortalCode, { connected: boolean; ready: boolean; nameConfirmed: boolean; lastSeenAt: number }>;
   interactiveRandom: Record<Side, 0 | 1 | null> | null;
+  interactiveRandomSubmitted?: Record<Side, boolean> | null;
   interactiveRandomResult: { left: 0 | 1; right: 0 | 1; resultSide: Side } | null;
   lineupSubmissions: Record<Side, Record<string, string> | null>;
+  lineupSubmitted?: Record<Side, boolean>;
   scoreProposal: null | { submittedBy: Side; score: Record<Side, number>; rejectedBy: Side | null };
   restSkip: Record<Side, boolean>;
   timedOut: boolean;
@@ -93,64 +144,37 @@ export interface MatchNotificationEvent {
   statusVersion: StatusRef;
 }
 
-export interface NotificationStream {
-  cursor: number;
-  events: MatchNotificationEvent[];
+export interface NotificationStream { cursor: number; events: MatchNotificationEvent[]; }
+
+export interface PrivateContextSegment {
+  lineupSubmissions?: Record<Side, Record<string, string> | null>;
+  interactiveRandom?: Record<Side, 0 | 1 | null>;
 }
 
-export type SyncResponse =
-  | {
-      kind: "full";
-      status: AuthoritativeStatus;
-      runtime: AuthoritativeRuntime;
-      notificationStream: NotificationStream;
-    }
-  | {
-      kind: "runtime";
-      statusRef: StatusRef;
-      runtime: AuthoritativeRuntime;
-      notificationStream: NotificationStream;
-    };
+export interface SyncResponse {
+  kind: "ok" | "changed" | "rebase";
+  check: StateCheck;
+  board?: BaseboardSegment;
+  facts?: MatchFactsSegment;
+  phase?: AuthoritativePhase;
+  runtime?: Omit<AuthoritativeRuntime, "presence" | "lineupSubmissions">;
+  presence?: AuthoritativeRuntime["presence"];
+  privateContext?: PrivateContextSegment;
+  allowedActions: string[];
+  notificationStream: NotificationStream;
+}
 
 export interface ActionRequest {
-  requestId: string;
-  expected: StatusRef;
+  commandId: string;
+  epoch: number;
+  phaseId: string;
+  runtimeId: string;
+  check: StateCheck;
   type: string;
   payload: Record<string, unknown>;
   notificationCursor: number | null;
 }
 
-function sortValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortValue);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .filter(([key]) => key !== "hash")
-        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
-        .map(([key, item]) => [key, sortValue(item)]),
-    );
-  }
-  return value;
-}
-
-export function canonicalStatusJson(status: AuthoritativeStatus): string {
-  return JSON.stringify(sortValue(status));
-}
-
-export async function verifyStatusHash(status: AuthoritativeStatus): Promise<boolean> {
-  if (!globalThis.crypto?.subtle) return true;
-  const bytes = new TextEncoder().encode(canonicalStatusJson(status));
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-  const hex = [...new Uint8Array(digest)].map((item) => item.toString(16).padStart(2, "0")).join("");
-  return status.hash === `sha256:${hex}`;
-}
-
-export function statusRef(status: AuthoritativeStatus): StatusRef {
-  return { epoch: status.epoch, revision: status.revision, hash: status.hash, phaseId: status.phase.phaseId };
-}
-
-export function runtimeMatches(status: AuthoritativeStatus, runtime: AuthoritativeRuntime): boolean {
-  return runtime.baseStatusRevision === status.revision
-    && runtime.baseStatusHash === status.hash
-    && runtime.phaseId === status.phase.phaseId;
+export function commandContext(check: StateCheck): CommandContext {
+  return { epoch: check.epoch, phaseId: check.phaseId, runtimeId: check.runtimeId, check };
 }
