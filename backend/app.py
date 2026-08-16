@@ -38,6 +38,7 @@ try:
         StateValidationError,
         default_config,
         hero_pool_from_catalog,
+        map_capabilities_from_catalog,
         normalize_config,
     )
 except ModuleNotFoundError:  # Support `python backend/app.py` from the repository root.
@@ -46,6 +47,7 @@ except ModuleNotFoundError:  # Support `python backend/app.py` from the reposito
         StateValidationError,
         default_config,
         hero_pool_from_catalog,
+        map_capabilities_from_catalog,
         normalize_config,
     )
 
@@ -130,6 +132,10 @@ def create_app() -> Flask:
 
     @app.get("/admin/<admin_hash>")
     def admin_page(admin_hash: str) -> Any:
+        return frontend_page()
+
+    @app.get("/debug")
+    def debug_page() -> Any:
         return frontend_page()
 
     @app.get("/<portal_code>")
@@ -384,7 +390,7 @@ def create_app() -> Flask:
             return jsonify({"error": "not_found"}), 404
         session, portal_code = resolved
         payload = request.get_json(silent=True) or {}
-        client = payload.get("status") if isinstance(payload.get("status"), dict) else None
+        client = payload.get("check") if isinstance(payload.get("check"), dict) else None
         notification_cursor = payload.get("notificationCursor")
         if isinstance(notification_cursor, bool) or not isinstance(notification_cursor, int):
             notification_cursor = None
@@ -399,8 +405,13 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         action_type = payload.get("type")
         details = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
-        expected = payload.get("expected") if isinstance(payload.get("expected"), dict) else None
-        request_id = payload.get("requestId")
+        supplied_check = payload.get("check") if isinstance(payload.get("check"), dict) else {}
+        expected = {
+            "epoch": payload.get("epoch", supplied_check.get("epoch")),
+            "phaseId": payload.get("phaseId", supplied_check.get("phaseId")),
+            "runtimeId": payload.get("runtimeId", supplied_check.get("runtimeId")),
+        }
+        request_id = payload.get("commandId")
         notification_cursor = payload.get("notificationCursor")
         if isinstance(notification_cursor, bool) or not isinstance(notification_cursor, int):
             notification_cursor = None
@@ -417,10 +428,11 @@ def create_app() -> Flask:
             )
         except StateActionError as exc:
             body: dict[str, Any] = {"error": exc.code, "message": exc.message}
-            if exc.code == "stale_status":
+            if exc.code in {"missing_command_context", "stale_epoch", "stale_phase", "stale_runtime"}:
                 body.update(session.response(
                     notification_cursor=notification_cursor,
                     force_full=True,
+                    portal_code=portal_code,
                 ))
             return jsonify(body), exc.status_code
         touch_authoritative_room(room_token)
@@ -1222,6 +1234,7 @@ def save_config_preset(payload: Any, *, replace: bool) -> dict[str, Any]:
         payload.get("config", payload),
         accept_legacy=True,
         hero_pool=current_hero_pool(),
+        map_capabilities=current_map_capabilities(),
     )
     now = current_timestamp()
     preset = {
@@ -1245,9 +1258,10 @@ def build_room_config(value: Any = None, source: dict[str, Any] | None = None) -
             value if isinstance(value, dict) else {},
             accept_legacy=True,
             hero_pool=hero_pool,
+            map_capabilities=current_map_capabilities(),
         )
     except StateValidationError:
-        normalized = default_config(hero_pool)
+        normalized = default_config(hero_pool, current_map_capabilities())
     return {
         "status": "draft",
         "revision": 1,
@@ -1403,6 +1417,7 @@ def migrate_authoritative_config_presets_unlocked() -> None:
                 config,
                 accept_legacy=True,
                 hero_pool=current_hero_pool(),
+                map_capabilities=current_map_capabilities(),
             )
             backup = path.with_name(f"{path.stem}.legacy-v0.json")
             if not backup.exists():
@@ -2386,6 +2401,8 @@ def register_authoritative_room_unlocked(room: dict[str, Any]) -> RoomSession:
         {str(code): str(token) for code, token in (room.get("tokens") or {}).items()},
         config_state.get("value") if isinstance(config_state.get("value"), dict) else default_config(),
         catalog_hash,
+        hero_pool_from_catalog(assets.get("heroes", [])),
+        map_capabilities_from_catalog(assets),
     )
 
 
@@ -2470,7 +2487,7 @@ def format_room_token_payload(
             300,
             DEFAULT_GLOBAL_SETTINGS["notificationDurationSeconds"],
         ),
-        "authoritativeState": session.response(force_full=True),
+        "authoritativeState": session.response(force_full=True, portal_code=portal_code),
     }
 
 
@@ -2736,6 +2753,10 @@ def load_assets() -> dict[str, Any]:
 
 def current_hero_pool() -> dict[str, list[str]]:
     return hero_pool_from_catalog(load_assets().get("heroes", []))
+
+
+def current_map_capabilities() -> dict[str, str]:
+    return map_capabilities_from_catalog(load_assets())
 
 
 def map_catalog(assets: dict[str, Any]) -> dict[str, dict[str, str]]:

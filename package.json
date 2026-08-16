@@ -8,6 +8,10 @@
     "build": "tsc && vite build && node scripts/build_sites.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "test:backend": "python -m unittest discover -s tests/backend -v",
+    "test:frontend-structure": "node tests/frontend/pop-window-structure.mjs",
+    "test:frontend-state": "node tests/frontend/state-integration.mjs",
+    "test:debug": "playwright test --config playwright.debug.config.ts",
+    "test:debug-separation": "npm run build && node tests/frontend/debug-isolation.mjs",
     "test:ui-spec": "python scripts/validate_ui_spec.py",
     "test:e2e": "playwright test",
     "test:sites": "npm run build && node tests/sites/worker-smoke.mjs"

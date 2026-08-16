@@ -7,13 +7,14 @@ function nowMs(): number {
 function isRunning(runtime: AuthoritativeRuntime): boolean {
   return runtime.totalTimeMs > 0
     && runtime.remainingTimeMs > 0
-    && !runtime.timedOut
+    && !runtime.awaitingAdminDecision
     && !runtime.pause.global.active
     && !runtime.pause.scoreTeams.left.active
     && !runtime.pause.scoreTeams.right.active;
 }
 
 export class CountdownPresentationClock {
+  private runtimeId: string | null = null;
   private phaseId: string | null = null;
   private totalTimeMs = 0;
   private anchorRemainingMs = 0;
@@ -24,6 +25,7 @@ export class CountdownPresentationClock {
   private running = false;
 
   reset(runtime: AuthoritativeRuntime, atMs = nowMs()): void {
+    this.runtimeId = runtime.runtimeId;
     this.phaseId = runtime.phaseId;
     this.totalTimeMs = runtime.totalTimeMs;
     this.anchorRemainingMs = runtime.remainingTimeMs;
@@ -36,7 +38,8 @@ export class CountdownPresentationClock {
 
   reconcile(runtime: AuthoritativeRuntime, atMs = nowMs()): "adjust" | "reset" {
     if (
-      this.phaseId !== runtime.phaseId
+      this.runtimeId !== runtime.runtimeId
+      || this.phaseId !== runtime.phaseId
       || this.totalTimeMs !== runtime.totalTimeMs
       || this.previousServerRemainingMs === null
       || this.running !== isRunning(runtime)
@@ -49,24 +52,31 @@ export class CountdownPresentationClock {
     const deviationMs = runtime.remainingTimeMs - predictedRemainingMs;
     const serverTimeDecreased = runtime.remainingTimeMs < this.previousServerRemainingMs;
 
-    if (!this.running || !serverTimeDecreased || Math.abs(deviationMs) >= 1000) {
+    if (!this.running) {
       this.reset(runtime, atMs);
       return "reset";
     }
 
-    // Start from the currently displayed value and distribute a sub-second
-    // correction over one second. Because |deviation| < 1000 ms, the displayed
-    // countdown remains monotonically decreasing even when correcting upward.
+    // A duplicate or delayed heartbeat must not move the visual clock
+    // backwards. Keep the current presentation anchor until the server clock
+    // advances again.
+    if (!serverTimeDecreased) {
+      return "adjust";
+    }
+
+    // Start from the currently displayed value and distribute at most one
+    // second of correction over the next second. Larger transport delays are
+    // absorbed over subsequent heartbeats instead of visibly jumping the bar.
     this.anchorRemainingMs = predictedRemainingMs;
     this.anchorAtMs = atMs;
-    this.correctionMs = deviationMs;
+    this.correctionMs = Math.max(-999, Math.min(999, deviationMs));
     this.correctionAtMs = atMs;
     this.previousServerRemainingMs = runtime.remainingTimeMs;
     return "adjust";
   }
 
   snapshot(runtime: AuthoritativeRuntime, atMs = nowMs()): { remaining: number; percent: number } {
-    if (this.phaseId !== runtime.phaseId || this.totalTimeMs !== runtime.totalTimeMs) {
+    if (this.runtimeId !== runtime.runtimeId || this.phaseId !== runtime.phaseId || this.totalTimeMs !== runtime.totalTimeMs) {
       this.reset(runtime, atMs);
     }
     const remainingMs = this.remainingAt(atMs);

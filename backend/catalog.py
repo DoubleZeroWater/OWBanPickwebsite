@@ -5,6 +5,7 @@ import json
 import shutil
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,6 +13,24 @@ from typing import Any, Callable
 CATALOG_SCHEMA_VERSION = 1
 TRANSLATION_SCHEMA_VERSION = 1
 MODES = ["Escort", "Hybrid", "Control", "Push", "Flashpoint"]
+SIDE_SELECTION_BY_MODE = {
+    "Escort": "attack_defense",
+    "Hybrid": "attack_defense",
+    "Control": "red_blue",
+    "Push": "red_blue",
+    "Flashpoint": "red_blue",
+}
+
+
+def attach_map_capabilities(value: dict[str, Any]) -> dict[str, Any]:
+    assets = deepcopy(value)
+    for mode, items in assets.get("maps", {}).items():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                item.setdefault("sideSelectionKind", SIDE_SELECTION_BY_MODE.get(str(mode), "none"))
+    return assets
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -56,14 +75,25 @@ def catalog_keys(assets: dict[str, Any]) -> dict[str, list[str]]:
     return {"modes": modes, "maps": maps, "heroes": heroes}
 
 
-def compute_catalog_hash(assets: dict[str, Any]) -> str:
+def _hash_catalog_signature(signature: dict[str, Any]) -> str:
     canonical = json.dumps(
-        catalog_keys(assets),
+        signature,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_catalog_hash(assets: dict[str, Any]) -> str:
+    enriched = attach_map_capabilities(assets)
+    signature: dict[str, Any] = catalog_keys(enriched)
+    signature["mapCapabilities"] = sorted(
+        f"{item.get('nameEn')}:{item.get('sideSelectionKind')}"
+        for items in enriched.get("maps", {}).values()
+        for item in items if isinstance(item, dict) and item.get("nameEn")
+    )
+    return _hash_catalog_signature(signature)
 
 
 def build_translation_template(assets: dict[str, Any]) -> dict[str, Any]:
@@ -95,7 +125,10 @@ def validate_translation(assets: dict[str, Any], translation: Any) -> dict[str, 
         return diagnostics
 
     diagnostics["versionMismatch"] = translation.get("schemaVersion") != TRANSLATION_SCHEMA_VERSION
-    diagnostics["hashMismatch"] = translation.get("catalogHash") != compute_catalog_hash(assets)
+    diagnostics["hashMismatch"] = translation.get("catalogHash") not in {
+        compute_catalog_hash(assets),
+        _hash_catalog_signature(catalog_keys(assets)),
+    }
 
     for category in ("modes", "maps", "heroes"):
         values = translation.get(category)
@@ -132,8 +165,8 @@ def load_catalog_assets(bundled_path: Path, runtime_catalog_dir: Path) -> tuple[
     runtime_path = runtime_catalog_dir / "current" / "assets.json"
     runtime_assets = read_json(runtime_path)
     if is_complete_catalog(runtime_assets):
-        return runtime_assets, "runtime"
-    return read_json(bundled_path), "bundled"
+        return attach_map_capabilities(runtime_assets), "runtime"
+    return attach_map_capabilities(read_json(bundled_path)), "bundled"
 
 
 def load_translation(
@@ -221,7 +254,11 @@ def is_complete_catalog(assets: dict[str, Any]) -> bool:
         return False
     if not assets.get("heroes"):
         return False
-    return assets.get("catalogHash") == compute_catalog_hash(assets)
+    stored_hash = assets.get("catalogHash")
+    # Runtime catalogs written before map capabilities became part of the
+    # identity remain usable. Their response hash is upgraded in memory.
+    legacy_hash = _hash_catalog_signature(catalog_keys(assets))
+    return stored_hash in {compute_catalog_hash(assets), legacy_hash}
 
 
 def allowed_runtime_asset_paths(assets: dict[str, Any]) -> set[str]:
