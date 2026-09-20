@@ -58,12 +58,87 @@ function render(errorMessage = ""): void {
           <p id="createRoomStatus" class="landing-status${errorMessage ? " landing-status-error" : ""}" aria-live="polite">${escapeHtml(errorMessage)}</p>
         </section>
       </div>
+      ${renderLandingGuide()}
     </main>
   `;
 
   document.getElementById("createRoomButton")?.addEventListener("click", createRoomFromLanding);
   bindJoinRoomForm();
   bindRoomHashButtons();
+}
+
+function renderLandingGuide(): string {
+  return `
+    <section class="landing-guide" aria-labelledby="landingGuideTitle">
+      <header class="landing-guide-header">
+        <h2 id="landingGuideTitle">使用指南</h2>
+      </header>
+      <ol class="landing-guide-steps">
+        <li class="landing-guide-step">
+          <div class="landing-guide-step-heading">
+            <span class="landing-guide-step-number">01</span>
+            <h3>创建房间</h3>
+          </div>
+          <p class="landing-guide-description">点击上方“创建房间”，一次获得四种身份的专属入口。</p>
+          <div class="landing-guide-illustration landing-guide-create" role="img" aria-label="创建一个比赛房间，生成四种身份入口">
+            <svg viewBox="0 0 240 130" aria-hidden="true">
+              <path d="M120 66v20M30 104V86h180v18M90 86v18M150 86v18" fill="none" stroke="#566071" stroke-width="2"/>
+              <rect x="69" y="9" width="102" height="57" rx="10" fill="#26252a" stroke="#ffb15f"/>
+              <path d="M120 22v16m-8-8h16" stroke="#ffb15f" stroke-width="2" stroke-linecap="round"/>
+              <text x="120" y="54" text-anchor="middle" fill="#f5f7fb">比赛房间</text>
+              <circle cx="30" cy="109" r="7" fill="#ef4a57"/>
+              <circle cx="90" cy="109" r="7" fill="#45a7ff"/>
+              <circle cx="150" cy="109" r="7" fill="#ffb15f"/>
+              <circle cx="210" cy="109" r="7" fill="#b8c0cc"/>
+            </svg>
+            <span>一个房间，四种入口</span>
+          </div>
+          <p class="landing-guide-note">已收到代码？直接在上方“已有房间”输入即可。</p>
+        </li>
+        <li class="landing-guide-step">
+          <div class="landing-guide-step-heading">
+            <span class="landing-guide-step-number">02</span>
+            <h3>分发入口</h3>
+          </div>
+          <p class="landing-guide-description">把对应的 4 位代码发给队伍、裁判和导播，各自进入同一场比赛。</p>
+          <div class="landing-guide-illustration landing-guide-roles" aria-label="四种入口的用途">
+            <div><i class="landing-guide-dot-a" aria-hidden="true"></i><strong>队伍1</strong><span>本队选择与禁用</span></div>
+            <div><i class="landing-guide-dot-b" aria-hidden="true"></i><strong>队伍2</strong><span>本队选择与禁用</span></div>
+            <div><i class="landing-guide-dot-c" aria-hidden="true"></i><strong>管理员</strong><span>配置规则、控制流程</span></div>
+            <div><i class="landing-guide-dot-d" aria-hidden="true"></i><strong>直播</strong><span>展示比赛公共画面</span></div>
+          </div>
+          <p class="landing-guide-note">管理员入口仅供裁判或房主使用。</p>
+        </li>
+        <li class="landing-guide-step">
+          <div class="landing-guide-step-heading">
+            <span class="landing-guide-step-number">03</span>
+            <h3>开始比赛</h3>
+          </div>
+          <p class="landing-guide-description">管理员配置并启动比赛，双方按页面提示完成选图、阵容与英雄禁用。</p>
+          <div class="landing-guide-illustration landing-guide-ban-scene" aria-label="双方英雄禁用示意">
+            <span class="landing-guide-example">英雄禁用示意</span>
+            <div class="landing-guide-team-bans">
+              ${renderLandingGuideBan("/static/heroes/ana-dabc96ec9d14.png", "安娜", "队伍1禁用")}
+              ${renderLandingGuideBan("/static/heroes/reinhardt-642eb6b0e6df.png", "莱因哈特", "队伍2禁用")}
+            </div>
+          </div>
+          <p class="landing-guide-note">轮到本队时，按提示完成当前操作。</p>
+        </li>
+      </ol>
+    </section>
+  `;
+}
+
+function renderLandingGuideBan(imageUrl: string, heroName: string, label: string): string {
+  return `
+    <div class="landing-guide-team-ban">
+      <div class="landing-guide-ban-avatar">
+        <img src="${imageUrl}" alt="${heroName}英雄头像" />
+        <span class="landing-guide-ban-symbol" aria-hidden="true"></span>
+      </div>
+      <span>${label}</span>
+    </div>
+  `;
 }
 
 function renderCreatedRoomLinks(room: CreatedRoomResponse): string {

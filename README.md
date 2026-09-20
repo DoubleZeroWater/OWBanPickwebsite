@@ -50,6 +50,30 @@ npm run dev
 
 然后打开 <http://127.0.0.1:5173/>，Vite 会代理 API 与静态占位图到 Flask。
 
+## 代码结构
+
+项目按模块化单体组织：仍由同一个 Flask 进程和同一个前端应用交付，但传输、应用编排、领域规则和持久化各自独立。
+
+```text
+backend/
+  app.py                 # 应用装配入口
+  api/                   # 页面、房间、模板和全局管理 HTTP 路由
+  application/           # 房间编排、目录刷新和历史服务
+  domain/                # 配置、状态模型、房间引擎和阶段规则
+  infrastructure/        # 原子 JSON 持久化
+
+frontend/src/
+  app/                   # 启动与路由
+  config/                # 默认配置
+  features/              # 管理页、比赛、英雄和阵容功能
+  state/ + sync/ + api/  # 权威状态、同步和传输
+  shared/                # 无业务状态的通用工具
+```
+
+`backend/app.py`、`backend/room_engine.py`、`backend/state_models.py` 和 `backend/match_config.py` 保留兼容导出，既有导入路径无需修改。
+
+跨层 JSON 结构集中定义在 `backend/domain/contracts.py`：稳定业务对象使用命名 `TypedDict`，仅原始 JSON 和动态响应包使用递归 `JsonObject`。前端地图规则、目录展示、比赛进度和阵容模型位于 `frontend/src/features/`，入口文件只负责组装运行时依赖。
+
 ## 房间数据与历史
 
 - `backend/data/runtime/rooms.json` 仅保存当前活动房间、全局设置和创建频率记录。

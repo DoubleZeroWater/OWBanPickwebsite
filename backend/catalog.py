@@ -7,7 +7,14 @@ import time
 import uuid
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
+
+from backend.domain.contracts import CatalogAssets, JsonObject
+
+try:
+    from backend.infrastructure.json_store import save_json_atomic
+except ModuleNotFoundError:  # Support direct module execution from the backend directory.
+    from infrastructure.json_store import save_json_atomic  # type: ignore[no-redef]
 
 
 CATALOG_SCHEMA_VERSION = 1
@@ -22,7 +29,7 @@ SIDE_SELECTION_BY_MODE = {
 }
 
 
-def attach_map_capabilities(value: dict[str, Any]) -> dict[str, Any]:
+def attach_map_capabilities(value: CatalogAssets) -> CatalogAssets:
     assets = deepcopy(value)
     for mode, items in assets.get("maps", {}).items():
         if not isinstance(items, list):
@@ -33,7 +40,7 @@ def attach_map_capabilities(value: dict[str, Any]) -> dict[str, Any]:
     return assets
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_json(path: Path) -> JsonObject:
     try:
         with path.open(encoding="utf-8") as file:
             value = json.load(file)
@@ -42,17 +49,7 @@ def read_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def save_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def catalog_keys(assets: dict[str, Any]) -> dict[str, list[str]]:
+def catalog_keys(assets: CatalogAssets) -> dict[str, list[str]]:
     modes = [str(mode) for mode in assets.get("modes", []) if isinstance(mode, str)]
     maps = sorted(
         {
@@ -75,7 +72,7 @@ def catalog_keys(assets: dict[str, Any]) -> dict[str, list[str]]:
     return {"modes": modes, "maps": maps, "heroes": heroes}
 
 
-def _hash_catalog_signature(signature: dict[str, Any]) -> str:
+def _hash_catalog_signature(signature: JsonObject) -> str:
     canonical = json.dumps(
         signature,
         ensure_ascii=False,
@@ -85,9 +82,9 @@ def _hash_catalog_signature(signature: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def compute_catalog_hash(assets: dict[str, Any]) -> str:
+def compute_catalog_hash(assets: CatalogAssets) -> str:
     enriched = attach_map_capabilities(assets)
-    signature: dict[str, Any] = catalog_keys(enriched)
+    signature: JsonObject = catalog_keys(enriched)
     signature["mapCapabilities"] = sorted(
         f"{item.get('nameEn')}:{item.get('sideSelectionKind')}"
         for items in enriched.get("maps", {}).values()
@@ -96,7 +93,7 @@ def compute_catalog_hash(assets: dict[str, Any]) -> str:
     return _hash_catalog_signature(signature)
 
 
-def build_translation_template(assets: dict[str, Any]) -> dict[str, Any]:
+def build_translation_template(assets: CatalogAssets) -> JsonObject:
     keys = catalog_keys(assets)
     return {
         "schemaVersion": TRANSLATION_SCHEMA_VERSION,
@@ -107,9 +104,9 @@ def build_translation_template(assets: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_translation(assets: dict[str, Any], translation: Any) -> dict[str, Any]:
+def validate_translation(assets: CatalogAssets, translation: object) -> JsonObject:
     expected = catalog_keys(assets)
-    diagnostics: dict[str, Any] = {
+    diagnostics: JsonObject = {
         "valid": True,
         "versionMismatch": False,
         "hashMismatch": False,
@@ -161,7 +158,7 @@ def validate_translation(assets: dict[str, Any], translation: Any) -> dict[str, 
     return diagnostics
 
 
-def load_catalog_assets(bundled_path: Path, runtime_catalog_dir: Path) -> tuple[dict[str, Any], str]:
+def load_catalog_assets(bundled_path: Path, runtime_catalog_dir: Path) -> tuple[CatalogAssets, str]:
     runtime_path = runtime_catalog_dir / "current" / "assets.json"
     runtime_assets = read_json(runtime_path)
     if is_complete_catalog(runtime_assets):
@@ -172,7 +169,7 @@ def load_catalog_assets(bundled_path: Path, runtime_catalog_dir: Path) -> tuple[
 def load_translation(
     bundled_translation_path: Path,
     runtime_catalog_dir: Path,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[JsonObject, str]:
     runtime_path = runtime_catalog_dir / "translation.json"
     if runtime_path.is_file():
         return read_json(runtime_path), "runtime"
@@ -183,7 +180,7 @@ def build_catalog_response(
     bundled_assets_path: Path,
     bundled_translation_path: Path,
     runtime_catalog_dir: Path,
-) -> dict[str, Any]:
+) -> JsonObject:
     assets, catalog_source = load_catalog_assets(bundled_assets_path, runtime_catalog_dir)
     translation, translation_source = load_translation(bundled_translation_path, runtime_catalog_dir)
     diagnostics = validate_translation(assets, translation)
@@ -215,7 +212,7 @@ def build_maintenance_status(
     bundled_assets_path: Path,
     bundled_translation_path: Path,
     runtime_catalog_dir: Path,
-) -> dict[str, Any]:
+) -> JsonObject:
     response = build_catalog_response(
         bundled_assets_path,
         bundled_translation_path,
@@ -243,7 +240,7 @@ def build_maintenance_status(
     }
 
 
-def is_complete_catalog(assets: dict[str, Any]) -> bool:
+def is_complete_catalog(assets: CatalogAssets) -> bool:
     if assets.get("schemaVersion") != CATALOG_SCHEMA_VERSION:
         return False
     if assets.get("modes") != MODES:
@@ -261,7 +258,7 @@ def is_complete_catalog(assets: dict[str, Any]) -> bool:
     return stored_hash in {compute_catalog_hash(assets), legacy_hash}
 
 
-def allowed_runtime_asset_paths(assets: dict[str, Any]) -> set[str]:
+def allowed_runtime_asset_paths(assets: CatalogAssets) -> set[str]:
     allowed: set[str] = set()
     for mode_maps in assets.get("maps", {}).values():
         for item in mode_maps:
@@ -280,7 +277,7 @@ def allowed_runtime_asset_paths(assets: dict[str, Any]) -> set[str]:
 def refresh_runtime_catalog(
     runtime_catalog_dir: Path,
     progress: Callable[[str, int, str], None] | None = None,
-) -> dict[str, Any]:
+) -> CatalogAssets:
     # Imported lazily so importing Flask does not initialize scraper networking.
     from scripts.scrape_assets import scrape_catalog
 
